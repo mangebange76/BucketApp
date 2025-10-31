@@ -4,3 +4,4 @@ pandas>=2.2.2,<3
 numpy>=1.26,<3
 gspread>=6.1.2
 google-auth>=2.33.0
+requests>=2.31.0
