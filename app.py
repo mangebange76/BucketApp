@@ -1,9 +1,9 @@
-# app.py — Riktkurser + Google Sheets (v4.5, split 1/4)
-# Nytt i v4.5:
-# - Autoskalning av per-aktie-tal (EPS/BV/NAV/AFFO/NII/FCF/TBV) med sanity-flaggor
-# - Knapp för att skriva tillbaka autoskalade värden till fliken Data
-# - Val i sidpanelen: skriv tillbaka vid massuppdatering
-# - Kommentar "sanity:..." följer med till Resultat
+# app.py — Riktkurser + Google Sheets (v4.6, split 1/4)
+# Nytt i v4.6:
+# - FIX: autoskalning (korrekt riktning: ratio<min → ÷10, ratio>max → ×10)
+# - "Rensa cache"-knapp i sidpanelen
+# - Autoskalade per-aktie-tal kan skrivas tillbaka till fliken Data (export + massuppd.)
+# - Kvartalssnapshots (Historik) + PE-band från Finnhub
 
 from __future__ import annotations
 import math, json, re, time
@@ -183,7 +183,7 @@ def upsert_row(ws: gspread.Worksheet, key_col: str, key_val: str, row_dict: Dict
     else:
         ws.append_row([row_dict.get(c, "") for c in header], value_input_option="RAW")
 
-# ========== Del 2/4 — Datakällor (Yahoo/FX/Finnhub/SEC), motor & heuristik ==========
+# ========== Del 2/4 — Datakällor (Yahoo/FX/Finnhub/SEC), numerikhelpers, motor & heuristik ==========
 
 # ---------- Numerisk robust konvertering ----------
 def to_float(x, default: float = 0.0) -> float:
@@ -305,6 +305,7 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     market_cap = fi_mcap or info.get("marketCap")
     shares_out = info.get("sharesOutstanding")
 
+    # statements
     try:
         income = getattr(t, "income_stmt", None)
         if income is None or income.empty:
@@ -417,7 +418,7 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
         r = requests.get(url, timeout=12)
         if r.status_code != 200:
             return {}
-        data = r.json() or {}
+        data = r.json() | {}
     except Exception:
         return {}
     metric = data.get("metric", {}) or {}
@@ -631,7 +632,7 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
 with st.sidebar:
     st.header("Inställningar & datakällor")
     use_finnhub   = st.checkbox("Använd Finnhub (EPS/BV/P-E-band)", value=True)
-    try_sec       = st.checkbox("Försök SEC beta (NII/AFFO/FFO per aktie)", value=False)
+    try_sec       = st.checkbox("Försök SEC beta (NII/AFFO per aktie)", value=False)
     autosave_hist = st.checkbox("Autospara kvartalssnapshots vid massuppdatering", value=True)
 
     st.markdown("---")
@@ -659,6 +660,12 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Uppdatering")
     do_mass_refresh = st.button("🔄 Uppdatera alla (Yahoo + Finnhub + SEC + FX)")
+
+    st.markdown("---")
+    if st.button("♻️ Rensa cache och ladda om"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.experimental_rerun()
 
     st.markdown("---")
     st.caption("Snabb-FX (SEK per 1 enhet)")
@@ -857,7 +864,7 @@ if save_clicked and ticker_in:
     else:
         st.success(f"{ticker_in} sparad/uppdaterad i Google Sheets.")
 
-# ========== Del 4/4 — Beräkning, autoskalning, portfölj i SEK, export + writeback, massuppdatering, snapshots ==========
+# ========== Del 4/4 — Beräkning, autoskalning (FIX), SEK-summering, export, massuppd., snapshots ==========
 
 # --- Läs Data efter ev. spar ---
 data_df = read_df(ws_data)
@@ -865,14 +872,18 @@ if data_df.empty:
     st.info("Lägg till minst ett bolag ovan så visas vyer här nedanför.")
     st.stop()
 
-# --- FX till SEK (pris visas i bolagets valuta; SEK används för summering) ---
+# --- FX till SEK: pris visas i bolagets valuta; SEK används bara för summering ---
 fx_map = fetch_fx_to_sek(sorted({(c or "SEK") for c in data_df["Valuta"].tolist()}))
 sek_rate_for = lambda c: fx_map.get(c or "SEK", 1.0)
 
-# --- Hjälpare: autoskalning av per-aktie-tal mot rimliga multipelintervall ---
+# --- AUTOSKALNING (FIX) ---
 def autoscale_ps(value: float, price: float, min_ratio: float, max_ratio: float,
                  tag: str, flags: list, max_steps: int = 6) -> float:
-    """Skala per-aktie-värden (EPS/BV/NAV/AFFO/NII/FCF/TBV) så att pris/värde hamnar i [min_ratio, max_ratio]."""
+    """
+    Skala per-aktie-värden så att (price/value) hamnar i [min_ratio, max_ratio].
+    • ratio < min  ⇒ value för stort  ⇒ ÷10
+    • ratio > max  ⇒ value för litet ⇒ ×10
+    """
     v = float(nz(value, 0.0))
     p = float(nz(price, 0.0))
     if v <= 0 or p <= 0:
@@ -880,18 +891,18 @@ def autoscale_ps(value: float, price: float, min_ratio: float, max_ratio: float,
     steps = 0
     ratio = p / v
     while ratio < min_ratio and steps < max_steps:
-        v *= 10.0
-        ratio = p / v
-        flags.append(f"{tag}×10")
-        steps += 1
-    while ratio > max_ratio and steps < max_steps:
         v /= 10.0
         ratio = p / v
         flags.append(f"{tag}÷10")
         steps += 1
+    while ratio > max_ratio and steps < max_steps:
+        v *= 10.0
+        ratio = p / v
+        flags.append(f"{tag}×10")
+        steps += 1
     return v
 
-# ---------- Värdering för en rad (inkl. sanity-flaggor & autoskalning; writeback-data returneras) ----------
+# ---------- Värdering för en rad (sanity + autoskalning) ----------
 def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     flags: List[str] = []
 
@@ -900,18 +911,18 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     mc  = float(nz(r.get("Market Cap"), 0.0))
     shs = float(nz(r.get("Shares Out"), 0.0))
 
-    # Pris-sanity
+    # Pris-sanity (delar /100 om yfinance gett multipel, eller justerar mot MC/Shares)
     if px > 10000:
         px = px / 100.0
         flags.append("price÷100")
     if mc > 0 and shs > 0:
-        ref_px = mc / shs
+        ref = mc / shs
         if px == 0:
-            px = ref_px; flags.append("price=MC/Shares")
+            px = ref; flags.append("price=MC/Shares")
         else:
             try:
-                if 0.01 < ref_px < 100000 and abs(px - ref_px) / max(ref_px, 1e-9) > 0.20:
-                    px = ref_px; flags.append("price=MC/Shares")
+                if 0.01 < ref < 100000 and abs(px - ref) / max(ref, 1e-9) > 0.20:
+                    px = ref; flags.append("price=MC/Shares")
             except Exception:
                 pass
 
@@ -941,7 +952,7 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     p_tbv_mult   = float(nz(r.get("P_TBV_mult"), 1.2))
     p_nii_mult   = float(nz(r.get("P_NII_mult"), 10.0))
 
-    # Per-aktie-inputs (med autoskalning)
+    # Per-aktie-inputs + autoskalning
     eps0    = float(nz(r.get("EPS0"), 0.0))
     bv_ps0  = float(nz(r.get("BV_ps0"), 0.0))
     nav_ps0 = float(nz(r.get("NAV_ps0"), 0.0))
@@ -954,13 +965,13 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
 
     if eps0 > 1000:
         eps0 /= 100.0; flags.append("eps÷100")
-    eps0    = autoscale_ps(eps0,  px, 5.0, 200.0, "eps",  flags)
-    bv_ps0  = autoscale_ps(bv_ps0,px, 0.2, 20.0, "bv",   flags)
-    nav_ps0 = autoscale_ps(nav_ps0,px, 0.2, 10.0, "nav", flags)
-    affo_ps0= autoscale_ps(affo_ps0,px, 5.0, 40.0, "affo",flags)
-    nii_ps0 = autoscale_ps(nii_ps0,px, 5.0, 20.0, "nii", flags)
-    fcf_ps0 = autoscale_ps(fcf_ps0,px, 5.0, 60.0, "fcfps",flags)
-    tbv_ps0 = autoscale_ps(tbv_ps0,px, 0.2, 20.0, "tbv", flags)
+    eps0    = autoscale_ps(eps0,  px, 5.0, 200.0, "eps",   flags)
+    bv_ps0  = autoscale_ps(bv_ps0,px, 0.2, 20.0,  "bv",    flags)
+    nav_ps0 = autoscale_ps(nav_ps0,px, 0.2, 10.0, "nav",   flags)
+    affo_ps0= autoscale_ps(affo_ps0,px, 5.0, 40.0, "affo", flags)
+    nii_ps0 = autoscale_ps(nii_ps0,px, 5.0, 20.0, "nii",   flags)
+    fcf_ps0 = autoscale_ps(fcf_ps0,px, 5.0, 60.0, "fcfps", flags)
+    tbv_ps0 = autoscale_ps(tbv_ps0,px, 0.2, 20.0, "tbv",   flags)
 
     has_fcf    = fcf0 > 0.0
     has_ebitda = ebitda0 > 0.0
@@ -968,18 +979,18 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     # Riktkurser per metod
     vals = {}
     vals["pe_hist_vs_eps"] = target_from_PE(eps0, pe_hist, g1, g2, g3)
-    vals["ev_fcf"]    = targets_from_ev_multiple(fcf0,    ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
-    vals["p_fcf"]     = targets_from_price_multiple(fcf_ps0, p_fcf_mult, g1, g2, g3)
-    vals["ev_sales"]  = targets_from_ev_multiple(rev0,    ev_s_mult,   net_debt, shares_out, g1, g2, g3)
-    vals["ev_ebitda"] = targets_from_ev_multiple(ebitda0, ev_eb_mult,  net_debt, shares_out, g1, g2, g3)
-    vals["p_nav"]     = targets_from_price_multiple(nav_ps0,  p_nav_mult,  g1, g2, g3)
+    vals["ev_fcf"]         = targets_from_ev_multiple(fcf0,    ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
+    vals["p_fcf"]          = targets_from_price_multiple(fcf_ps0, p_fcf_mult, g1, g2, g3)
+    vals["ev_sales"]       = targets_from_ev_multiple(rev0,    ev_s_mult,   net_debt, shares_out, g1, g2, g3)
+    vals["ev_ebitda"]      = targets_from_ev_multiple(ebitda0, ev_eb_mult,  net_debt, shares_out, g1, g2, g3)
+    vals["p_nav"]          = targets_from_price_multiple(nav_ps0,  p_nav_mult,  g1, g2, g3)
     dacf_mult = 6.0 if math.isclose(ev_eb_mult, 0.0) else ev_eb_mult
-    vals["ev_dacf"]   = targets_from_ev_multiple(ebitda0, dacf_mult,   net_debt, shares_out, g1, g2, g3)
-    vals["p_affo"]    = targets_from_price_multiple(affo_ps0, p_affo_mult, g1, g2, g3)
-    vals["p_b"]       = targets_from_price_multiple(bv_ps0,   p_b_mult,    g1, g2, g3)
-    tbv1,tbv2,tbv3    = project_tbv_per_share(tbv_ps0, rotce, payout)
-    vals["p_tbv"]     = (p_tbv_mult*tbv_ps0, p_tbv_mult*tbv1, p_tbv_mult*tbv2, p_tbv_mult*tbv3)
-    vals["p_nii"]     = targets_from_price_multiple(nii_ps0,  p_nii_mult,  g1, g2, g3)
+    vals["ev_dacf"]        = targets_from_ev_multiple(ebitda0, dacf_mult,   net_debt, shares_out, g1, g2, g3)
+    vals["p_affo"]         = targets_from_price_multiple(affo_ps0, p_affo_mult, g1, g2, g3)
+    vals["p_b"]            = targets_from_price_multiple(bv_ps0,   p_b_mult,    g1, g2, g3)
+    tbv1,tbv2,tbv3         = project_tbv_per_share(tbv_ps0, rotce, payout)
+    vals["p_tbv"]          = (p_tbv_mult*tbv_ps0, p_tbv_mult*tbv1, p_tbv_mult*tbv2, p_tbv_mult*tbv3)
+    vals["p_nii"]          = targets_from_price_multiple(nii_ps0,  p_nii_mult,  g1, g2, g3)
 
     # Välj primär metod
     pref = (r.get("Preferred metod") or "AUTO").strip().lower()
@@ -994,13 +1005,13 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     today,y1,y2,y3 = vals.get(primary, (0.0,0.0,0.0,0.0))
     b1,br1 = bull_bear(y1, bull_mult, bear_mult)
 
-    # Utdelning & SEK-summering
+    # Utdelning och SEK-summering
     div_ps = float(nz(r.get("Dividend/ps"), 0.0))
     da = float(nz(r.get("Dividend Yield"), 0.0))*100.0 if nz(r.get("Dividend Yield"),0.0) \
          else (safe_div(div_ps, px, 0.0)*100.0 if px>0 else 0.0)
 
     rate = sek_rate_for(cur)
-    antal = int(nz(r.get("Antal aktier"),0))
+    antal = int(nz(r.get("Antal aktier"), 0))
     innehav_sek = antal * px * rate
     utd_år_sek  = antal * div_ps * rate
     upside = (safe_div(today, px, 0.0) - 1.0)*100.0 if px>0 else 0.0
@@ -1013,7 +1024,6 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
         "affo_ps0": affo_ps0, "nav_ps0": nav_ps0, "nii_ps0": nii_ps0, "bv_ps0": bv_ps0, "fcf_ps0": fcf_ps0,
         "shares_fd": shares_out, "net_debt": net_debt
     }
-
     autoscaled_writeback = {
         "EPS0": eps0, "BV_ps0": bv_ps0, "NAV_ps0": nav_ps0,
         "AFFO_ps0": affo_ps0, "NII_ps0": nii_ps0, "FCF_ps0": fcf_ps0, "TBV_ps0": tbv_ps0
@@ -1031,7 +1041,7 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
         "AutoscaledInputs": autoscaled_writeback,
     }
 
-# ---------- Hjälp för snapshots (används i massuppdatering) ----------
+# ---------- Hjälp för snapshots ----------
 def compute_primary_for_snapshot(row: Dict[str,Any]) -> Tuple[str, Tuple[float,float,float,float], float, float, float]:
     ser = pd.Series(row)
     res = compute_methods_row(ser)
@@ -1040,7 +1050,7 @@ def compute_primary_for_snapshot(row: Dict[str,Any]) -> Tuple[str, Tuple[float,f
     b1,br1 = bull_bear(t1, bull_mult, bear_mult)
     return primary, (t0,t1,t2,t3), b1, br1, res["Upside_%"]
 
-# ---------- Massuppdatering ----------
+# ---------- Massuppdatering + writeback av autoskalade inputs ----------
 def writeback_autoscaled_row(ticker: str, autoscaled: Dict[str, Any]):
     d = {"Ticker": ticker, "Timestamp": now_ts()}
     for k, v in autoscaled.items():
@@ -1054,34 +1064,32 @@ if do_mass_refresh:
     if df.empty:
         st.warning("Inga bolag i Data ännu.")
     else:
-        cur_list = sorted({(c or "SEK") for c in df["Valuta"].tolist()})
-        persist_fx(ws_fx, fetch_fx_to_sek(cur_list))
+        persist_fx(ws_fx, fetch_fx_to_sek(sorted({(c or "SEK") for c in df["Valuta"].tolist()})))
         done = 0
-        for _, r in df.iterrows():
-            tk = r.get("Ticker","")
-            if not tk:
+        for _, r0 in df.iterrows():
+            tk = r0.get("Ticker","")
+            if not tk: 
                 continue
             try:
                 adv = dict(
-                    pe_hist=r.get("PE_hist", np.nan), eps0=r.get("EPS0", np.nan),
-                    ev_fcf_mult=r.get("EV_FCF_mult", np.nan), p_fcf_mult=r.get("P_FCF_mult", np.nan),
-                    ev_s_mult=r.get("EV_S_mult", np.nan), ev_ebitda_mult=r.get("EV_EBITDA_mult", np.nan),
-                    p_nav_mult=r.get("P_NAV_mult", np.nan), p_affo_mult=r.get("P_AFFO_mult", np.nan),
-                    p_b_mult=r.get("P_B_mult", np.nan), p_tbv_mult=r.get("P_TBV_mult", np.nan),
-                    p_nii_mult=r.get("P_NII_mult", np.nan), tbv_ps0=r.get("TBV_ps0", np.nan),
-                    rotce=r.get("ROTCE", np.nan), payout=r.get("Payout", np.nan),
-                    affo_ps0=r.get("AFFO_ps0", np.nan), nav_ps0=r.get("NAV_ps0", np.nan),
-                    nii_ps0=r.get("NII_ps0", np.nan), bv_ps0=r.get("BV_ps0", np.nan), fcf_ps0=r.get("FCF_ps0", np.nan)
+                    pe_hist=r0.get("PE_hist", np.nan), eps0=r0.get("EPS0", np.nan),
+                    ev_fcf_mult=r0.get("EV_FCF_mult", np.nan), p_fcf_mult=r0.get("P_FCF_mult", np.nan),
+                    ev_s_mult=r0.get("EV_S_mult", np.nan), ev_ebitda_mult=r0.get("EV_EBITDA_mult", np.nan),
+                    p_nav_mult=r0.get("P_NAV_mult", np.nan), p_affo_mult=r0.get("P_AFFO_mult", np.nan),
+                    p_b_mult=r0.get("P_B_mult", np.nan), p_tbv_mult=r0.get("P_TBV_mult", np.nan),
+                    p_nii_mult=r0.get("P_NII_mult", np.nan), tbv_ps0=r0.get("TBV_ps0", np.nan),
+                    rotce=r0.get("ROTCE", np.nan), payout=r0.get("Payout", np.nan),
+                    affo_ps0=r0.get("AFFO_ps0", np.nan), nav_ps0=r0.get("NAV_ps0", np.nan),
+                    nii_ps0=r0.get("NII_ps0", np.nan), bv_ps0=r0.get("BV_ps0", np.nan), fcf_ps0=r0.get("FCF_ps0", np.nan)
                 )
                 newrow = handle_one_ticker_save(
-                    tk, r.get("Bucket",""), int(nz(r.get("Antal aktier"),0)),
-                    r.get("Preferred metod","AUTO"),
-                    float(nz(r.get("G1"),0.15)), float(nz(r.get("G2"),0.12)), float(nz(r.get("G3"),0.10)),
+                    tk, r0.get("Bucket",""), int(nz(r0.get("Antal aktier"),0)),
+                    r0.get("Preferred metod","AUTO"),
+                    float(nz(r0.get("G1"),0.15)), float(nz(r0.get("G2"),0.12)), float(nz(r0.get("G3"),0.10)),
                     adv, use_finnhub, try_sec
                 )
-                # Beräkna för snapshot + ev. autoskalat writeback
-                ser = pd.Series(newrow)
-                res = compute_methods_row(ser)
+                # Beräkna för snapshot + writeback
+                res = compute_methods_row(pd.Series(newrow))
                 if writeback_in_mass:
                     writeback_autoscaled_row(tk, res["AutoscaledInputs"])
                 if autosave_hist and use_finnhub:
@@ -1097,17 +1105,14 @@ if do_mass_refresh:
 # ---------- Beräkna alla (respektera filter) ----------
 calc_rows=[]
 for _, rr in data_df.iterrows():
-    if rr.get("Bucket") not in pick_buckets:
+    if rr.get("Bucket") not in pick_buckets: 
         continue
     if only_owned and int(nz(rr.get("Antal aktier"),0)) <= 0:
         continue
     if only_watch and int(nz(rr.get("Antal aktier"),0)) > 0:
         continue
     try:
-        row = compute_methods_row(rr)
-        if row["Pris"] == 0.0:
-            st.warning(f"{row['Ticker']}: pris=0 från Yahoo (tillfälligt).")
-        calc_rows.append(row)
+        calc_rows.append(compute_methods_row(rr))
     except Exception as e:
         st.warning(f"Kunde inte beräkna {rr.get('Ticker')}: {e}")
 
@@ -1143,7 +1148,7 @@ show_cols = [
 ]
 st.dataframe(calc_df[show_cols].reset_index(drop=True), use_container_width=True)
 
-# ---------- Export till fliken "Resultat" (inkl. sanity i Kommentar) ----------
+# ---------- Export till 'Resultat' + writeback autoskalat ----------
 def persist_result_row(tkr: str, cur: str, pris: float, vals: Dict[str, Any], inputs: Dict[str, Any], method: str, sanity: str):
     today,y1,y2,y3 = vals.get(method,(0.0,0.0,0.0,0.0))
     b1,br1 = bull_bear(y1, bull_mult, bear_mult)
