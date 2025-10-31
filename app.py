@@ -1,10 +1,14 @@
-# app.py — Portfölj + Riktkurser till Google Sheets, multi-metod, auto-FX
-# Flikar i Google Sheets: "Data", "Valutakurser", "Resultat"
+# app.py — Riktkurser + Google Sheets (renad)
+# - Inga Apps-Script-URL:er
+# - Flikar: "Data", "Valutakurser", "Resultat"
+# - Buckets, auto-FX (SEK), multi-metod-värdering, filter & ranking
+# - Sparar primära riktkurser till "Resultat"
 # Författare: GPT-5 Thinking — 2025-10-31
 
 from __future__ import annotations
 import math
 import json
+import re
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -60,42 +64,21 @@ def multi_year(v0: float, g1: float, g2: float, g3: float) -> Tuple[float, float
 def bull_bear(value_1y: float, bull_mult: float = 1.15, bear_mult: float = 0.85) -> Tuple[float, float]:
     return value_1y * bull_mult, value_1y * bear_mult
 
-def stringify_inputs(d: Dict[str, Any]) -> str:
-    parts = []
-    for k, v in d.items():
-        if isinstance(v, float):
-            parts.append(f"{k}:{v:.4f}")
-        else:
-            parts.append(f"{k}:{str(v)}")
-    return "|".join(parts).replace(" ", "_")
-
-def build_gas_url(ticker: str, method: str, inputs: Dict[str, Any], shares_fd: Optional[float], note: str = "") -> str:
-    base = "https://script.google.com/macros/s/DEPLOYMENT_ID/exec"  # byt till din deployment
-    q = {
-        "ticker": ticker,
-        "method": method,
-        "input": stringify_inputs(inputs),
-        "shares_fd": f"{shares_fd:.2f}" if shares_fd else "",
-        "note": note.replace(" ", "_")
-    }
-    qs = "&".join([f"{k}={str(v)}" for k, v in q.items()])
-    return f"{base}?{qs}"
-
 # =========================
-# Google Sheets I/O
+# Sheets: kolumner
 # =========================
 
 REQUIRED_DATA_COLS = [
     "Timestamp", "Ticker", "Bolagsnamn", "Sektor", "Industri", "Valuta",
     "Bucket", "Antal aktier",
     "Preferred metod", "G1", "G2", "G3",
-    # valfria multiplar/inputs (sparas om du fyller i manuellt)
+    # manuella inputs/multiplar (valfria)
     "PE_hist", "EPS0",
     "EV_FCF_mult", "P_FCF_mult", "EV_S_mult", "EV_EBITDA_mult",
     "P_NAV_mult", "P_AFFO_mult", "P_B_mult", "P_TBV_mult", "P_NII_mult",
     "TBV_ps0", "ROTCE", "Payout",
     "AFFO_ps0", "NAV_ps0", "NII_ps0", "BV_ps0", "FCF_ps0",
-    # cache från Yahoo (kan uppdateras)
+    # cache från Yahoo
     "Last Price", "Market Cap", "EV", "Shares Out", "Revenue TTM", "EBITDA TTM", "FCF TTM",
     "Total Debt", "Cash", "Dividend/ps", "Dividend Yield",
 ]
@@ -116,6 +99,18 @@ FX_SYMBOLS = {
     "SEK": None,  # bas
 }
 
+# =========================
+# Google Sheets I/O
+# =========================
+
+def col_idx_to_a1(n: int) -> str:
+    """1->A, 26->Z, 27->AA ..."""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
 def _normalize_private_key(creds: Dict[str, Any]) -> Dict[str, Any]:
     pk = creds.get("private_key")
     if isinstance(pk, str) and "\\n" in pk:
@@ -134,22 +129,43 @@ def get_gspread_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    gc = gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scope))
-    return gc
+    return gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scope))
 
-def open_or_create_ws(sh: gspread.Spreadsheet, title: str, cols: List[str]) -> gspread.Worksheet:
+def _sheet_id_from_url_or_id(val: str) -> str:
+    val = (val or "").strip()
+    if "/" not in val and " " not in val and val:
+        return val
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)", val)
+    if not m:
+        raise ValueError("Kunde inte hitta Sheet-ID i SHEET_URL/SHEET_ID")
+    return m.group(1)
+
+def _ensure_ws(sh: gspread.Spreadsheet, title: str, cols: List[str]) -> gspread.Worksheet:
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=2, cols=max(50, len(cols)))
         ws.append_row(cols)
-    # se till att headern finns
+        return ws
     header = ws.row_values(1)
     if header != cols:
-        # skriv exakt header (rensa först vid behov)
         ws.clear()
         ws.append_row(cols)
     return ws
+
+@st.cache_resource(show_spinner=False)
+def open_sheets():
+    sheet_id = st.secrets.get("SHEET_ID", "")
+    if not sheet_id:
+        sheet_url = st.secrets.get("SHEET_URL", "")
+        sheet_id = _sheet_id_from_url_or_id(sheet_url)
+
+    gc = get_gspread_client()
+    sh = gc.open_by_key(sheet_id)
+    ws_data = _ensure_ws(sh, "Data", REQUIRED_DATA_COLS)
+    ws_fx = _ensure_ws(sh, "Valutakurser", ["Timestamp", "Valuta", "SEK_per_unit"])
+    ws_res = _ensure_ws(sh, "Resultat", RESULT_COLS)
+    return sh, ws_data, ws_fx, ws_res
 
 def read_df(ws: gspread.Worksheet) -> pd.DataFrame:
     vals = ws.get_all_records()
@@ -164,36 +180,24 @@ def read_df(ws: gspread.Worksheet) -> pd.DataFrame:
 
 def upsert_row(ws: gspread.Worksheet, key_col: str, key_val: str, row_dict: Dict[str, Any]):
     df = read_df(ws)
+    header = ws.row_values(1)
     if df.empty:
-        # lägg första raden
-        ordered = [row_dict.get(c, "") for c in ws.row_values(1)]
+        ordered = [row_dict.get(c, "") for c in header]
         ws.append_row(ordered)
         return
-    idx = df.index[df[key_col] == key_val].tolist()
-    header = ws.row_values(1)
+    idx = df.index[df.get(key_col, pd.Series(dtype=object)) == key_val].tolist()
     if idx:
-        r = idx[0] + 2  # 1-bas + header
-        values = ws.row_values(r)
-        # bygg ny rad i rätt ordning
+        rnum = idx[0] + 2  # data börjar på rad 2
+        existing = ws.row_values(rnum)
         new_row = []
-        for col in header:
-            new_row.append(row_dict.get(col, values[header.index(col)] if header.index(col) < len(values) else ""))
-        ws.update(f"A{r}:{chr(64+len(header))}{r}", [new_row])
+        for i, col in enumerate(header):
+            new_row.append(row_dict.get(col, existing[i] if i < len(existing) else ""))
+        last_col = col_idx_to_a1(len(header))
+        a1 = f"A{rnum}:{last_col}{rnum}"
+        ws.update(a1, [new_row])
     else:
         ordered = [row_dict.get(c, "") for c in header]
         ws.append_row(ordered)
-
-@st.cache_resource(show_spinner=False)
-def open_sheets():
-    sheet_id = st.secrets.get("SHEET_ID", "")
-    if not sheet_id:
-        st.stop()
-    gc = get_gspread_client()
-    sh = gc.open_by_key(sheet_id)
-    ws_data = open_or_create_ws(sh, "Data", REQUIRED_DATA_COLS)
-    ws_fx = open_or_create_ws(sh, "Valutakurser", ["Timestamp", "Valuta", "SEK_per_unit"])
-    ws_res = open_or_create_ws(sh, "Resultat", RESULT_COLS)
-    return sh, ws_data, ws_fx, ws_res
 
 # =========================
 # Yahoo & FX
@@ -223,8 +227,8 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     snap["industry"] = info.get("industry")
     snap["enterprise_value"] = info.get("enterpriseValue")
     snap["shares_out"] = info.get("sharesOutstanding")
-    snap["dividend_ps"] = info.get("dividendRate")  # per år
-    snap["dividend_yield"] = info.get("dividendYield")  # i decimal
+    snap["dividend_ps"] = info.get("dividendRate")          # årlig utd/aktie
+    snap["dividend_yield"] = info.get("dividendYield")      # decimal
 
     # statements (årliga)
     try:
@@ -278,6 +282,8 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
 def fetch_fx_to_sek(codes: List[str]) -> Dict[str, float]:
     rates: Dict[str, float] = {}
     for c in codes:
+        if not c:
+            continue
         if c == "SEK":
             rates[c] = 1.0
             continue
@@ -331,6 +337,15 @@ def project_tbv_per_share(tbv0_ps: float, rotce: float, payout_ratio: float) -> 
     g = rotce * (1.0 - payout_ratio)
     return multi_year(tbv0_ps, g, g, g)
 
+def stringify_inputs(d: Dict[str, Any]) -> str:
+    parts = []
+    for k, v in d.items():
+        if isinstance(v, float):
+            parts.append(f"{k}:{v:.4f}")
+        else:
+            parts.append(f"{k}:{str(v)}")
+    return "|".join(parts).replace(" ", "_")
+
 # =========================
 # Heuristik: välj primär metod per bolag
 # =========================
@@ -348,7 +363,6 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
     tk = ticker.upper()
     s = (sector or "").lower()
     i = (industry or "").lower()
-    # typdetektering
     if tk in BDC_TICKERS or "bdc" in i:
         return "p_nii"
     if any(k in i for k in REIT_HINTS):
@@ -359,18 +373,13 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
         return "ev_dacf" if has_ebitda else "ev_ebitda"
     if any(k in s for k in SAAS_HINTS) or any(k in i for k in SAAS_HINTS):
         return "ev_fcf" if has_fcf else "ev_sales"
-
-    # bucket-bias
     b = (bucket or "").lower()
     if "tillväxt" in b:
-        if has_fcf:
-            return "ev_fcf"
-        if has_ebitda:
-            return "ev_ebitda"
+        if has_fcf: return "ev_fcf"
+        if has_ebitda: return "ev_ebitda"
         return "ev_sales"
-    else:  # utdelning
-        if has_fcf:
-            return "p_fcf"
+    else:
+        if has_fcf: return "p_fcf"
         return "p_b"
 
 # =========================
@@ -454,7 +463,7 @@ save_clicked = st.button("💾 Spara till Google Sheets (hämtar Yahoo + FX + be
 try:
     sh, ws_data, ws_fx, ws_res = open_sheets()
 except Exception as e:
-    st.error("Kunde inte öppna Google Sheet. Kontrollera SHEET_ID och GOOGLE_CREDENTIALS i secrets.")
+    st.error("Kunde inte öppna Google Sheet. Kontrollera att SHEET_ID/SHEET_URL och GOOGLE_CREDENTIALS är korrekta och att arket är delat med service-kontot.")
     st.stop()
 
 # =========================
@@ -471,7 +480,6 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
     cur = snap.get("currency") or "SEK"
     rates = fetch_fx_to_sek([cur])
     persist_fx(ws_fx, rates)
-    sek_rate = rates.get(cur, 1.0)
 
     # bygg rad
     row = {
@@ -516,7 +524,7 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
         "Dividend Yield": snap.get("dividend_yield") or 0.0,
     }
     upsert_row(ws_data, "Ticker", tk, row)
-    return row, sek_rate, snap
+    return row, snap
 
 if save_clicked and ticker_in:
     adv = dict(
@@ -526,7 +534,7 @@ if save_clicked and ticker_in:
         rotce=rotce, payout=payout, affo_ps0=affo_ps0, nav_ps0=nav_ps0, nii_ps0=nii_ps0,
         bv_ps0=bv_ps0, fcf_ps0=fcf_ps0
     )
-    row, rate, snap = handle_one_ticker_save(ticker_in, bucket_in, antal_in, pref_method_in, g1_in, g2_in, g3_in, adv)
+    handle_one_ticker_save(ticker_in, bucket_in, antal_in, pref_method_in, g1_in, g2_in, g3_in, adv)
     st.success(f"{ticker_in} sparad/uppdaterad i Google Sheets.")
 
 if do_mass_refresh:
@@ -534,12 +542,15 @@ if do_mass_refresh:
     if data_df.empty:
         st.warning("Inga bolag i Data ännu.")
     else:
-        # samla valutor, hämta FX i ett svep
-        cur_list = sorted({c for c in data_df["Valuta"].fillna("SEK").tolist()})
+        # Hämta FX i klump
+        cur_list = sorted({(c or "SEK") for c in data_df["Valuta"].tolist()})
         rates = fetch_fx_to_sek(cur_list)
         persist_fx(ws_fx, rates)
+        # Uppdatera varje ticker
         for _, r in data_df.iterrows():
-            tk = r["Ticker"]
+            tk = r.get("Ticker", "")
+            if not tk:
+                continue
             try:
                 adv = dict(
                     pe_hist=r.get("PE_hist", np.nan), eps0=r.get("EPS0", np.nan),
@@ -572,11 +583,17 @@ if data_df.empty:
     st.stop()
 
 # FX cache
-cur_list = sorted({c for c in data_df["Valuta"].fillna("SEK").tolist()})
+cur_list = sorted({(c or "SEK") for c in data_df["Valuta"].tolist()})
 fx = fetch_fx_to_sek(cur_list)
 sek_rate_for = lambda c: fx.get(c or "SEK", 1.0)
 
-# Beräkna alla metoder per rad och välj primär metod
+# Metoder
+def targets_from_price_multiple(metric_ps0: float, multiple: float,
+                                g1: float, g2: float, g3: float) -> Tuple[float, float, float, float]:
+    today = multiple * metric_ps0
+    y1, y2, y3 = multi_year(metric_ps0, g1, g2, g3)
+    return today, multiple * y1, multiple * y2, multiple * y3
+
 def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     cur = r.get("Valuta") or "SEK"
     px = float(nz(r.get("Last Price"), 0.0))
@@ -615,43 +632,31 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     bv_ps0 = float(nz(r.get("BV_ps0"), 0.0))
     fcf_ps0 = float(nz(r.get("FCF_ps0"), 0.0))
 
-    # flaggor
     has_fcf = fcf0 > 0.0
     has_ebitda = ebitda0 > 0.0
 
     vals = {}
-
     # P/E
     vals["pe_hist_vs_eps"] = target_from_PE(eps0, pe_hist, g1, g2, g3)
-
     # EV/FCF
     vals["ev_fcf"] = targets_from_ev_multiple(fcf0, ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
-
     # P/FCF
     vals["p_fcf"] = targets_from_price_multiple(fcf_ps0, p_fcf_mult, g1, g2, g3)
-
     # EV/S
     vals["ev_sales"] = targets_from_ev_multiple(rev0, ev_s_mult, net_debt, shares_out, g1, g2, g3)
-
     # EV/EBITDA
     vals["ev_ebitda"] = targets_from_ev_multiple(ebitda0, ev_eb_mult, net_debt, shares_out, g1, g2, g3)
-
     # P/NAV
     vals["p_nav"] = targets_from_price_multiple(nav_ps0, p_nav_mult, g1, g2, g3)
-
-    # EV/DACF (använder EBITDA om DACF ej ifyllt – proxy)
+    # EV/DACF (fallback: EV/EBITDA-mult)
     vals["ev_dacf"] = targets_from_ev_multiple(ebitda0, 6.0 if math.isclose(ev_eb_mult,0.0) else ev_eb_mult, net_debt, shares_out, g1, g2, g3)
-
     # P/AFFO
     vals["p_affo"] = targets_from_price_multiple(affo_ps0, p_affo_mult, g1, g2, g3)
-
     # P/B
     vals["p_b"] = targets_from_price_multiple(bv_ps0, p_b_mult, g1, g2, g3)
-
     # P/TBV med TBV-projektion
     tbv1, tbv2, tbv3 = project_tbv_per_share(tbv_ps0, rotce, payout)
     vals["p_tbv"] = (p_tbv_mult * tbv_ps0, p_tbv_mult * tbv1, p_tbv_mult * tbv2, p_tbv_mult * tbv3)
-
     # P/NII
     vals["p_nii"] = targets_from_price_multiple(nii_ps0, p_nii_mult, g1, g2, g3)
 
@@ -675,11 +680,22 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     div_ps = float(nz(r.get("Dividend/ps"), 0.0))
     da = float(nz(r.get("Dividend Yield"), 0.0)) * 100.0 if nz(r.get("Dividend Yield"), 0.0) else (safe_div(div_ps, px, 0.0) * 100.0 if px>0 else 0.0)
 
-    # SEK
+    # SEK-värden
     rate = sek_rate_for(cur)
     innehav_sek = int(nz(r.get("Antal aktier"),0)) * px * rate
     utd_år_sek = int(nz(r.get("Antal aktier"),0)) * div_ps * rate
     upside = safe_div(today, px, 0.0) - 1.0 if px>0 else 0.0
+
+    # Inputs-sammanfattning (sparas med Resultat)
+    inputs = {
+        "g1": g1, "g2": g2, "g3": g3,
+        "pe_hist": pe_hist, "eps0": eps0,
+        "ev_fcf": ev_fcf_mult, "p_fcf": p_fcf_mult, "ev_s": ev_s_mult, "ev_ebitda": ev_eb_mult,
+        "p_nav": p_nav_mult, "p_affo": p_affo_mult, "p_b": p_b_mult, "p_tbv": p_tbv_mult, "p_nii": p_nii_mult,
+        "tbv_ps0": tbv_ps0, "rotce": rotce, "payout": payout, "affo_ps0": affo_ps0, "nav_ps0": nav_ps0,
+        "nii_ps0": nii_ps0, "bv_ps0": bv_ps0, "fcf_ps0": fcf_ps0,
+        "shares_fd": shares_out, "net_debt": net_debt
+    }
 
     return {
         "Ticker": r.get("Ticker"),
@@ -701,15 +717,7 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
         "Bear 1y": br1,
         "Upside_%": upside*100.0,
         "Alla metoder": vals,
-        "Inputs": {
-            "g1": g1, "g2": g2, "g3": g3,
-            "pe_hist": pe_hist, "eps0": eps0,
-            "ev_fcf": ev_fcf_mult, "p_fcf": p_fcf_mult, "ev_s": ev_s_mult, "ev_ebitda": ev_eb_mult,
-            "p_nav": p_nav_mult, "p_affo": p_affo_mult, "p_b": p_b_mult, "p_tbv": p_tbv_mult, "p_nii": p_nii_mult,
-            "tbv_ps0": tbv_ps0, "rotce": rotce, "payout": payout, "affo_ps0": affo_ps0, "nav_ps0": nav_ps0,
-            "nii_ps0": nii_ps0, "bv_ps0": bv_ps0, "fcf_ps0": fcf_ps0,
-            "shares_fd": shares_out, "net_debt": net_debt
-        }
+        "Inputs": inputs
     }
 
 calc_rows = []
@@ -737,11 +745,22 @@ st.markdown("## 📊 Rangordning (störst uppsida →)")
 show_cols = ["Ticker","Namn","Bucket","Valuta","Pris","Primär metod","Fair idag","Fair 1y","Upside_%","Antal","Innehav_SEK","Utdelning/år_SEK","DA_%"]
 st.dataframe(calc_df[show_cols].reset_index(drop=True), use_container_width=True)
 
-# Spara ”Resultat” (primär metod) till Sheets
+# =========================
+# Spara primära riktkurser till "Resultat"
+# =========================
+
+def stringify_inputs(d: Dict[str, Any]) -> str:
+    parts = []
+    for k, v in d.items():
+        if isinstance(v, float):
+            parts.append(f"{k}:{v:.4f}")
+        else:
+            parts.append(f"{k}:{str(v)}")
+    return "|".join(parts).replace(" ", "_")
+
 def persist_result_row(tkr: str, cur: str, pris: float, vals: Dict[str, Any], inputs: Dict[str, Any], method: str):
     today, y1, y2, y3 = vals.get(method, (0.0,0.0,0.0,0.0))
     b1, br1 = bull_bear(y1, bull_mult, bear_mult)
-    url = build_gas_url(tkr, method, inputs, inputs.get("shares_fd"), note="fair_value_targets")
     row = {
         "Timestamp": now_ts(),
         "Ticker": tkr,
@@ -755,7 +774,7 @@ def persist_result_row(tkr: str, cur: str, pris: float, vals: Dict[str, Any], in
         "Bear 1 år": br1,
         "Metod": method,
         "Input-sammanfattning": stringify_inputs(inputs),
-        "Kommentar": url,  # lägger URL i kommentarsfält
+        "Kommentar": "",  # renad: ingen URL
     }
     upsert_row(ws_res, "Ticker", tkr, row)
 
@@ -766,19 +785,17 @@ if st.button("💾 Spara primära riktkurser till fliken Resultat"):
         persist_result_row(r["Ticker"], r["Valuta"], r["Pris"], vals, inputs, r["Primär metod"])
     st.success("Primära riktkurser sparade till 'Resultat'.")
 
+# =========================
 # Detaljer per bolag (alla metoder)
+# =========================
+
 st.markdown("## 🔎 Detaljer per bolag (alla värderingsmetoder)")
 for _, r in calc_df.iterrows():
     with st.expander(f"{r['Ticker']} • {r['Namn']} • {r['Bucket']}"):
         st.write(f"**Valuta:** {r['Valuta']} • **Pris:** {fmt2(r['Pris'])} • **Primär metod:** `{r['Primär metod']}`")
-        # tabell över metoder
         rows = []
         for m, (t0, t1, t2, t3) in r["Alla metoder"].items():
             b1, br1 = bull_bear(t1, bull_mult, bear_mult)
             rows.append([m, t0, t1, t2, t3, b1, br1])
         dfm = pd.DataFrame(rows, columns=["Metod","Idag","1 år","2 år","3 år","Bull 1 år","Bear 1 år"])
         st.dataframe(dfm, use_container_width=True)
-
-        # kopieringsbar URL för primär metod
-        url = build_gas_url(r["Ticker"], r["Primär metod"], r["Inputs"], r["Inputs"].get("shares_fd"), note="fair_value_targets")
-        st.code(url, language="text")
