@@ -1,10 +1,8 @@
-# app.py — Riktkurser + Google Sheets (v4.3, split 1/4)
-# Nytt/ändrat:
-# - Robust pris-normalisering (hanteras i Del 2) för Yahoo (fast_info i cent → ÷100).
-# - FX hämtas & loggas (Del 2), portföljsummering i SEK (Del 4).
-# - Kvartalssnapshot till fliken "Historik".
-# - Rangordning, export till "Resultat".
-# - Buckets, filter äger/ej, utd-data.
+# app.py — Riktkurser + Google Sheets (v4.4, split 1/4)
+# Nytt:
+# - Sanity-flaggor: visar när pris skalsäkrats (÷100 eller ersatt med MC/Shares) och när EPS skalsäkrats (÷100).
+# - Dessa flaggor syns i rankingtabell, detaljvyer och sparas som kommentar i "Resultat".
+# - Fortsatt robust pris-normalisering + FX-loggning + kvartalssnapshots.
 
 from __future__ import annotations
 import math, json, re, time
@@ -173,23 +171,42 @@ def upsert_row(ws: gspread.Worksheet, key_col: str, key_val: str, row_dict: Dict
     df = read_df(ws)
     header = ws.row_values(1)
     if df.empty:
-        ws.append_row([row_dict.get(c, "") for c in header])
+        ws.append_row([row_dict.get(c, "") for c in header], value_input_option="RAW")
         return
     idx = df.index[df.get(key_col, pd.Series(dtype=object)) == key_val].tolist()
     if idx:
         rnum = idx[0] + 2  # 1-baserad + rubrikrad
         existing = ws.row_values(rnum)
         new_row = [row_dict.get(col, existing[i] if i < len(existing) else "") for i, col in enumerate(header)]
-        ws.update(f"A{rnum}:{col_idx_to_a1(len(header))}{rnum}", [new_row])
+        ws.update(f"A{rnum}:{col_idx_to_a1(len(header))}{rnum}", [new_row], value_input_option="RAW")
     else:
-        ws.append_row([row_dict.get(c, "") for c in header])
+        ws.append_row([row_dict.get(c, "") for c in header], value_input_option="RAW")
 
 # ========== Del 2/4 — Datakällor (Yahoo/FX/Finnhub/SEC), motor & heuristik ==========
 
-# ---------- Små hjälpare ----------
+# ---------- Numerisk robust konvertering (hanterar "202,92", mellanslag, valutasymboler) ----------
+def to_float(x, default: float = 0.0) -> float:
+    if x is None:
+        return default
+    if isinstance(x, (int, float)) and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return float(x)
+    try:
+        s = str(x)
+        # ta bort tusentalsmellanslag, NBSP, valutatecken
+        s = s.replace("\u00A0", " ").replace(" ", "")
+        s = re.sub(r"[A-Za-z%$€£¥krKR]", "", s)
+        # ersätt komma med punkt
+        s = s.replace(",", ".")
+        if s == "" or s == ".":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+# ---------- Hjälpare ----------
 def _first(*vals):
     for v in vals:
-        if v is None: 
+        if v is None:
             continue
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             continue
@@ -225,7 +242,7 @@ def _fi_get(fi_obj, key):
         return None
 
 def _norm_price(px, mcap=None, shares=None):
-    """Normalisera pris. Om px ser ut att vara i cent (mycket stort tal), dividera med 100.
+    """Normalisera pris. Om px ser ut att vara i cent (orimligt stort), dividera med 100.
        Använder även mcap/shares som referens där det går."""
     try:
         if px is None:
@@ -243,7 +260,7 @@ def _norm_price(px, mcap=None, shares=None):
             # px redan rätt skala?
             if abs(px - ref) / ref < 0.03:
                 return px
-            # ingen bra match: antag cent om px väldigt stort
+            # px väldigt stort → anta cent
             if px > 10000:
                 return px / 100.0
             return px
@@ -641,17 +658,18 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
             return "p_fcf"
         return "p_b"
 
-# ========== Del 3/4 — UI, öppna Sheets, autofyll & spara en ticker ==========
+# ========== Del 3/4 — UI, Sheets-öppning, autofyll, snapshots & spara en ticker ==========
 
-# ---------- Sidopanel ----------
+# ---------- Sidopanel: datakällor, filter & massuppdateringsknapp ----------
 with st.sidebar:
     st.header("Inställningar & datakällor")
-    use_finnhub = st.checkbox("Använd Finnhub (EPS/BV/PE-band)", value=True)
-    try_sec = st.checkbox("Försök SEC beta (NII/FFO/AFFO)", value=False)
-    autosave_hist = st.checkbox("Autospara kvartalssnapshot efter massuppdatering", value=True)
+    use_finnhub   = st.checkbox("Använd Finnhub (EPS/BV/P-E-band)", value=True)
+    try_sec       = st.checkbox("Försök SEC beta (NII/AFFO/FFO per aktie)", value=False)
+    autosave_hist = st.checkbox("Autospara kvartalssnapshots vid massuppdatering", value=True)
+
     bull_mult = st.number_input("Bull × (på 1-års riktkurs)", value=1.15, step=0.05, format="%.2f")
     bear_mult = st.number_input("Bear × (på 1-års riktkurs)", value=0.85, step=0.05, format="%.2f")
-    st.caption("Basvaluta/visning: SEK (FX hämtas automatiskt).")
+    st.caption("Visning sker i bolagets valuta; portföljvärde summeras i SEK.")
 
     st.markdown("---")
     st.subheader("Filter")
@@ -659,47 +677,51 @@ with st.sidebar:
         "Bucket A tillväxt","Bucket B tillväxt","Bucket C tillväxt",
         "Bucket A utdelning","Bucket B utdelning","Bucket C utdelning",
     ]
-    pick_buckets = st.multiselect("Välj buckets att visa:", bucket_opts, default=bucket_opts)
+    pick_buckets = st.multiselect("Välj buckets att visa", bucket_opts, default=bucket_opts)
     only_owned = st.checkbox("Visa endast innehav (>0 aktier)", value=False)
-    only_watch = st.checkbox("Visa endast bevakningslista (0 aktier)", value=False)
+    only_watch = st.checkbox("Visa endast bevakning (0 aktier)", value=False)
 
     st.markdown("---")
     st.subheader("Uppdatering")
-    do_mass_refresh = st.button("🔄 Uppdatera alla (Yahoo+Finnhub+SEC beta+FX)")
+    do_mass_refresh = st.button("🔄 Uppdatera alla (Yahoo + Finnhub + SEC + FX)")
 
     st.markdown("---")
-    st.caption("Senaste FX→SEK (Yahoo)")
-    fx_preview = fetch_fx_to_sek(["USD","EUR","NOK","CAD","GBP","DKK"])
-    if fx_preview:
-        st.write({k: round(v, 4) for k, v in fx_preview.items()})
+    st.caption("Snabb-FX (SEK per 1 enhet)")
+    try:
+        fx_preview = fetch_fx_to_sek(["USD","EUR","NOK","CAD","GBP","DKK"])
+        if fx_preview:
+            st.write({k: round(v, 4) for k, v in fx_preview.items()})
+    except Exception:
+        st.write("—")
 
 # ---------- Lägg till / uppdatera bolag ----------
 st.markdown("## ➕ Lägg till/uppdatera bolag")
-col = st.columns(5)
-ticker_in = col[0].text_input("Ticker (t.ex. NVDA)", "")
-bucket_in = col[1].selectbox("Bucket", bucket_opts, index=0)
-antal_in = col[2].number_input("Antal aktier", min_value=0, value=0, step=1)
-pref_method_in = col[3].selectbox(
+cols_top = st.columns(5)
+ticker_in = cols_top[0].text_input("Ticker (t.ex. NVDA)", "")
+bucket_in = cols_top[1].selectbox("Bucket", bucket_opts, index=0)
+antal_in  = cols_top[2].number_input("Antal aktier", min_value=0, value=0, step=1)
+pref_method_in = cols_top[3].selectbox(
     "Preferred metod (valfritt – annars AUTO)",
-    ["AUTO","pe_hist_vs_eps","ev_fcf","p_fcf","ev_sales","ev_ebitda","p_nav","ev_dacf","p_affo","p_b","p_tbv","p_nii"],
+    ["AUTO","pe_hist_vs_eps","ev_fcf","p_fcf","ev_sales","ev_ebitda",
+     "p_nav","ev_dacf","p_affo","p_b","p_tbv","p_nii"],
     index=0
 )
-g1_in = col[4].number_input("G1 (år 1)", value=0.15, step=0.01, format="%.2f")
+g1_in = cols_top[4].number_input("G1 (år 1, t.ex. 0.15 = 15%)", value=0.15, step=0.01, format="%.2f")
 g2_in = st.number_input("G2 (år 2)", value=0.12, step=0.01, format="%.2f")
 g3_in = st.number_input("G3 (år 3)", value=0.10, step=0.01, format="%.2f")
 
-with st.expander("Avancerat (frivilligt) – multiplar/inputs per metod"):
+with st.expander("Avancerat (frivilligt) – multiplar & per-aktie-inputs"):
     c1,c2,c3,c4 = st.columns(4)
-    pe_hist = c1.number_input("P/E hist snitt", value=15.0, step=0.5, format="%.2f")
-    eps0   = c2.number_input("EPS0 (idag)", value=0.00, step=0.01, format="%.2f")
+    pe_hist     = c1.number_input("P/E historiskt snitt", value=15.0, step=0.5, format="%.2f")
+    eps0        = c2.number_input("EPS0 (idag)", value=0.00, step=0.01, format="%.2f")
     ev_fcf_mult = c3.number_input("EV/FCF-multiple", value=18.0, step=0.5, format="%.2f")
     p_fcf_mult  = c4.number_input("P/FCF-multiple", value=20.0, step=0.5, format="%.2f")
 
     c5,c6,c7,c8 = st.columns(4)
-    ev_s_mult = c5.number_input("EV/S-multiple", value=5.0, step=0.5, format="%.2f")
+    ev_s_mult      = c5.number_input("EV/S-multiple", value=5.0, step=0.5, format="%.2f")
     ev_ebitda_mult = c6.number_input("EV/EBITDA-multiple", value=12.0, step=0.5, format="%.2f")
-    p_nav_mult = c7.number_input("P/NAV-multiple", value=1.00, step=0.05, format="%.2f")
-    p_affo_mult = c8.number_input("P/AFFO-multiple (REIT)", value=13.0, step=0.5, format="%.2f")
+    p_nav_mult     = c7.number_input("P/NAV-multiple", value=1.00, step=0.05, format="%.2f")
+    p_affo_mult    = c8.number_input("P/AFFO-multiple (REIT)", value=13.0, step=0.5, format="%.2f")
 
     c9,c10,c11,c12 = st.columns(4)
     p_b_mult   = c9.number_input("P/B-multiple", value=1.50, step=0.05, format="%.2f")
@@ -708,8 +730,8 @@ with st.expander("Avancerat (frivilligt) – multiplar/inputs per metod"):
     tbv_ps0    = c12.number_input("TBV/aktie (idag)", value=0.00, step=0.01, format="%.2f")
 
     c13,c14,c15,c16 = st.columns(4)
-    rotce  = c13.number_input("ROTCE (t.ex. 0.12=12%)", value=0.12, step=0.01, format="%.2f")
-    payout = c14.number_input("Payout-ratio", value=0.30, step=0.05, format="%.2f")
+    rotce   = c13.number_input("ROTCE (t.ex. 0.12 = 12%)", value=0.12, step=0.01, format="%.2f")
+    payout  = c14.number_input("Payout-ratio", value=0.30, step=0.05, format="%.2f")
     affo_ps0 = c15.number_input("AFFO/aktie (idag)", value=0.00, step=0.01, format="%.2f")
     nav_ps0  = c16.number_input("NAV/aktie (idag)", value=0.00, step=0.01, format="%.2f")
 
@@ -718,7 +740,7 @@ with st.expander("Avancerat (frivilligt) – multiplar/inputs per metod"):
     bv_ps0  = c18.number_input("BV/aktie (idag)", value=0.00, step=0.01, format="%.2f")
     fcf_ps0 = c19.number_input("FCF/aktie (idag)", value=0.00, step=0.01, format="%.2f")
 
-save_clicked = st.button("💾 Spara till Google Sheets (hämtar Yahoo+Finnhub+SEC beta+FX)")
+save_clicked = st.button("💾 Spara till Google Sheets (hämtar Yahoo + Finnhub + SEC + FX)")
 
 # ---------- Öppna Sheets ----------
 try:
@@ -727,47 +749,68 @@ except Exception:
     st.error("Kunde inte öppna Google Sheet. Kontrollera SHEET_ID/SHEET_URL och delning med service-kontot.")
     st.stop()
 
-# ---------- Autofyll från källor ----------
+# ---------- Snapshot-funktion (för Resultat/Historik) ----------
+def save_quarter_snapshot(row: Dict[str,Any],
+                          pe_band: Tuple[Optional[float],Optional[float],Optional[float]],
+                          primary: str,
+                          fair_tuple: Tuple[float,float,float,float],
+                          b1: float, br1: float, upside_pct: float):
+    """Sparar en rad till fliken Historik med nyckel Ticker|YYYY-QX."""
+    _,_, yq = yq_of()
+    key = f"{row.get('Ticker','')}|{yq}"
+    p25,p50,p75 = (pe_band or (None,None,None))
+    t0,t1,t2,t3 = fair_tuple
+    hist = {
+        "Key": key, "Timestamp": now_ts(), "YQ": yq,
+        "Ticker": row.get("Ticker",""), "Namn": row.get("Bolagsnamn",""),
+        "Valuta": row.get("Valuta",""), "Pris": row.get("Last Price",0.0),
+        "PE_p25": p25 if p25 is not None else "",
+        "PE_p50": p50 if p50 is not None else "",
+        "PE_p75": p75 if p75 is not None else "",
+        "PE_hist": row.get("PE_hist",""),
+        "G1": row.get("G1",""), "G2": row.get("G2",""), "G3": row.get("G3",""),
+        "Primär metod": primary,
+        "Fair_today": t0, "Fair_1y": t1, "Fair_2y": t2, "Fair_3y": t3,
+        "Bull_1y": b1, "Bear_1y": br1, "Upside_%": upside_pct,
+        "EPS_TTM": row.get("EPS0",""), "BV_ps0": row.get("BV_ps0",""),
+        "FCF_ps0": row.get("FCF_ps0",""), "NII_ps0": row.get("NII_ps0",""),
+        "AFFO_ps0": row.get("AFFO_ps0",""), "NAV_ps0": row.get("NAV_ps0",""),
+        "TBV_ps0": row.get("TBV_ps0",""), "Shares_Out": row.get("Shares Out",""),
+        "Sektor": row.get("Sektor",""), "Industri": row.get("Industri",""),
+    }
+    upsert_row(ws_hist, "Key", key, hist)
+
+# ---------- Autofyll från källor (Finnhub/SEC) ----------
 def auto_fill_from_sources(tk: str, row: Dict[str,Any], use_finn: bool, use_sec_beta: bool) -> Dict[str,Any]:
-    # Finnhub: EPS TTM / Book value per share + PE-band
+    # Finnhub: EPS TTM / Book value per share + P/E-band
     if use_finn:
         fm = fetch_finnhub_metrics(tk) or {}
-        if fm.get("eps_ttm") and not row.get("EPS0"):
-            row["EPS0"] = fm["eps_ttm"]
-        if fm.get("book_ps") and not row.get("BV_ps0"):
-            row["BV_ps0"] = fm["book_ps"]
-        band = fm.get("pe_band")
-        if band and not row.get("PE_hist"):
-            row["PE_hist"] = band[1] if band[1] else row.get("PE_hist")
-        row["_pe_band"] = band  # bär vidare för ev. snapshot
+        if fm.get("eps_ttm") and not row.get("EPS0"):    row["EPS0"]   = fm["eps_ttm"]
+        if fm.get("book_ps") and not row.get("BV_ps0"):  row["BV_ps0"] = fm["book_ps"]
+        row["_pe_band"] = fm.get("pe_band")
 
-    # Härled FCF/aktie om vi har FCF TTM och Shares Out
+    # Härled FCF/aktie om FCF TTM + Shares finns
     if not row.get("FCF_ps0"):
         fcf_ttm = nz(row.get("FCF TTM"), 0.0)
-        shs = nz(row.get("Shares Out"), 0.0)
+        shs     = nz(row.get("Shares Out"), 0.0)
         if fcf_ttm and shs:
-            try:
-                row["FCF_ps0"] = float(fcf_ttm) / float(shs)
-            except Exception:
-                pass
+            row["FCF_ps0"] = safe_div(float(fcf_ttm), float(shs), 0.0)
 
-    # Anta NAV≈BV om REIT/BDC-industri (bästa ansträngning)
+    # REIT/BDC hint → NAV≈BV om NAV saknas
     ind = (row.get("Industri") or "").lower()
-    if not row.get("NAV_ps0") and ("reit" in ind or "real estate" in ind or tk in BDC_TICKERS):
+    if not row.get("NAV_ps0") and ("reit" in ind or "real estate" in ind or tk.upper() in BDC_TICKERS):
         if row.get("BV_ps0"):
             row["NAV_ps0"] = row["BV_ps0"]
 
-    # SEC beta: NII/AFFO per aktie om möjligt
+    # SEC beta: NII/AFFO per aktie
     if use_sec_beta:
         try:
             secv = sec_try_nii_affo_ps(tk) or {}
             if secv.get("nii_ps") and not row.get("NII_ps0"):
                 row["NII_ps0"] = secv["nii_ps"]
             if not row.get("AFFO_ps0"):
-                if secv.get("affo_ps"):
-                    row["AFFO_ps0"] = secv["affo_ps"]
-                elif secv.get("ffo_ps"):
-                    row["AFFO_ps0"] = secv["ffo_ps"]
+                if secv.get("affo_ps"): row["AFFO_ps0"] = secv["affo_ps"]
+                elif secv.get("ffo_ps"): row["AFFO_ps0"] = secv["ffo_ps"]
         except Exception:
             pass
     return row
@@ -775,8 +818,8 @@ def auto_fill_from_sources(tk: str, row: Dict[str,Any], use_finn: bool, use_sec_
 # ---------- Spara/uppdatera en ticker ----------
 def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: str,
                            g1: float, g2: float, g3: float,
-                           adv: Dict[str, Any], use_finn: bool, use_sec_beta: bool):
-    tk = ticker.strip().upper()
+                           adv: Dict[str, Any], use_finn: bool, use_sec_beta: bool) -> Dict[str,Any]:
+    tk = (ticker or "").strip().upper()
     snap = fetch_yahoo_snapshot(tk)
 
     cur = snap.get("currency") or "SEK"
@@ -789,6 +832,8 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
         "Sektor": snap.get("sector") or "", "Industri": snap.get("industry") or "",
         "Valuta": cur, "Bucket": bucket, "Antal aktier": int(antal),
         "Preferred metod": pref_method, "G1": g1, "G2": g2, "G3": g3,
+
+        # Avancerat (inputs)
         "PE_hist": adv.get("pe_hist"), "EPS0": adv.get("eps0"),
         "EV_FCF_mult": adv.get("ev_fcf_mult"), "P_FCF_mult": adv.get("p_fcf_mult"),
         "EV_S_mult": adv.get("ev_s_mult"), "EV_EBITDA_mult": adv.get("ev_ebitda_mult"),
@@ -799,15 +844,17 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
         "AFFO_ps0": adv.get("affo_ps0"), "NAV_ps0": adv.get("nav_ps0"),
         "NII_ps0": adv.get("nii_ps0"), "BV_ps0": adv.get("bv_ps0"),
         "FCF_ps0": adv.get("fcf_ps0"),
-        "Last Price": snap.get("last_price") or 0.0,
-        "Market Cap": snap.get("market_cap") or 0.0,
-        "EV": snap.get("enterprise_value") or 0.0,
-        "Shares Out": snap.get("shares_out") or 0.0,
+
+        # Yahoo snapshot
+        "Last Price":  snap.get("last_price") or 0.0,
+        "Market Cap":  snap.get("market_cap") or 0.0,
+        "EV":          snap.get("enterprise_value") or 0.0,
+        "Shares Out":  snap.get("shares_out") or 0.0,
         "Revenue TTM": snap.get("revenue_ttm") or 0.0,
-        "EBITDA TTM": snap.get("ebitda_ttm") or 0.0,
-        "FCF TTM": snap.get("fcf_ttm") or 0.0,
-        "Total Debt": snap.get("total_debt") or 0.0,
-        "Cash": snap.get("cash") or 0.0,
+        "EBITDA TTM":  snap.get("ebitda_ttm") or 0.0,
+        "FCF TTM":     snap.get("fcf_ttm") or 0.0,
+        "Total Debt":  snap.get("total_debt") or 0.0,
+        "Cash":        snap.get("cash") or 0.0,
         "Dividend/ps": snap.get("dividend_ps") or 0.0,
         "Dividend Yield": snap.get("dividend_yield") or 0.0,
     }
@@ -819,39 +866,66 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
 # ---------- UI-knapp: spara en ----------
 if save_clicked and ticker_in:
     adv = dict(
-        pe_hist=pe_hist, eps0=eps0, ev_fcf_mult=ev_fcf_mult, p_fcf_mult=p_fcf_mult,
-        ev_s_mult=ev_s_mult, ev_ebitda_mult=ev_ebitda_mult, p_nav_mult=p_nav_mult, p_affo_mult=p_affo_mult,
-        p_b_mult=p_b_mult, p_tbv_mult=p_tbv_mult, p_nii_mult=p_nii_mult, tbv_ps0=tbv_ps0,
-        rotce=rotce, payout=payout, affo_ps0=affo_ps0, nav_ps0=nav_ps0, nii_ps0=nii_ps0,
-        bv_ps0=bv_ps0, fcf_ps0=fcf_ps0
+        pe_hist=pe_hist, eps0=eps0,
+        ev_fcf_mult=ev_fcf_mult, p_fcf_mult=p_fcf_mult,
+        ev_s_mult=ev_s_mult, ev_ebitda_mult=ev_ebitda_mult,
+        p_nav_mult=p_nav_mult, p_affo_mult=p_affo_mult,
+        p_b_mult=p_b_mult, p_tbv_mult=p_tbv_mult, p_nii_mult=p_nii_mult,
+        tbv_ps0=tbv_ps0, rotce=rotce, payout=payout,
+        affo_ps0=affo_ps0, nav_ps0=nav_ps0, nii_ps0=nii_ps0, bv_ps0=bv_ps0, fcf_ps0=fcf_ps0
     )
-    row = handle_one_ticker_save(
-        ticker_in, bucket_in, antal_in, pref_method_in, g1_in, g2_in, g3_in,
+    saved = handle_one_ticker_save(
+        ticker_in, bucket_in, int(antal_in), pref_method_in,
+        float(g1_in), float(g2_in), float(g3_in),
         adv, use_finnhub, try_sec
     )
-    if not row.get("Last Price"):
+    if not saved.get("Last Price"):
         st.warning(f"{ticker_in}: pris saknas från Yahoo – försök igen senare.")
     else:
         st.success(f"{ticker_in} sparad/uppdaterad i Google Sheets.")
 
-# ========== Del 4/4 — Beräkna/visa, portföljsummering, massuppdatering, export & snapshots ==========
+# ========== Del 4/4 — Beräkna/visa (med sanity-flaggor), portfölj i SEK, export, massuppdatering, snapshots ==========
 
-# --- Läs Data (efter ev. spar) ---
+# --- Läs Data efter ev. spar ---
 data_df = read_df(ws_data)
 if data_df.empty:
     st.info("Lägg till minst ett bolag ovan så visas vyer här nedanför.")
     st.stop()
 
-# --- FX för värdering i SEK (pris visas i bolagsvaluta) ---
+# --- FX till SEK (pris visas i bolagets valuta; SEK används för summering) ---
 fx_map = fetch_fx_to_sek(sorted({(c or "SEK") for c in data_df["Valuta"].tolist()}))
 sek_rate_for = lambda c: fx_map.get(c or "SEK", 1.0)
 
-# ---------- Värdering för en rad ----------
+# ---------- Värdering för en rad (inkl. sanity-flaggor) ----------
 def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
+    flags: List[str] = []
+
     cur = r.get("Valuta") or "SEK"
-    px = float(nz(r.get("Last Price"), 0.0))
-    mc = float(nz(r.get("Market Cap"), 0.0))
-    shares_out = float(nz(r.get("Shares Out"), safe_div(mc, px, 0.0)))
+    px  = float(nz(r.get("Last Price"), 0.0))
+    mc  = float(nz(r.get("Market Cap"), 0.0))
+    shs = float(nz(r.get("Shares Out"), 0.0))
+
+    # Pris-sanity 1: om extremt stort → tolka som cent
+    if px > 10000:
+        px = px / 100.0
+        flags.append("price÷100")
+
+    # Pris-sanity 2: använd MC/Shares om stor avvikelse (>20 %) eller px=0
+    if mc > 0 and shs > 0:
+        ref_px = mc / shs
+        if px == 0:
+            px = ref_px
+            flags.append("price=MC/Shares")
+        else:
+            try:
+                if 0.01 < ref_px < 100000 and abs(px - ref_px) / max(ref_px, 1e-9) > 0.20:
+                    px = ref_px
+                    flags.append("price=MC/Shares")
+            except Exception:
+                pass
+
+    # Härled shares_out om saknas
+    shares_out = shs if shs > 0 else safe_div(mc, px, 0.0)
 
     rev0    = float(nz(r.get("Revenue TTM"), 0.0))
     ebitda0 = float(nz(r.get("EBITDA TTM"), 0.0))
@@ -866,6 +940,12 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
 
     pe_hist      = float(nz(r.get("PE_hist"), 15.0))
     eps0         = float(nz(r.get("EPS0"), 0.0))
+
+    # EPS-sanity: om orimligt stor (t.ex. i cent), skala ned
+    if eps0 > 1000:
+        eps0 = eps0 / 100.0
+        flags.append("eps÷100")
+
     ev_fcf_mult  = float(nz(r.get("EV_FCF_mult"), 18.0))
     p_fcf_mult   = float(nz(r.get("P_FCF_mult"), 20.0))
     ev_s_mult    = float(nz(r.get("EV_S_mult"), 5.0))
@@ -890,19 +970,19 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
 
     vals = {}
     vals["pe_hist_vs_eps"] = target_from_PE(eps0, pe_hist, g1, g2, g3)
-    vals["ev_fcf"]   = targets_from_ev_multiple(fcf0,    ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
-    vals["p_fcf"]    = targets_from_price_multiple(fcf_ps0, p_fcf_mult, g1, g2, g3)
-    vals["ev_sales"] = targets_from_ev_multiple(rev0,    ev_s_mult,   net_debt, shares_out, g1, g2, g3)
-    vals["ev_ebitda"]= targets_from_ev_multiple(ebitda0, ev_eb_mult,  net_debt, shares_out, g1, g2, g3)
-    vals["p_nav"]    = targets_from_price_multiple(nav_ps0,  p_nav_mult,  g1, g2, g3)
+    vals["ev_fcf"]    = targets_from_ev_multiple(fcf0,    ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
+    vals["p_fcf"]     = targets_from_price_multiple(fcf_ps0, p_fcf_mult, g1, g2, g3)
+    vals["ev_sales"]  = targets_from_ev_multiple(rev0,    ev_s_mult,   net_debt, shares_out, g1, g2, g3)
+    vals["ev_ebitda"] = targets_from_ev_multiple(ebitda0, ev_eb_mult,  net_debt, shares_out, g1, g2, g3)
+    vals["p_nav"]     = targets_from_price_multiple(nav_ps0,  p_nav_mult,  g1, g2, g3)
     # ev_dacf: fallback 6x om ev_eb_mult==0
     dacf_mult = 6.0 if math.isclose(ev_eb_mult, 0.0) else ev_eb_mult
-    vals["ev_dacf"]  = targets_from_ev_multiple(ebitda0, dacf_mult,   net_debt, shares_out, g1, g2, g3)
-    vals["p_affo"]   = targets_from_price_multiple(affo_ps0, p_affo_mult, g1, g2, g3)
-    vals["p_b"]      = targets_from_price_multiple(bv_ps0,   p_b_mult,    g1, g2, g3)
-    tbv1,tbv2,tbv3   = project_tbv_per_share(tbv_ps0, rotce, payout)
-    vals["p_tbv"]    = (p_tbv_mult*tbv_ps0, p_tbv_mult*tbv1, p_tbv_mult*tbv2, p_tbv_mult*tbv3)
-    vals["p_nii"]    = targets_from_price_multiple(nii_ps0,  p_nii_mult,  g1, g2, g3)
+    vals["ev_dacf"]   = targets_from_ev_multiple(ebitda0, dacf_mult,   net_debt, shares_out, g1, g2, g3)
+    vals["p_affo"]    = targets_from_price_multiple(affo_ps0, p_affo_mult, g1, g2, g3)
+    vals["p_b"]       = targets_from_price_multiple(bv_ps0,   p_b_mult,    g1, g2, g3)
+    tbv1,tbv2,tbv3    = project_tbv_per_share(tbv_ps0, rotce, payout)
+    vals["p_tbv"]     = (p_tbv_mult*tbv_ps0, p_tbv_mult*tbv1, p_tbv_mult*tbv2, p_tbv_mult*tbv3)
+    vals["p_nii"]     = targets_from_price_multiple(nii_ps0,  p_nii_mult,  g1, g2, g3)
 
     # Primär metod
     pref = (r.get("Preferred metod") or "AUTO").strip().lower()
@@ -922,8 +1002,9 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
          else (safe_div(div_ps, px, 0.0)*100.0 if px>0 else 0.0)
 
     rate = sek_rate_for(cur)
-    innehav_sek = int(nz(r.get("Antal aktier"),0)) * px * rate
-    utd_år_sek  = int(nz(r.get("Antal aktier"),0)) * div_ps * rate
+    antal = int(nz(r.get("Antal aktier"),0))
+    innehav_sek = antal * px * rate
+    utd_år_sek  = antal * div_ps * rate
     upside = (safe_div(today, px, 0.0) - 1.0)*100.0 if px>0 else 0.0
 
     inputs = {
@@ -938,19 +1019,25 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     return {
         "Ticker": r.get("Ticker"), "Namn": r.get("Bolagsnamn"),
         "Valuta": cur, "Pris": px, "Rate_SEK": rate,
-        "Antal": int(nz(r.get("Antal aktier"),0)),
-        "Innehav_SEK": innehav_sek, "Utdelning/år_SEK": utd_år_sek, "DA_%": da,
+        "Antal": antal, "Innehav_SEK": innehav_sek, "Utdelning/år_SEK": utd_år_sek, "DA_%": da,
         "Bucket": r.get("Bucket"), "Primär metod": primary,
         "Fair idag": today, "Fair 1y": y1, "Fair 2y": y2, "Fair 3y": y3,
         "Bull 1y": b1, "Bear 1y": br1, "Upside_%": upside,
+        "Sanity": ", ".join(flags),
         "Alla metoder": vals, "Inputs": inputs
     }
 
-# ---------- Mass-snapshot-hjälp ----------
+# ---------- Hjälp för snapshots (används i massuppdatering) ----------
 def compute_primary_for_snapshot(row: Dict[str,Any]) -> Tuple[str, Tuple[float,float,float,float], float, float, float]:
     px = float(nz(row.get("Last Price"), 0.0))
     mc = float(nz(row.get("Market Cap"), 0.0))
-    shares_out = float(nz(row.get("Shares Out"), safe_div(mc, px, 0.0)))
+    shs = float(nz(row.get("Shares Out"), 0.0))
+    if px > 10000:
+        px /= 100.0
+    if mc > 0 and shs > 0 and (px == 0 or abs(px - mc/shs) / (mc/shs) > 0.20):
+        px = mc/shs
+
+    shares_out = shs if shs > 0 else safe_div(mc, px, 0.0)
     rev0    = float(nz(row.get("Revenue TTM"), 0.0))
     ebitda0 = float(nz(row.get("EBITDA TTM"), 0.0))
     fcf0    = float(nz(row.get("FCF TTM"), 0.0))
@@ -964,6 +1051,8 @@ def compute_primary_for_snapshot(row: Dict[str,Any]) -> Tuple[str, Tuple[float,f
 
     pe_hist      = float(nz(row.get("PE_hist"), 15.0))
     eps0         = float(nz(row.get("EPS0"), 0.0))
+    if eps0 > 1000: eps0 /= 100.0
+
     ev_fcf_mult  = float(nz(row.get("EV_FCF_mult"), 18.0))
     p_fcf_mult   = float(nz(row.get("P_FCF_mult"), 20.0))
     ev_s_mult    = float(nz(row.get("EV_S_mult"), 5.0))
@@ -1022,7 +1111,7 @@ if do_mass_refresh:
         done = 0
         for _, r in df.iterrows():
             tk = r.get("Ticker","")
-            if not tk: 
+            if not tk:
                 continue
             try:
                 adv = dict(
@@ -1052,7 +1141,7 @@ if do_mass_refresh:
                 st.warning(f"Misslyckades uppdatera {tk}: {e}")
         st.success(f"Alla bolag uppdaterade ({done} st).")
 
-# ---------- Beräkna alla (filter) ----------
+# ---------- Beräkna alla (respektera filter) ----------
 calc_rows=[]
 for _, rr in data_df.iterrows():
     if rr.get("Bucket") not in pick_buckets:
@@ -1094,33 +1183,33 @@ c3.metric("Utdelning per månad (SEK)", _sek(total_div_month_sek))
 st.caption("Summorna gäller bolagen i tabellen nedan (enligt dina filter).")
 
 # ---------- Rankingtabell ----------
-st.markdown("## 📊 Rangordning (störst uppsida →)")
+st.markdown("## 🧮 Rangordning (störst uppsida →)")
 show_cols = [
-    "Ticker","Namn","Bucket","Valuta","Pris","Primär metod",
+    "Ticker","Namn","Bucket","Valuta","Pris","Primär metod","Sanity",
     "Fair idag","Fair 1y","Upside_%","Antal","Innehav_SEK","Utdelning/år_SEK","DA_%"
 ]
 st.dataframe(calc_df[show_cols].reset_index(drop=True), use_container_width=True)
 
-# ---------- Export till fliken "Resultat" ----------
-def persist_result_row(tkr: str, cur: str, pris: float, vals: Dict[str, Any], inputs: Dict[str, Any], method: str):
+# ---------- Export till fliken "Resultat" (inkl. sanity i Kommentar) ----------
+def persist_result_row(tkr: str, cur: str, pris: float, vals: Dict[str, Any], inputs: Dict[str, Any], method: str, sanity: str):
     today,y1,y2,y3 = vals.get(method,(0.0,0.0,0.0,0.0))
     b1,br1 = bull_bear(y1, bull_mult, bear_mult)
+    comment = f"sanity:{sanity}" if sanity else ""
     row = {
         "Timestamp": now_ts(), "Ticker": tkr, "Valuta": cur, "Aktuell kurs (0)": pris,
         "Riktkurs idag": today, "Riktkurs 1 år": y1, "Riktkurs 2 år": y2, "Riktkurs 3 år": y3,
         "Bull 1 år": b1, "Bear 1 år": br1, "Metod": method,
-        "Input-sammanfattning": stringify_inputs(inputs), "Kommentar": "",
+        "Input-sammanfattning": stringify_inputs(inputs), "Kommentar": comment,
     }
     upsert_row(ws_res, "Ticker", tkr, row)
 
 if st.button("💾 Spara primära riktkurser till fliken Resultat"):
     for _, r in calc_df.iterrows():
-        persist_result_row(r["Ticker"], r["Valuta"], r["Pris"], r["Alla metoder"], r["Inputs"], r["Primär metod"])
+        persist_result_row(r["Ticker"], r["Valuta"], r["Pris"], r["Alla metoder"], r["Inputs"], r["Primär metod"], r.get("Sanity",""))
     st.success("Primära riktkurser sparade till 'Resultat'.")
 
 # ---------- Detaljer per bolag & snapshots ----------
 st.markdown("## 🔎 Detaljer per bolag (alla värderingsmetoder)")
-
 def set_pe_hist_in_data(ticker: str, pe_value: float):
     upsert_row(ws_data, "Ticker", ticker, {"Ticker": ticker, "PE_hist": pe_value, "Timestamp": now_ts()})
 
@@ -1128,6 +1217,8 @@ for _, r in calc_df.iterrows():
     tk = r["Ticker"]
     with st.expander(f"{tk} • {r['Namn']} • {r['Bucket']}"):
         st.write(f"**Valuta:** {r['Valuta']} • **Pris:** {fmt2(r['Pris'])} • **Primär metod:** `{r['Primär metod']}`")
+        if r.get("Sanity"):
+            st.caption(f"Sanity: {r['Sanity']}")
         rows = []
         for m, (t0,t1,t2,t3) in r["Alla metoder"].items():
             b1, br1 = bull_bear(t1, bull_mult, bear_mult)
@@ -1138,7 +1229,7 @@ for _, r in calc_df.iterrows():
         if use_finnhub:
             band = fetch_finnhub_metrics(tk).get("pe_band")
             p25,p50,p75 = (band or (None,None,None))
-            st.caption(f"P/E-band (≈ senaste 5–10 år): p25={fmt2(p25)} • p50={fmt2(p50)} • p75={fmt2(p75)}")
+            st.caption(f"P/E-band (≈ historik): p25={fmt2(p25)} • p50={fmt2(p50)} • p75={fmt2(p75)}")
 
             c1,c2,c3 = st.columns(3)
             if c1.button(f"Sätt PE_hist = p50 ({fmt2(p50)})", key=f"set_pe_{tk}") and p50:
