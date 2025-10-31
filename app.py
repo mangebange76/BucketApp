@@ -1,9 +1,10 @@
-# app.py — Riktkurser + Google Sheets (v4.6, split 1/4)
-# Nytt i v4.6:
-# - FIX: autoskalning (korrekt riktning: ratio<min → ÷10, ratio>max → ×10)
-# - "Rensa cache"-knapp i sidpanelen
-# - Autoskalade per-aktie-tal kan skrivas tillbaka till fliken Data (export + massuppd.)
-# - Kvartalssnapshots (Historik) + PE-band från Finnhub
+# app.py — Riktkurser + Google Sheets (v5.0, split 1/4)
+# Nytt i v5.0:
+# - Auto-läge för tillväxt: Analytiker (Finnhub) → CAGR⊕Manuell → Manuell
+# - Fixad autoskalning med slutlig clamp + sanity-flaggor
+# - Portföljvärde i SEK, pris visas i bolagets valuta
+# - Kvartalssnapshots + PE-band från Finnhub
+# - Writeback av autoskalade per-aktie-värden till fliken Data
 
 from __future__ import annotations
 import math, json, re, time
@@ -95,7 +96,7 @@ HIST_COLS = [
     "Shares_Out","Sektor","Industri"
 ]
 
-# FX-symboler för Yahoo
+# FX-symboler för Yahoo (valuta→SEK)
 FX_SYMBOLS = {
     "USD":"USDSEK=X","EUR":"EURSEK=X","NOK":"NOKSEK=X",
     "CAD":"CADSEK=X","GBP":"GBPSEK=X","DKK":"DKKSEK=X",
@@ -183,14 +184,19 @@ def upsert_row(ws: gspread.Worksheet, key_col: str, key_val: str, row_dict: Dict
     else:
         ws.append_row([row_dict.get(c, "") for c in header], value_input_option="RAW")
 
-# ========== Del 2/4 — Datakällor (Yahoo/FX/Finnhub/SEC), numerikhelpers, motor & heuristik ==========
+# ========== Del 2/4 — Datakällor, estimat & CAGR, numerikhelpers, motor & heuristik ==========
 
 # ---------- Numerisk robust konvertering ----------
 def to_float(x, default: float = 0.0) -> float:
     if x is None:
         return default
-    if isinstance(x, (int, float)) and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-        return float(x)
+    if isinstance(x, (int, float)):
+        try:
+            if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+                return default
+            return float(x)
+        except Exception:
+            return default
     try:
         s = str(x)
         s = s.replace("\u00A0", " ").replace(" ", "")
@@ -202,7 +208,6 @@ def to_float(x, default: float = 0.0) -> float:
     except Exception:
         return default
 
-# ---------- Småhjälpare ----------
 def _first(*vals):
     for v in vals:
         if v is None:
@@ -407,7 +412,7 @@ def persist_fx(ws_fx: gspread.Worksheet, rates: Dict[str, float]):
     if rows:
         ws_fx.append_rows(rows, value_input_option="USER_ENTERED")
 
-# ---------- Finnhub (EPS, BV/ps, P/E-band) ----------
+# ---------- Finnhub (EPS/BV & P/E-band) ----------
 @st.cache_data(show_spinner=False, ttl=1800)
 def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
     api = st.secrets.get("FINNHUB_API_KEY", "")
@@ -418,7 +423,7 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
         r = requests.get(url, timeout=12)
         if r.status_code != 200:
             return {}
-        data = r.json() | {}
+        data = r.json() or {}
     except Exception:
         return {}
     metric = data.get("metric", {}) or {}
@@ -445,7 +450,6 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
     vals = [v for v in vals if v > 0]
     if len(vals) > 20:
         vals = vals[-20:]
-
     pe_p25 = np.percentile(vals, 25) if vals else None
     pe_p50 = np.percentile(vals, 50) if vals else None
     pe_p75 = np.percentile(vals, 75) if vals else None
@@ -453,6 +457,94 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
         pe_p50 = metric.get("peExclExtraTTM") or metric.get("peTTM")
 
     return {"eps_ttm": eps_ttm, "book_ps": book_ps, "pe_band": (pe_p25, pe_p50, pe_p75)}
+
+# ---------- Analytikerestimat (Finnhub) & CAGR (Yahoo) för Auto-läge ----------
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_finnhub_estimates(symbol: str) -> dict:
+    api = st.secrets.get("FINNHUB_API_KEY", "")
+    if not api:
+        return {}
+    def _get(url):
+        try:
+            r = requests.get(url, timeout=12)
+            if r.status_code == 200:
+                return r.json() or {}
+        except Exception:
+            pass
+        return {}
+
+    eps = _get(f"https://finnhub.io/api/v1/stock/eps-estimates?symbol={symbol}&freq=annual&token={api}")
+    rev = _get(f"https://finnhub.io/api/v1/stock/revenue-estimates?symbol={symbol}&freq=annual&token={api}")
+
+    def _series(obj, key):
+        arr = obj.get("data") or obj.get("series") or []
+        out = []
+        for it in arr:
+            v = it.get(key)
+            if isinstance(v, (int, float)):
+                try:
+                    y = int(str(it.get("fiscalYear") or it.get("period") or "")[:4])
+                except Exception:
+                    y = None
+                out.append((y, float(v)))
+        out = [(y, v) for (y, v) in out if v is not None]
+        out.sort(key=lambda x: (x[0] is None, x[0]))
+        return out
+
+    def _growth_from_series(ser):
+        gs = []
+        for i in range(1, min(4, len(ser))):
+            prev, cur = ser[i-1][1], ser[i][1]
+            if prev:
+                gs.append((cur/prev) - 1.0)
+        while len(gs) < 3:
+            gs.append(gs[-1] if gs else 0.0)
+        return tuple(gs[:3])
+
+    out = {}
+    eps_ser = _series(eps, "epsAvg")
+    rev_ser = _series(rev, "revenueAvg")
+    if len(eps_ser) >= 2: out["g_eps"] = _growth_from_series(eps_ser)
+    if len(rev_ser) >= 2: out["g_rev"] = _growth_from_series(rev_ser)
+    return out
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def yahoo_revenue_cagr(ticker: str, years: int = 5) -> Optional[float]:
+    """Enkel 3–5 års CAGR på omsättning från Yahoo (annual income_stmt)."""
+    try:
+        t = yf.Ticker(ticker)
+        inc = getattr(t, "income_stmt", None)
+        if inc is None or inc.empty:
+            inc = getattr(t, "financials", pd.DataFrame())
+        if inc is None or inc.empty:
+            return None
+        if "Total Revenue" in inc.index:
+            row = inc.loc["Total Revenue"]
+        elif "TotalRevenue" in inc.index:
+            row = inc.loc["TotalRevenue"]
+        else:
+            return None
+        vals = [to_float(row.get(col)) for col in inc.columns]
+        vals = [v for v in vals if v]
+        if len(vals) < 2:
+            return None
+        vals = vals[:years][::-1]  # äldst → nyast
+        start, end = vals[0], vals[-1]
+        n = max(1, len(vals)-1)
+        if start > 0 and end > 0:
+            return (end/start)**(1.0/n) - 1.0
+    except Exception:
+        return None
+    return None
+
+def _norm_rate(g) -> float:
+    """Normalisera tillväxttal: >5 antas vara procent; clamp [-90%, +150%]."""
+    g = float(nz(g, 0.0))
+    if g > 5.0:
+        g = g / 100.0
+    if g < -0.90: g = -0.90
+    if g >  1.50: g =  1.50
+    return g
 
 # ---------- SEC XBRL (beta: NII/FFO/AFFO per aktie) ----------
 def _sec_headers():
@@ -505,7 +597,7 @@ def _sec_latest_per_share(facts: Dict[str, Any], names: List[str]) -> Optional[f
                 continue
             units = f.get("units", {})
             for unit, arr in units.items():
-                if "/shares" in unit.lower() or "perShare" in unit:
+                if "/shares" in (unit or "").lower() or "perShare" in (unit or ""):
                     try:
                         arr = sorted(arr, key=lambda x: x.get("end", ""))
                         return float(arr[-1]["val"])
@@ -628,7 +720,7 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
 
 # ========== Del 3/4 — UI, Sheets-öppning, snapshots & spara/uppdatera en ticker ==========
 
-# ---------- Sidopanel: datakällor, filter, export & massuppdatering ----------
+# ---------- Sidopanel: datakällor, tillväxtkälla, filter, export & massuppdatering ----------
 with st.sidebar:
     st.header("Inställningar & datakällor")
     use_finnhub   = st.checkbox("Använd Finnhub (EPS/BV/P-E-band)", value=True)
@@ -641,10 +733,20 @@ with st.sidebar:
     bear_mult = st.number_input("Bear × (på 1-års riktkurs)", value=0.85, step=0.05, format="%.2f")
 
     st.markdown("---")
+    st.subheader("Tillväxtkälla (G1–G3)")
+    growth_source = st.selectbox(
+        "Välj källa för framtida tillväxt",
+        ["Auto (Analytiker → CAGR⊕Manuell)", "Analytiker (Finnhub)", "Historik (CAGR 3–5 år)", "Manuell"],
+        index=0
+    )
+    cagr_blend_w = 0.50
+    if growth_source in ("Auto (Analytiker → CAGR⊕Manuell)", "Historik (CAGR 3–5 år)"):
+        cagr_blend_w = st.slider("Vikt för CAGR i blandning (CAGR vs Manuell)", 0.0, 1.0, 0.50, 0.05)
+
+    st.markdown("---")
     st.subheader("Skriv tillbaka")
     writeback_autoscaled = st.checkbox("Skriv tillbaka autoskalade per-aktie-värden när jag sparar 'Resultat'", value=True)
     writeback_in_mass    = st.checkbox("Skriv tillbaka autoskalade vid massuppdatering", value=True)
-
     st.caption("Visning sker i bolagets valuta; portföljvärde summeras i SEK.")
 
     st.markdown("---")
@@ -864,7 +966,7 @@ if save_clicked and ticker_in:
     else:
         st.success(f"{ticker_in} sparad/uppdaterad i Google Sheets.")
 
-# ========== Del 4/4 — Beräkning, autoskalning (FIX), SEK-summering, export, massuppd., snapshots ==========
+# ========== Del 4/4 — Beräkning, Auto-tillväxt, autoskalning, SEK-summering, export, massuppd., snapshots ==========
 
 # --- Läs Data efter ev. spar ---
 data_df = read_df(ws_data)
@@ -876,33 +978,47 @@ if data_df.empty:
 fx_map = fetch_fx_to_sek(sorted({(c or "SEK") for c in data_df["Valuta"].tolist()}))
 sek_rate_for = lambda c: fx_map.get(c or "SEK", 1.0)
 
-# --- AUTOSKALNING (FIX) ---
+# --- AUTOSKALNING (med clamp) ---
 def autoscale_ps(value: float, price: float, min_ratio: float, max_ratio: float,
-                 tag: str, flags: list, max_steps: int = 6) -> float:
+                 tag: str, flags: list, max_steps: int = 12) -> float:
     """
     Skala per-aktie-värden så att (price/value) hamnar i [min_ratio, max_ratio].
-    • ratio < min  ⇒ value för stort  ⇒ ÷10
-    • ratio > max  ⇒ value för litet ⇒ ×10
+    • ratio < min  ⇒ value är för stort  ⇒ ÷10
+    • ratio > max  ⇒ value är för litet ⇒ ×10
+    Därefter en sista clamp så vi *garanterar* intervallet.
     """
     v = float(nz(value, 0.0))
     p = float(nz(price, 0.0))
     if v <= 0 or p <= 0:
         return v
+
     steps = 0
     ratio = p / v
+
     while ratio < min_ratio and steps < max_steps:
         v /= 10.0
         ratio = p / v
         flags.append(f"{tag}÷10")
         steps += 1
+
     while ratio > max_ratio and steps < max_steps:
         v *= 10.0
         ratio = p / v
         flags.append(f"{tag}×10")
         steps += 1
+
+    # Sista säkerhetsnätet (garanterar att vi verkligen hamnar inom intervallet)
+    lo, hi = p / max_ratio, p / min_ratio
+    if v < lo:
+        v = lo
+        flags.append(f"{tag}=clamp↑")
+    elif v > hi:
+        v = hi
+        flags.append(f"{tag}=clamp↓")
+
     return v
 
-# ---------- Värdering för en rad (sanity + autoskalning) ----------
+# ---------- Värdering för en rad (Auto-tillväxt + sanity + autoskalning) ----------
 def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     flags: List[str] = []
 
@@ -935,10 +1051,6 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     td      = float(nz(r.get("Total Debt"), 0.0))
     ca      = float(nz(r.get("Cash"), 0.0))
     net_debt = td - ca
-
-    g1 = float(nz(r.get("G1"), 0.15))
-    g2 = float(nz(r.get("G2"), 0.12))
-    g3 = float(nz(r.get("G3"), 0.10))
 
     # Multiplar
     pe_hist      = float(nz(r.get("PE_hist"), 15.0))
@@ -973,10 +1085,71 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     fcf_ps0 = autoscale_ps(fcf_ps0,px, 5.0, 60.0, "fcfps", flags)
     tbv_ps0 = autoscale_ps(tbv_ps0,px, 0.2, 20.0, "tbv",   flags)
 
-    has_fcf    = fcf0 > 0.0
-    has_ebitda = ebitda0 > 0.0
+    # --- Tillväxt (Auto-läge finns i sidopanel) ---
+    raw_g1 = nz(r.get("G1"), 0.15); base_g1 = _norm_rate(raw_g1)
+    raw_g2 = nz(r.get("G2"), 0.12); base_g2 = _norm_rate(raw_g2)
+    raw_g3 = nz(r.get("G3"), 0.10); base_g3 = _norm_rate(raw_g3)
+    g1, g2, g3 = base_g1, base_g2, base_g3
+
+    try:
+        _src = growth_source
+    except NameError:
+        _src = "Auto (Analytiker → CAGR⊕Manuell)"
+
+    tk = (r.get("Ticker") or "").upper()
+
+    def _blend_with_manual(cagr_rate: Optional[float], w: float) -> tuple[float,float,float]:
+        """Blanda CAGR med manuella G med vikt w (0..1)."""
+        if cagr_rate is None:
+            return base_g1, base_g2, base_g3
+        g_c = float(cagr_rate)
+        g1b = _norm_rate(w*g_c + (1.0-w)*base_g1)
+        g2b = _norm_rate(w*g_c + (1.0-w)*base_g2)
+        g3b = _norm_rate(w*g_c + (1.0-w)*base_g3)
+        return g1b, g2b, g3b
+
+    if _src == "Auto (Analytiker → CAGR⊕Manuell)":
+        est = fetch_finnhub_estimates(tk) or {}
+        if "g_eps" in est:
+            g1, g2, g3 = est["g_eps"]; flags.append("g=estimates_eps")
+        elif "g_rev" in est:
+            g1, g2, g3 = est["g_rev"]; flags.append("g=estimates_rev")
+        else:
+            cagr = yahoo_revenue_cagr(tk, years=5) or yahoo_revenue_cagr(tk, years=3)
+            try:
+                w = cagr_blend_w
+            except NameError:
+                w = 0.50
+            g1, g2, g3 = _blend_with_manual(cagr, w)
+            if cagr is not None:
+                flags.append(f"g=blend_cagr({cagr:.2f})_w={w:.2f}")
+            else:
+                flags.append("g=manual")
+    elif _src == "Analytiker (Finnhub)":
+        est = fetch_finnhub_estimates(tk) or {}
+        if "g_eps" in est:
+            g1, g2, g3 = est["g_eps"]; flags.append("g=estimates_eps")
+        elif "g_rev" in est:
+            g1, g2, g3 = est["g_rev"]; flags.append("g=estimates_rev")
+        else:
+            flags.append("g=manual(no_estimates)")
+    elif _src == "Historik (CAGR 3–5 år)":
+        cagr = yahoo_revenue_cagr(tk, years=5) or yahoo_revenue_cagr(tk, years=3)
+        try:
+            w = cagr_blend_w
+        except NameError:
+            w = 0.50
+        g1, g2, g3 = _blend_with_manual(cagr, w)
+        if cagr is not None:
+            flags.append(f"g=cagr_blend({cagr:.2f})_w={w:.2f}")
+        else:
+            flags.append("g=manual(no_cagr)")
+    else:
+        flags.append("g=manual")
 
     # Riktkurser per metod
+    has_fcf    = fcf0 > 0.0
+    has_ebitda = ebitda0 > 0.0
     vals = {}
     vals["pe_hist_vs_eps"] = target_from_PE(eps0, pe_hist, g1, g2, g3)
     vals["ev_fcf"]         = targets_from_ev_multiple(fcf0,    ev_fcf_mult, net_debt, shares_out, g1, g2, g3)
