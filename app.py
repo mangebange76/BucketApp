@@ -3,8 +3,9 @@
 # app.py — Del 1/4: Imports, boot, hjälpfunktioner
 # ============================================================
 
-# ---- Standard ----
 from __future__ import annotations
+
+# ---- Standard ----
 import os, sys, time, math, json, traceback, statistics
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
@@ -122,7 +123,7 @@ def fmt_pct(x: float) -> str:
         return "–"
 
 # ============================================================
-# app.py — Del 2/4
+# app.py — Del 2/4 (FIXAD)
 # Google Sheets, FX, dataladdning & sidopanel
 # ============================================================
 
@@ -170,24 +171,27 @@ def _sheet_id_from_url_or_id(s: str) -> str:
             return s
     return s
 
-@st.cache_resource(show_spinner=False)
-def open_spreadsheet(gc) -> gspread.Spreadsheet:
-    sheet_url = st.secrets.get("SHEET_URL", "").strip()
-    sheet_id = st.secrets.get("SHEET_ID", "").strip()
+def _get_sheet_id_from_secrets() -> str:
+    sheet_url = (st.secrets.get("SHEET_URL", "") or "").strip()
+    sheet_id  = (st.secrets.get("SHEET_ID", "")  or "").strip()
     if not sheet_id and sheet_url:
         sheet_id = _sheet_id_from_url_or_id(sheet_url)
     if not sheet_id:
         st.error("Saknar SHEET_URL eller SHEET_ID i secrets.")
         st.stop()
-    try:
-        return gc.open_by_key(sheet_id)
-    except Exception as e:
-        st.error("Kunde inte öppna Google Sheet. Kontrollera SHEET_URL/SHEET_ID och delning till service-kontot.")
-        st.code(str(e))
-        st.stop()
+    return sheet_id
 
-GC = guard(lambda: get_gspread_client(), label="(Google-auth)")
-SPREADSHEET_HANDLE = guard(lambda: open_spreadsheet(GC), label="(Öppna Google Sheet)")
+@st.cache_resource(show_spinner=False)
+def open_spreadsheet_by_id(sheet_id: str) -> gspread.Spreadsheet:
+    """
+    IMPORTANT: Tar enbart hashbar sträng (sheet_id). Skapar själv gspread-klienten.
+    """
+    gc = get_gspread_client()
+    return gc.open_by_key(sheet_id)
+
+# Initiera Spreadsheet-handle (utan o-hashbara arg)
+SHEET_ID = guard(lambda: _get_sheet_id_from_secrets(), label="(Läs Sheet ID)")
+SPREADSHEET_HANDLE = guard(lambda: open_spreadsheet_by_id(SHEET_ID), label="(Öppna Google Sheet)")
 
 # ---------------------------
 # Worksheet-hjälpare
@@ -202,14 +206,14 @@ def _open_ws(name: str) -> gspread.Worksheet:
         return SPREADSHEET_HANDLE.worksheet(name)
     except Exception:
         # Skapa om saknas
-        ws = SPREADSHEET_HANDLE.add_worksheet(title=name, rows=1000, cols=50)
+        ws = SPREADSHEET_HANDLE.add_worksheet(title=name, rows=2000, cols=50)
         return ws
 
 def ensure_hist_sheet() -> gspread.Worksheet:
     try:
         ws = SPREADSHEET_HANDLE.worksheet(WS_HIST_NAME)
     except Exception:
-        ws = SPREADSHEET_HANDLE.add_worksheet(title=WS_HIST_NAME, rows=2000, cols=20)
+        ws = SPREADSHEET_HANDLE.add_worksheet(title=WS_HIST_NAME, rows=20000, cols=20)
         ws.update([[
             "Timestamp","YQ","Ticker","Currency","Last Price","Market Cap","EV","Shares Out",
             "Revenue TTM","EBITDA TTM","FCF TTM","Dividend/ps",
@@ -441,7 +445,7 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
             out["market_cap"] = to_float(getattr(fi, "market_cap", None), None)
             out["shares_out"] = to_float(getattr(fi, "shares", None), None)
             out["pe_forward"] = to_float(getattr(fi, "forward_pe", None), None)
-        # info (kan vara långsammare)
+        # info
         inf = getattr(t, "info", {}) or {}
         out["long_name"] = inf.get("longName") or ""
         out["short_name"] = inf.get("shortName") or ""
@@ -455,15 +459,7 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # TTM-remsor
-    try:
-        fin = t.financials or pd.DataFrame()
-        is_ = t.income_stmt if hasattr(t, "income_stmt") else None
-        # yfinance 0.2: t.income_stmt / t.cashflow / t.balance_sheet (annual & quarterly)
-    except Exception:
-        fin = pd.DataFrame()
-
-    # Fång upp TTM via yfinance attribut
+    # TTM via yfinance objekt
     try:
         out["revenue_ttm"] = to_float(getattr(t, "income_stmt_trailing_total_revenue", None), None)
     except Exception:
@@ -473,9 +469,9 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     except Exception:
         pass
     try:
-        # FCF = operatingCF - capex; yfinance saknar ofta direkt TTM → försök via cashflow history
-        cf = t.cashflow or pd.DataFrame()
-        if not cf.empty:
+        # FCF approx via cashflow (kan saknas)
+        cf = getattr(t, "cashflow", pd.DataFrame())
+        if isinstance(cf, pd.DataFrame) and not cf.empty:
             ocf = to_float(cf.get("Total Cash From Operating Activities", pd.Series([None])).iloc[0], None)
             capex = to_float(cf.get("Capital Expenditures", pd.Series([None])).iloc[0], None)
             if ocf is not None and capex is not None:
@@ -504,7 +500,6 @@ def _yf_annual_income_stmt(ticker: str) -> Optional[pd.DataFrame]:
         df = t.income_stmt  # annual
         if df is None or df.empty:
             return None
-        # rader som index
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
         return df
@@ -535,11 +530,9 @@ def yahoo_dividend_cagr(ticker: str, years: int = 5) -> Optional[float]:
         d = t.dividends
         if not isinstance(d, pd.Series) or d.empty:
             return None
-        # grupp per år
         ann = d.groupby(d.index.year).sum()
         if len(ann) < 2:
             return None
-        # ta sista (nyast) och en som ligger N år bak om finns
         years = min(years, len(ann) - 1)
         v0 = float(ann.iloc[-(years+1)])
         vN = float(ann.iloc[-1])
@@ -592,14 +585,11 @@ def _fh_get(path: str, params: Dict[str, Any]) -> Optional[dict]:
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_finnhub_estimates(ticker: str) -> Optional[Dict[str, Any]]:
     """Hämta enkla EPS/Revenue-estimat för nästa två år via Finnhub."""
-    # Endpoint: /forecast?symbol=...
     j = _fh_get("forecast", {"symbol": ticker})
     if not j:
         return None
-    # Finnhub svar varierar; plocka EPS/Revenue för nextY/nextY+1 om det finns
     out = {}
     try:
-        # vissa svar: {"epsNextY":..., "epsNext2Y":..., "revenueNextY":..., "revenueNext2Y":...}
         out["eps_next1"] = to_float(j.get("epsNextY"), None)
         out["eps_next2"] = to_float(j.get("epsNext2Y"), None)
         out["rev_next1"] = to_float(j.get("revenueNextY"), None)
@@ -615,7 +605,6 @@ def fetch_finnhub_metrics(ticker: str) -> Optional[Dict[str, Any]]:
     if not j or "metric" not in j:
         return None
     met = j["metric"] or {}
-    # fabricera band p25/p50/p75 om de finns
     band = {}
     for k in ("peTTMPercentile25", "peTTMPercentile50", "peTTMPercentile75"):
         v = to_float(met.get(k), None)
@@ -632,7 +621,6 @@ def fetch_finnhub_eps_quarterly(ticker: str) -> Optional[List[float]]:
     j = _fh_get("stock/earnings", {"symbol": ticker})
     if not j:
         return None
-    # Försök plocka EPS (actual) i kronologisk ordning
     try:
         arr = []
         for it in sorted(j, key=lambda x: (x.get("year", 0), x.get("quarter", 0))):
@@ -652,7 +640,6 @@ def eps_cagr_from_quarters(q_eps: Optional[List[float]]) -> Optional[float]:
     prev4 = sum(q_eps[-8:-4])
     if prev4 <= 0 or last4 <= 0:
         return None
-    # ett år mellan blocken
     return (last4 / prev4) - 1.0
 
 # ---------------------------
@@ -683,7 +670,7 @@ def series_from_est_or_cagr(base0: float,
     return a0, a1, a2, a3
 
 def _compress(mult: float, comp_rate: float, years: int) -> float:
-    """Sänk multipeln gejmässigt per år."""
+    """Sänk multipeln geometriskt per år."""
     return float(mult) * ((1.0 - float(comp_rate)) ** years)
 
 def ev_multiple_from_series(s0: float, s1: float, s2: float, s3: float,
@@ -715,7 +702,6 @@ def _anchor_pe(pe_ttm: Optional[float], pe_fwd: Optional[float], pe_band: Dict[s
             cands.append(v)
     if not cands:
         return 20.0
-    # median ger robust ankare
     try:
         return float(statistics.median(cands))
     except Exception:
@@ -734,17 +720,13 @@ def pe_targets_from_estimates(*,
                               g3: float) -> Tuple[float,float,float,float,str]:
     """
     Returnerar (idag, 1y, 2y, 3y, note).
-    Idag = blend(TTM_eps vs N12M_eps) men den slutliga blenden görs utanför i Del 4.
-    Här ger vi riktkurser baserat på EPS-serien * komprimerad ankarmultipel.
     """
     anchor0 = _anchor_pe(pe_ttm, pe_fwd, pe_band or {})
     # EPS-serie
     if eps_ttm is None or eps_ttm <= 0:
-        # härled från price / pe_ttm om möjligt
         if pe_ttm and pe_ttm > 0 and price > 0:
             eps_ttm = price / pe_ttm
     if eps_ttm is None or eps_ttm <= 0:
-        # utan EPS_ttm kan vi inte räkna P/E idag – sätt rimligt litet värde
         eps_ttm = 0.0001
 
     # EPS år1/år2 – använd estimat, annars CAGR från ttm
@@ -778,8 +760,7 @@ def choose_primary_method(bucket: str,
                           has_ebitda: bool) -> str:
     b = (bucket or "").lower()
     if "utdel" in b or "income" in b:
-        # REIT/BDC/Fond-liknande prior
-        return "p_affo"  # ofta fallbackar vi om värden saknas
+        return "p_affo"  # REIT/BDC prior
     if "bank" in industry.lower():
         return "p_tbv"
     if not has_fcf and not has_ebitda:
@@ -879,7 +860,6 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     mcap  = mcap_sheet or y.get("market_cap")
     ev    = ev_sheet or y.get("enterprise_value") or None
     if ev is None and mcap is not None and price is not None and y.get("shares_out"):
-        # fallback: om we missar EV men har nettoskuld via diff (saknas) → lämna None
         ev = None
     shares_out = shares_out or y.get("shares_out")
     pe_ttm = pe_ttm_sheet or y.get("pe_ttm")
@@ -904,11 +884,9 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     if p_nii_mult is None:  p_nii_mult = 10.0
 
     # EV-komponenter
-    net_debt = None
+    net_debt = 0.0
     if ev is not None and mcap is not None:
         net_debt = float(ev) - float(mcap)
-    else:
-        net_debt = 0.0
     shares_out = nz(shares_out, 0.0)
 
     # ---- Estimat & band via Finnhub ----
@@ -941,7 +919,6 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     rev0, rev1, rev2, rev3 = series_from_est_or_cagr(
         rev_ttm or 0.0, rev_next1, rev_next2, rev_cagr, g1, g2, g3
     )
-    # EBITDA antag ≈ växer med rev-cagr om vi saknar estimat
     e0, e1, e2, e3 = series_from_est_or_cagr(
         ebitda_ttm or 0.0, None, None, rev_cagr, g1, g2, g3
     )
@@ -962,12 +939,10 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
         pe_comp_rate=pe_comp_rate,
         g3=g3,
     )
-
-    # Idag = blend(TTM vs N12M) för P/E: blenda t0,t1
+    # Idag = blend(TTM vs N12M) för P/E
     today_from_pe = (1.0 - today_blend_w) * t0_pe + today_blend_w * t1_pe
 
     # ---- EV-baserade mål (→ pris per aktie) ----
-    # Om shares_out saknas kan vi inte omvandla EV → pris: ge 0:or
     if shares_out <= 0:
         ev_sales_today = ev_sales_1 = ev_sales_2 = ev_sales_3 = 0.0
         ev_eb_today = ev_eb_1 = ev_eb_2 = ev_eb_3 = 0.0
@@ -983,7 +958,6 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
         ev_fcf_today, ev_fcf_1, ev_fcf_2, ev_fcf_3 = ev_multiple_from_series(
             f0, f1, f2, f3, ev_fcf_mult, ev_comp_rate, net_debt, shares_out
         )
-        # DACF ≈ EBITDA här
         ev_dacf_today, ev_dacf_1, ev_dacf_2, ev_dacf_3 = ev_multiple_from_series(
             e0, e1, e2, e3, dacf_mult, ev_comp_rate, net_debt, shares_out
         )
@@ -1005,16 +979,16 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     # ---- Sammanställ metodtabell ----
     tbl = pd.DataFrame([
         ["pe_hist_vs_eps", round(today_from_pe, 4), round(t1_pe,4), round(t2_pe,4), round(t3_pe,4)],
-        ["ev_sales",       round(ev_sales_today,4),  round(ev_sales_1,4), round(ev_sales_2,4), round(ev_sales_3,4)],
-        ["ev_ebitda",      round(ev_eb_today,4),     round(ev_eb_1,4),    round(ev_eb_2,4),    round(ev_eb_3,4)],
-        ["ev_dacf",        round(ev_dacf_today,4),   round(ev_dacf_1,4),  round(ev_dacf_2,4),  round(ev_dacf_3,4)],
-        ["ev_fcf",         round(ev_fcf_today,4),    round(ev_fcf_1,4),   round(ev_fcf_2,4),   round(ev_fcf_3,4)],
-        ["p_fcf",          round(p_fcf_today,4),     round(p_fcf_1,4),    round(p_fcf_2,4),    round(p_fcf_3,4)],
-        ["p_nav",          round(p_nav_today,4),     round(p_nav_1,4),    round(p_nav_2,4),    round(p_nav_3,4)],
-        ["p_affo",         round(p_affo_today,4),    round(p_affo_1,4),   round(p_affo_2,4),   round(p_affo_3,4)],
-        ["p_b",            round(p_b_today,4),       round(p_b_1,4),      round(p_b_2,4),      round(p_b_3,4)],
-        ["p_tbv",          round(p_tbv_today,4),     round(p_tbv_1,4),    round(p_tbv_2,4),    round(p_tbv_3,4)],
-        ["p_nii",          round(p_nii_today,4),     round(p_nii_1,4),    round(p_nii_2,4),    round(p_nii_3,4)],
+        ["ev_sales",       round(ev_sales_today,4),  round(ev_sales_1,4),  round(ev_sales_2,4),  round(ev_sales_3,4)],
+        ["ev_ebitda",      round(ev_eb_today,4),     round(ev_eb_1,4),     round(ev_eb_2,4),     round(ev_eb_3,4)],
+        ["ev_dacf",        round(ev_dacf_today,4),   round(ev_dacf_1,4),   round(ev_dacf_2,4),   round(ev_dacf_3,4)],
+        ["ev_fcf",         round(ev_fcf_today,4),    round(ev_fcf_1,4),    round(ev_fcf_2,4),    round(ev_fcf_3,4)],
+        ["p_fcf",          round(p_fcf_today,4),     round(p_fcf_1,4),     round(p_fcf_2,4),     round(p_fcf_3,4)],
+        ["p_nav",          round(p_nav_today,4),     round(p_nav_1,4),     round(p_nav_2,4),     round(p_nav_3,4)],
+        ["p_affo",         round(p_affo_today,4),    round(p_affo_1,4),    round(p_affo_2,4),    round(p_affo_3,4)],
+        ["p_b",            round(p_b_today,4),       round(p_b_1,4),       round(p_b_2,4),       round(p_b_3,4)],
+        ["p_tbv",          round(p_tbv_today,4),     round(p_tbv_1,4),     round(p_tbv_2,4),     round(p_tbv_3,4)],
+        ["p_nii",          round(p_nii_today,4),     round(p_nii_1,4),     round(p_nii_2,4),     round(p_nii_3,4)],
     ], columns=["Metod","Idag","1 år","2 år","3 år"])
 
     # primär metod
@@ -1022,7 +996,6 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     has_eb  = (ebitda_ttm is not None and ebitda_ttm > 0)
     prim = choose_primary_method(buck, "", "", tkr, bool(has_fcf), bool(has_eb))
 
-    # primära mål
     prim_row = tbl[tbl["Metod"] == prim].iloc[0] if prim in set(tbl["Metod"]) else tbl.iloc[0]
     prim_today, prim_1y, prim_2y, prim_3y = float(prim_row["Idag"]), float(prim_row["1 år"]), float(prim_row["2 år"]), float(prim_row["3 år"])
 
@@ -1032,9 +1005,11 @@ def compute_company_row(row: pd.Series) -> Dict[str, Any]:
     wht_map = read_settings_wht()
     wht = float(wht_map.get(ccy, DEFAULT_WHT.get(ccy, 0.15)))
     div_ttm = div_ps or 0.0
-    div1 = div_ttm * (1.0 + (yahoo_dividend_cagr(tkr, years=5) or 0.05))
-    div2 = div1 * (1.0 + (yahoo_dividend_cagr(tkr, years=5) or 0.05))
-    div3 = div2 * (1.0 + (yahoo_dividend_cagr(tkr, years=5) or 0.05))
+    # försök med historisk utdelnings-CAGR
+    div_cagr = yahoo_dividend_cagr(tkr, years=5) or 0.05
+    div1 = div_ttm * (1.0 + div_cagr)
+    div2 = div1 * (1.0 + div_cagr)
+    div3 = div2 * (1.0 + div_cagr)
 
     fx = fx_to_sek(ccy)
     holding_value_sek = nz(price,0.0) * shares_owned * fx
@@ -1169,8 +1144,6 @@ for x in results:
             )
             st.caption(f"Sanity: {x['sanity']}")
             st.dataframe(x["table"], use_container_width=True, height=260)
-
-            # P/E-band-anteckning om vi lyckades få ett band
             st.caption(f"P/E-ankare: {x['pe_note']}")
 
         with subc2:
