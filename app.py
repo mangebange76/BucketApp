@@ -2,11 +2,11 @@
 # ============================================================
 # Bas: Streamlit-app för fair value / riktkurser / portfölj
 # Lagring: Google Sheets (Data, Resultat, Valutakurser, Settings, Snapshot)
-# Hämtning: Yahoo (yfinance) + valfri Finnhub
+# Hämtning: Yahoo (yfinance) + (Del 2/4: Finnhub-estimat)
 # ============================================================
 
 from __future__ import annotations
-import os, json, math, time, random
+import os, json, math, time
 from typing import Any, Dict, List, Optional, Tuple
 from collections.abc import Mapping
 from datetime import datetime
@@ -272,6 +272,13 @@ def _ensure_sheet_schema():
         if changed:
             _write_df(FX_TITLE, fx[FX_COLUMNS])
 
+    # Resultat – säkerställ minsta schema
+    res = _read_df(RESULT_TITLE)
+    if res.empty:
+        _write_df(RESULT_TITLE, pd.DataFrame(columns=[
+            "Timestamp","Ticker","Valuta","Metod","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år"
+        ]))
+
     # Snapshot
     snap = _read_df(SNAPSHOT_TITLE)
     if snap.empty:
@@ -405,7 +412,8 @@ if 'PREFER_ORDER' not in globals():
 
 # app.py — Del 2/4
 # ============================================================
-# Datainsamling (Yahoo, Finnhub) + beräkningsmotor & utdelning
+# Datainsamling (Yahoo via yfinance, Finnhub-estimat)
+# Beräkningsmotor: metoder, multipel-decay, paths, utdelning
 # ============================================================
 
 import requests
@@ -478,7 +486,7 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     set_if_missing("p_to_book",    gi("priceToBook"),       "yahoo_info")
     set_if_missing("bvps",         gi("bookValue"),         "yahoo_info")
 
-    ev_info   = _safe_float(gi("enterpriseValue"))
+    ev_info    = _safe_float(gi("enterpriseValue"))
     total_debt = _safe_float(gi("totalDebt"))
     total_cash = _safe_float(gi("totalCash"))
 
@@ -541,12 +549,11 @@ def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
         if r.ok:
             js = r.json()
             rows = js if isinstance(js, list) else js.get("data", [])
-            # Sortera på period om möjligt
+            # Sortera på period om möjligt (senaste sist)
             try:
                 rows = sorted(rows or [], key=lambda x: str(x.get("period", "")))
             except Exception:
                 rows = rows or []
-            # Plocka ut upp till två senaste EPS-avg
             vals = [_safe_float(x.get("epsAvg")) for x in rows if _safe_float(x.get("epsAvg")) is not None]
             if len(vals) >= 1:
                 eps_1y = vals[-1]
@@ -906,7 +913,7 @@ def _pick_primary_from_table(met_df: pd.DataFrame, preset: Optional[str] = None)
         return None, None, None, None, None
     available = set(met_df["Metod"].astype(str))
     chosen = None
-    # 1) Om användaren/row redan valt primär metod & den finns: använd den
+    # 1) Om raden redan har en primär metod & den finns: använd den
     if preset and preset in available:
         chosen = preset
     # 2) Annars: välj metoden med flest icke-NaN punkter, tie-break via _PREFER_ORDER
@@ -1173,7 +1180,7 @@ def page_analysis():
 
 # app.py — Del 4/4
 # ============================================================
-# Sidor: Editor / Ranking / Settings / Batch
+# Sidor: Editor / Ranking / Inställningar / Batch
 # Snapshot-funktion och main()
 # ============================================================
 
@@ -1353,13 +1360,15 @@ def page_editor():
         for c in DATA_COLUMNS:
             if c not in df_new.columns:
                 df_new[c] = np.nan
-        if (df_new["Ticker"].astype(str).str.upper() == ticker).any():
-            mask = df_new["Ticker"].astype(str).str.upper() == ticker
+        # uppdatera eller append
+        mask_exist = (df_new["Ticker"].astype(str).str.upper() == ticker)
+        if mask_exist.any():
             for k, v in new_row.items():
-                df_new.loc[mask, k] = v
+                df_new.loc[mask_exist, k] = v
         else:
-            # append med exakt kolumnordning
-            df_new = pd.concat([df_new, pd.DataFrame([new_row])[df_new.columns]], ignore_index=True)
+            # ⚠️ Viktigt: reindex för att undvika KeyError när df_new har fler kolumner
+            to_append = pd.DataFrame([new_row]).reindex(columns=df_new.columns)
+            df_new = pd.concat([df_new, to_append], ignore_index=True)
         write_data_df(df_new)
         st.session_state["editor_prefill"] = {}  # töm prefill när vi sparat
         st.success("Sparat till Data.")
@@ -1433,7 +1442,7 @@ def page_ranking():
     st.dataframe(out, use_container_width=True)
 
 # ============================================================
-#                     SIDA: Settings
+#                     SIDA: Inställningar
 # ============================================================
 def page_settings():
     st.header("⚙️ Inställningar")
