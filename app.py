@@ -2,10 +2,11 @@
 # ============================================================
 # Bas: Streamlit-app för fair value / riktkurser / portfölj
 # Lagring: Google Sheets (Data, Resultat, Valutakurser, Settings, Snapshot)
-# Hämtning: Yahoo (yfinance) + (valfritt) Finnhub
+# Hämtning: Yahoo (yfinance) + valfri Finnhub (estimat)
 # ============================================================
 
 from __future__ import annotations
+
 import os, json, math, time, random
 from typing import Any, Dict, List, Optional, Tuple
 from collections.abc import Mapping
@@ -39,6 +40,15 @@ DEFAULT_BUCKETS = [
     "Bucket A utdelning","Bucket B utdelning","Bucket C utdelning"
 ]
 
+PREFER_ORDER = [
+    "ev_ebitda","ev_sales","pe_hist_vs_eps","p_b",
+    "ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"
+]
+
+# mild throttling för att undvika 429
+SHEETS_MIN_SLEEP = 0.25
+SHEETS_MAX_SLEEP = 0.6
+
 # =========================
 # Små hjälpare
 # =========================
@@ -51,8 +61,10 @@ def now_stamp() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Hämta värde från env eller st.secrets."""
     v = os.environ.get(key)
-    if v: return v
+    if v: 
+        return v
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -91,25 +103,24 @@ def _pos(x) -> Optional[float]:
     return v if (v is not None and v > 0) else None
 
 def _with_backoff(callable_fn, *args, **kwargs):
-    """Exponential backoff för Google Sheets-API (429/5xx)."""
-    max_tries = kwargs.pop("_max_tries", 6)
-    base = kwargs.pop("_base_sleep", 0.7)
-    for i in range(max_tries):
+    """Exponential backoff runt gspread-anrop (429/5xx)."""
+    delay = SHEETS_MIN_SLEEP
+    for attempt in range(6):
         try:
             return callable_fn(*args, **kwargs)
         except APIError as e:
             code = getattr(e, "response", None)
-            code = getattr(code, "status_code", None) or getattr(e, "status", None)
-            if code in (429, 500, 502, 503, 504):
-                sleep_s = base * (2 ** i) + random.random() * 0.2
-                time.sleep(min(sleep_s, 8.0))
-                continue
-            raise
+            # alltid sova lite för att slippa per-minute-quota
+            time.sleep(delay + random.uniform(0, 0.2))
+            delay = min(SHEETS_MAX_SLEEP + attempt * 0.25, 2.0)
+            if attempt >= 5:
+                raise
         except Exception:
-            # små transienta fel – försök igen kort
-            time.sleep(0.4 + 0.1 * i)
-    # sista försöket utan fångst
-    return callable_fn(*args, **kwargs)
+            # okända fel – gör ett försök till med liten sömn
+            time.sleep(delay)
+            delay = min(SHEETS_MAX_SLEEP + attempt * 0.25, 2.0)
+            if attempt >= 5:
+                raise
 
 # =========================
 # Google Sheets Auth
@@ -118,11 +129,12 @@ def _with_backoff(callable_fn, *args, **kwargs):
 def _build_gspread_client() -> gspread.Client:
     """
     Skapa gspread Client från GOOGLE_CREDENTIALS.
-    Stöd: Mapping/AttrDict, str (JSON), bytes/bytearray.
+    Stödjer: Mapping/AttrDict, JSON-sträng, bytes/bytearray.
     """
     raw = _env_or_secret("GOOGLE_CREDENTIALS")
     if raw is None:
         raise RuntimeError("Saknar GOOGLE_CREDENTIALS i secrets eller env.")
+
     # normalisera
     if isinstance(raw, Mapping):
         try:
@@ -146,13 +158,16 @@ def _build_gspread_client() -> gspread.Client:
 
 @st.cache_resource(show_spinner=False)
 def _open_spreadsheet(_gc: gspread.Client) -> Spreadsheet:
-    """Öppnar spreadsheet via SHEET_URL eller SHEET_ID (trimmar whitespace)."""
-    sheet_url = _env_or_secret("SHEET_URL")
-    sheet_id  = _env_or_secret("SHEET_ID")
+    """
+    Öppnar spreadsheet via SHEET_URL eller SHEET_ID (trim av whitespace).
+    Notera underscore på _gc för att undvika Streamlit hashing-problem.
+    """
+    sheet_url = (_env_or_secret("SHEET_URL") or "").strip()
+    sheet_id  = (_env_or_secret("SHEET_ID")  or "").strip()
     if sheet_url:
-        return _with_backoff(_gc.open_by_url, sheet_url.strip())
+        return _with_backoff(_gc.open_by_url, sheet_url)
     if sheet_id:
-        return _with_backoff(_gc.open_by_key, sheet_id.strip())
+        return _with_backoff(_gc.open_by_key, sheet_id)
     raise RuntimeError("Ange SHEET_URL eller SHEET_ID i secrets.")
 
 def _get_ws(spread: Spreadsheet, title: str) -> Worksheet:
@@ -184,18 +199,22 @@ def _write_df(title: str, df: pd.DataFrame):
     out = df.copy()
     out.columns = [str(c) for c in out.columns]
     out = out.fillna("")
-    # skriv atomärt: clear + update (med backoff)
+    # skriv head + body
     _with_backoff(ws.clear)
     if out.shape[0] == 0:
         _with_backoff(ws.update, [list(out.columns)])
     else:
-        _with_backoff(ws.update, [list(out.columns)] + out.astype(str).values.tolist())
+        body = [list(out.columns)] + out.astype(str).values.tolist()
+        _with_backoff(ws.update, body)
+    # litet andrum för kvoter
+    time.sleep(SHEETS_MIN_SLEEP)
 
 def _append_rows(title: str, rows: List[List[Any]]):
     gc = _build_gspread_client()
     sh = _open_spreadsheet(gc)
     ws = _get_ws(sh, title)
     _with_backoff(ws.append_rows, rows, value_input_option="RAW")
+    time.sleep(SHEETS_MIN_SLEEP)
 
 # =========================
 # Schema – kolumner
@@ -222,10 +241,13 @@ def _ensure_sheet_schema():
     if df.empty:
         _write_df(DATA_TITLE, pd.DataFrame(columns=DATA_COLUMNS))
     else:
+        changed = False
         for c in DATA_COLUMNS:
             if c not in df.columns:
                 df[c] = np.nan
-        _write_df(DATA_TITLE, df[[c for c in DATA_COLUMNS]])
+                changed = True
+        if changed:
+            _write_df(DATA_TITLE, df[[c for c in DATA_COLUMNS]])
 
     # Settings
     s = _read_df(SETTINGS_TITLE)
@@ -242,9 +264,13 @@ def _ensure_sheet_schema():
         ], columns=SETTINGS_COLUMNS)
         _write_df(SETTINGS_TITLE, base)
     else:
+        changed = False
         for c in SETTINGS_COLUMNS:
-            if c not in s.columns: s[c] = np.nan
-        _write_df(SETTINGS_TITLE, s[SETTINGS_COLUMNS])
+            if c not in s.columns:
+                s[c] = np.nan
+                changed = True
+        if changed:
+            _write_df(SETTINGS_TITLE, s[SETTINGS_COLUMNS])
 
     # FX
     fx = _read_df(FX_TITLE)
@@ -258,16 +284,19 @@ def _ensure_sheet_schema():
         ], columns=FX_COLUMNS)
         _write_df(FX_TITLE, base_fx)
     else:
+        changed = False
         for c in FX_COLUMNS:
-            if c not in fx.columns: fx[c] = np.nan
-        _write_df(FX_TITLE, fx[FX_COLUMNS])
+            if c not in fx.columns:
+                fx[c] = np.nan
+                changed = True
+        if changed:
+            _write_df(FX_TITLE, fx[FX_COLUMNS])
 
     # Snapshot
     snap = _read_df(SNAPSHOT_TITLE)
     if snap.empty:
         _write_df(SNAPSHOT_TITLE, pd.DataFrame(columns=[
-            "Timestamp","Ticker","Valuta","Metod","Idag","1 år","2 år","3 år","Ankare PE","Decay",
-            "Källa:EPS_TTM","Källa:EPS_1Y","Källa:Rev_TTM","Källa:EBITDA_TTM","Källa:PE_anchor"
+            "Timestamp","Ticker","Valuta","Metod","Idag","1 år","2 år","3 år","Ankare PE","Decay"
         ]))
 
 guard(_ensure_sheet_schema, label="(säkra ark/kolumner)")
@@ -281,14 +310,22 @@ FX_PAIRS = {"USD":"USDSEK=X","EUR":"EURSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X",
 def _fetch_fx_from_yahoo() -> Dict[str, float]:
     out = {"SEK":1.0}
     for code, pair in FX_PAIRS.items():
-        if pair is None: continue
+        if pair is None: 
+            continue
         try:
             t = yf.Ticker(pair)
-            px = getattr(t.fast_info, "last_price", None)
+            px = None
+            try:
+                fi = t.fast_info
+                px = fi.last_price
+            except Exception:
+                px = None
             if not px:
                 hist = t.history(period="1d")
-                if not hist.empty: px = float(hist["Close"].iloc[-1])
-            if px: out[code] = float(px)
+                if not hist.empty: 
+                    px = float(hist["Close"].iloc[-1])
+            if px:
+                out[code] = float(px)
         except Exception:
             pass
     return out
@@ -327,14 +364,6 @@ def get_settings_map() -> Dict[str, str]:
             k = str(r.get("Key"))
             v = "" if pd.isna(r.get("Value")) else str(r.get("Value"))
             out[k] = v
-    # defaults
-    out.setdefault("pe_anchor_weight_ttm","0.50")
-    out.setdefault("multiple_decay","0.10")
-    out.setdefault("withholding_USD","0.15")
-    out.setdefault("withholding_EUR","0.15")
-    out.setdefault("withholding_NOK","0.25")
-    out.setdefault("withholding_CAD","0.15")
-    out.setdefault("withholding_SEK","0.00")
     return out
 
 def get_withholding_for(currency: str, settings: Dict[str, str]) -> float:
@@ -344,44 +373,6 @@ def get_withholding_for(currency: str, settings: Dict[str, str]) -> float:
         return float(settings.get(key, "0.15"))
     except Exception:
         return 0.15
-
-# =========================
-# Publika IO – Data/Resultat
-# =========================
-def read_data_df() -> pd.DataFrame:
-    df = _read_df(DATA_TITLE)
-    if df.empty:
-        return pd.DataFrame(columns=DATA_COLUMNS)
-    # typning för nycklar
-    num_cols = [
-        "Antal aktier","GAV (SEK)","Aktuell kurs",
-        "Utestående aktier","Net debt",
-        "Rev TTM","EBITDA TTM","EPS TTM","PE TTM","PE FWD",
-        "EV/Revenue","EV/EBITDA","P/B","BVPS","EPS 1Y",
-        "Rev CAGR","EPS CAGR","Årlig utdelning","Utdelning CAGR",
-        "Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år"
-    ]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-def write_data_df(df: pd.DataFrame):
-    cols = [c for c in DATA_COLUMNS if c in df.columns] + [c for c in df.columns if c not in DATA_COLUMNS]
-    _write_df(DATA_TITLE, df[cols])
-
-def append_result_row(row: Dict[str, Any]):
-    res = _read_df(RESULT_TITLE)
-    if res.empty:
-        _write_df(RESULT_TITLE, pd.DataFrame([row]))
-    else:
-        cols = list(res.columns)
-        for k in row.keys():
-            if k not in cols:
-                res[k] = np.nan
-                cols.append(k)
-        res = pd.concat([res, pd.DataFrame([row])[cols]], ignore_index=True)
-        _write_df(RESULT_TITLE, res[cols])
 
 # app.py — Del 2/4
 # ============================================================
@@ -401,13 +392,8 @@ def _safe_float(x) -> Optional[float]:
     """Som _f men snällare när strängar innehåller tusentals- eller decimaltecken."""
     return _f(x)
 
-def _mark(src_map: Dict[str,str], key: str, src: str):
-    """Skriv källmarkering för ett fält."""
-    if key and src:
-        src_map[key] = src
-
 # -------------------------
-# Yahoo (yfinance) – robust snapshot + källor
+# Yahoo (yfinance) – robust snapshot + källspårning
 # -------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
@@ -416,31 +402,26 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     Returnerar dict med nycklar:
       price, currency, market_cap, ev, shares,
       eps_ttm, pe_ttm, pe_fwd,
-      eps_fwd (om tillgängligt),  revenue_ttm, ebitda_ttm,
+      revenue_ttm, ebitda_ttm,
       ev_to_sales, ev_to_ebitda, p_to_book, bvps,
-      revenue_growth (YoY), ebitda_margins,
       net_debt,
-      __sources (källor för fält)
+      source_map (per-fälts källa: 'yahoo_fast' | 'yahoo_info' | 'derived')
     """
     tk = yf.Ticker(ticker)
     out: Dict[str, Any] = {}
-    src: Dict[str, str]  = {}
+    src: Dict[str, str] = {}
 
     # Snabbkanal
     try:
         fi = tk.fast_info
-        val = _safe_float(getattr(fi, "last_price", None))
-        if val is not None:
-            out["price"] = val; _mark(src, "price", "yahoo.fast_info")
-        cur = getattr(fi, "currency", None)
-        if cur:
-            out["currency"] = cur; _mark(src, "currency", "yahoo.fast_info")
-        mc = _safe_float(getattr(fi, "market_cap", None))
-        if mc is not None:
-            out["market_cap"] = mc; _mark(src, "market_cap", "yahoo.fast_info")
-        sh = _safe_float(getattr(fi, "shares", None))
-        if sh is not None:
-            out["shares"] = sh; _mark(src, "shares", "yahoo.fast_info")
+        v = _safe_float(getattr(fi, "last_price", None))
+        if v is not None: out["price"] = v; src["price"] = "yahoo_fast"
+        v = getattr(fi, "currency", None)
+        if v: out["currency"] = v; src["currency"] = "yahoo_fast"
+        v = _safe_float(getattr(fi, "market_cap", None))
+        if v is not None: out["market_cap"] = v; src["market_cap"] = "yahoo_fast"
+        v = _safe_float(getattr(fi, "shares", None))
+        if v is not None: out["shares"] = v; src["shares"] = "yahoo_fast"
     except Exception:
         pass
 
@@ -456,59 +437,55 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
         except Exception:
             return None
 
-    def set_if_none(name: str, val, source: str):
-        if out.get(name) is None and val is not None:
-            out[name] = val; _mark(src, name, source)
+    def setv(key, val, tag="yahoo_info"):
+        if val is not None and val == val:
+            out[key] = val
+            if key not in src:
+                src[key] = tag
 
-    set_if_none("price",       _safe_float(gi("currentPrice")),       "yahoo.info")
-    set_if_none("currency",    gi("currency"),                         "yahoo.info")
-    set_if_none("market_cap",  _safe_float(gi("marketCap")),           "yahoo.info")
+    setv("price",       _safe_float(gi("currentPrice")))
+    setv("currency",    gi("currency"))
+    setv("market_cap",  _safe_float(gi("marketCap")))
+    setv("eps_ttm",     _safe_float(gi("trailingEps")))
+    setv("pe_ttm",      _safe_float(gi("trailingPE")))
+    setv("pe_fwd",      _safe_float(gi("forwardPE")))
+    setv("revenue_ttm", _safe_float(gi("totalRevenue")))
+    setv("ebitda_ttm",  _safe_float(gi("ebitda")))
+    setv("ev_to_sales", _safe_float(gi("enterpriseToRevenue")))
+    setv("ev_to_ebitda",_safe_float(gi("enterpriseToEbitda")))
+    setv("p_to_book",   _safe_float(gi("priceToBook")))
+    setv("bvps",        _safe_float(gi("bookValue")))
 
-    set_if_none("eps_ttm",     _safe_float(gi("trailingEps")),         "yahoo.info")
-    set_if_none("pe_ttm",      _safe_float(gi("trailingPE")),          "yahoo.info")
-    set_if_none("pe_fwd",      _safe_float(gi("forwardPE")),           "yahoo.info")
-    set_if_none("eps_fwd",     _safe_float(gi("forwardEps")),          "yahoo.info")
-
-    set_if_none("revenue_ttm", _safe_float(gi("totalRevenue")),        "yahoo.info")
-    set_if_none("ebitda_ttm",  _safe_float(gi("ebitda")),              "yahoo.info")
-    set_if_none("ev_to_sales", _safe_float(gi("enterpriseToRevenue")), "yahoo.info")
-    set_if_none("ev_to_ebitda",_safe_float(gi("enterpriseToEbitda")),  "yahoo.info")
-    set_if_none("p_to_book",   _safe_float(gi("priceToBook")),         "yahoo.info")
-    set_if_none("bvps",        _safe_float(gi("bookValue")),           "yahoo.info")
-
-    set_if_none("revenue_growth", _safe_float(gi("revenueGrowth")),    "yahoo.info")  # ~YoY (decimaltal)
-    set_if_none("ebitda_margins", _safe_float(gi("ebitdaMargins")),    "yahoo.info")  # andel
-
+    # EV och nettoskuld
     ev_info   = _safe_float(gi("enterpriseValue"))
     total_debt= _safe_float(gi("totalDebt"))
     total_cash= _safe_float(gi("totalCash"))
 
     if ev_info is not None:
-        set_if_none("ev", ev_info, "yahoo.info")
-    elif out.get("market_cap") is not None and total_debt is not None and total_cash is not None:
+        out["ev"] = ev_info; src["ev"] = "yahoo_info"
+    elif _pos(out.get("market_cap")) is not None and total_debt is not None and total_cash is not None:
         out["ev"] = out["market_cap"] + total_debt - total_cash
-        _mark(src, "ev", "derived: mcap + debt - cash")
+        src["ev"] = "derived"
 
-    if out.get("market_cap") is not None and out.get("ev") is not None:
-        out["net_debt"] = out["ev"] - out["market_cap"]
-        _mark(src, "net_debt", "derived: ev - mcap")
+    if _pos(out.get("market_cap")) is not None and _pos(out.get("ev")) is not None:
+        out["net_debt"] = out["ev"] - out["market_cap"]; src["net_debt"] = "derived"
 
     # Shares fallback via MCAP/price
     if not _pos(out.get("shares")) and _pos(out.get("market_cap")) and _pos(out.get("price")):
         try:
             out["shares"] = out["market_cap"] / out["price"]
-            _mark(src, "shares", "derived: mcap/price")
+            src["shares"] = "derived"
         except Exception:
             pass
 
     # Normalisera valuta
     out["currency"] = str(out.get("currency") or "USD").upper()
 
-    out["__sources"] = src
+    out["source_map"] = src
     return out
 
 # -------------------------
-# Finnhub (valfritt) – EPS-estimat
+# Finnhub (valfritt) – EPS-estimat 1–2 år framåt
 # -------------------------
 def _get_finnhub_key() -> Optional[str]:
     return (_env_or_secret("FINNHUB_API_KEY")
@@ -516,39 +493,45 @@ def _get_finnhub_key() -> Optional[str]:
             or os.environ.get("FINNHUB_API_KEY")
             or os.environ.get("FINNHUB_TOKEN"))
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
     """
     Försöker hämta EPS-estimat 1–2 år framåt från Finnhub (om nyckel finns).
-    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "__source": "..."}
+    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "finnhub"|"none"}
     """
     key = _get_finnhub_key()
     if not key:
-        return {"eps_1y": None, "eps_2y": None, "__source": "none"}
+        return {"eps_1y": None, "eps_2y": None, "source": "none"}
 
-    # Primärt försök: /stock/estimate
+    # Primärt försök: /stock/estimate (periodsorterad lista med epsAvg)
     try:
         url = f"https://finnhub.io/api/v1/stock/estimate?symbol={ticker}&token={key}"
-        r = requests.get(url, timeout=10)
-        eps_1y, eps_2y = None, None
-        if r.ok:
-            js = r.json()
-            rows = js if isinstance(js, list) else js.get("data", [])
-            rows = rows or []
-            rows = sorted(rows, key=lambda x: str(x.get("period","")))
-            vals = [_safe_float(x.get("epsAvg")) for x in rows if _safe_float(x.get("epsAvg")) is not None]
-            if vals:
-                eps_1y = vals[-1]
-                eps_2y = vals[-2] if len(vals) > 1 else None
-        return {"eps_1y": eps_1y, "eps_2y": eps_2y, "__source": "finnhub.estimate"}
+        r = requests.get(url, timeout=12)
+        if not r.ok:
+            return {"eps_1y": None, "eps_2y": None, "source": "none"}
+        js = r.json()
+        rows = js if isinstance(js, list) else js.get("data", [])
+        rows = rows or []
+        # sortera på period (YYYY-MM-DD eller YYYY-MM)
+        def per_key(x):
+            p = str(x.get("period") or "")
+            return p
+        rows = sorted(rows, key=per_key)
+        vals = [_safe_float(x.get("epsAvg")) for x in rows if _safe_float(x.get("epsAvg")) is not None]
+        if not vals:
+            return {"eps_1y": None, "eps_2y": None, "source": "none"}
+        # anta senaste = 1Y, näst senaste = 2Y om finns
+        eps_1y = vals[-1]
+        eps_2y = vals[-2] if len(vals) > 1 else None
+        return {"eps_1y": eps_1y, "eps_2y": eps_2y, "source": "finnhub"}
     except Exception:
-        return {"eps_1y": None, "eps_2y": None, "__source": "finnhub.error"}
+        return {"eps_1y": None, "eps_2y": None, "source": "none"}
 
 # -------------------------
 # Multipel-decay & ankar-P/E
 # -------------------------
 def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac: float = 0.60) -> Optional[float]:
-    """Minska multipeln med decay per år (linjär mot ett golv)."""
+    """Minska multipeln med decay per år (linjärt mot ett golv)."""
     m0 = _pos(mult0)
     if m0 is None:
         return None
@@ -611,87 +594,62 @@ def _price_from_pb(pb: Optional[float], bvps: Optional[float]) -> Optional[float
     return p * b
 
 # -------------------------
-# EPS/REV/EBITDA paths (inkl. fallback + källor)
+# EPS/REV/EBITDA paths + härledning
 # -------------------------
 def _derive_eps_from_pe_if_missing(price: Optional[float], pe_ttm: Optional[float], pe_fwd: Optional[float],
-                                   eps_ttm: Optional[float], eps_1y: Optional[float],
-                                   src_out: Dict[str,str]) -> Tuple[Optional[float], Optional[float]]:
+                                   eps_ttm: Optional[float], eps_1y: Optional[float]) -> Tuple[Optional[float], str, Optional[float], str]:
     """
-    Om EPS saknas men vi har price+PE, härled EPS. Uppdaterar src_out.
-    Returnerar (eps_ttm, eps_1y)
+    Om EPS saknas men vi har price+PE, härled EPS. Returnerar (eps_ttm, src_ttm, eps_1y, src_1y)
     """
+    src_ttm = "source" if eps_ttm is not None else ""
+    src_1y  = "source" if eps_1y  is not None else ""
     if eps_ttm is None and _pos(price) and _pos(pe_ttm):
         eps_ttm = price / pe_ttm
-        _mark(src_out, "eps_ttm", "derived_from_pe_ttm")
+        src_ttm = "derived_from_pe"
     if eps_1y is None and _pos(price) and _pos(pe_fwd):
         eps_1y = price / pe_fwd
-        _mark(src_out, "eps_1y", "derived_from_pe_fwd")
-    return eps_ttm, eps_1y
+        src_1y = "derived_from_forward_pe"
+    return eps_ttm, src_ttm, eps_1y, src_1y
 
-def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optional[float],
-              eps_cagr: Optional[float], src_out: Dict[str,str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optional[float], eps_cagr: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Returnerar (eps_0, eps_1, eps_2, eps_3).
-    Prioritet: estimat (1–2y). Saknas → extrapolera med CAGR från senaste kända punkt.
-    eps_cagr förväntas som decimaltal (0.18 = 18%).
+    Prioritet: given eps_1y/2y → annars extrapolera med EPS CAGR från ttm.
     """
     e0 = _pos(eps_ttm)
     e1 = _pos(eps_1y)
     e2 = _pos(eps_2y)
     cg = _f(eps_cagr)
-
-    # Om vi har e0 och e1 men saknar CAGR – härled enkel tillväxt
-    if cg is None and e0 is not None and e1 is not None and e0 > 0:
-        try:
-            cg = (e1 / e0) - 1.0
-            _mark(src_out, "eps_cagr", "derived_simple_from_eps_ttm_to_1y")
-        except Exception:
-            pass
-
-    # Fyll luckor med CAGR
     if e1 is None and e0 is not None and cg is not None:
-        e1 = e0 * (1.0 + cg); _mark(src_out, "eps_1y", "derived_from_cagr")
+        e1 = e0 * (1.0 + cg)
     if e2 is None and e1 is not None and cg is not None:
-        e2 = e1 * (1.0 + cg); _mark(src_out, "eps_2y", "derived_from_cagr")
+        e2 = e1 * (1.0 + cg)
     e3 = e2 * (1.0 + cg) if (e2 is not None and cg is not None) else None
-    if e3 is not None: _mark(src_out, "eps_3y", "derived_from_cagr")
-
     return e0, e1, e2, e3
 
-def _rev_path(rev_ttm: Optional[float], rev_cagr: Optional[float], revenue_growth_hint: Optional[float],
-              src_out: Dict[str,str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    Returnerar (rev_0..rev_3). rev_cagr i decimaltal. Om rev_cagr saknas, använd revenue_growth_hint (YoY från Yahoo) som fallback.
-    """
+def _rev_path(rev_ttm: Optional[float], rev_cagr: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     r0 = _pos(rev_ttm)
     cg = _f(rev_cagr)
+    if r0 is None:
+        return None, None, None, None
     if cg is None:
-        cg = _f(revenue_growth_hint)
-        if cg is not None:
-            _mark(src_out, "rev_cagr", "yahoo.revenueGrowth_hint")
-
-    if r0 is None or cg is None:
-        return r0, None, None, None
+        return r0, r0, r0, r0
     r1 = r0 * (1.0 + cg)
     r2 = r1 * (1.0 + cg)
     r3 = r2 * (1.0 + cg)
-    _mark(src_out, "rev_path", "derived_from_cagr")
     return r0, r1, r2, r3
 
-def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optional[float], rev2: Optional[float], rev3: Optional[float],
-                 src_out: Dict[str,str]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optional[float], rev2: Optional[float], rev3: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Proxy: EBITDA växer ungefär i takt med omsättning (om vi saknar riktiga prognoser).
-    Om rev-path saknas -> håll ebitda konstant.
+    Om rev-path saknas → håll ebitda konstant.
     """
     e0 = _pos(ebitda_ttm)
     if e0 is None:
         return None, None, None, None
     if rev0 is None or rev1 is None:
-        _mark(src_out, "ebitda_path", "flat_due_to_missing_rev_path")
         return e0, e0, e0, e0
     def scale(r): return (e0 * (r / rev0)) if (r and rev0) else e0
-    _mark(src_out, "ebitda_path", "scaled_with_revenue_path")
     return e0, scale(rev1), scale(rev2), scale(rev3)
 
 # -------------------------
@@ -716,97 +674,169 @@ def forecast_dividends_net_sek(
     return {"y1": net(1), "y2": net(2), "y3": net(3)}
 
 # -------------------------
-# Huvudmotor per rad (inkl. källkartläggning)
+# Metodval (heuristik)
 # -------------------------
-def compute_methods_for_row(
-    row: pd.Series,
-    settings: Dict[str, str],
-    fx_map: Dict[str, float],
-    primary_override: Optional[str] = None,
-) -> Tuple[pd.DataFrame, str, Dict[str, Any], Dict[str,str]]:
+def choose_primary_method(met_df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Välj primär metod: flest icke-NaN → bryt-tie med PREFER_ORDER.
+    Returnerar (method, idag, y1, y2, y3)
+    """
+    if met_df is None or met_df.empty:
+        return None, None, None, None, None
+    counts = met_df.set_index("Metod")[["Idag","1 år","2 år","3 år"]].notna().sum(axis=1)
+    if counts.empty:
+        return None, None, None, None, None
+    maxc = counts.max()
+    candidates = list(counts[counts == maxc].index)
+    chosen = None
+    for p in PREFER_ORDER:
+        if p in candidates:
+            chosen = p
+            break
+    if chosen is None:
+        chosen = candidates[0]
+    row = met_df[met_df["Metod"] == chosen].iloc[0]
+    return chosen, _f(row["Idag"]), _f(row["1 år"]), _f(row["2 år"]), _f(row["3 år"])
+
+# -------------------------
+# Huvudmotor per rad
+# -------------------------
+def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float]) -> Tuple[pd.DataFrame, str, Dict[str, Any]]:
     """
     Beräknar metodtabell (Idag, 1,2,3 år) för raden.
-    Returnerar (methods_df, sanity_text, meta, sources_map)
+    Returnerar (methods_df, sanity_text, meta)
+    meta innehåller: currency, price, shares_out, net_debt, pe_anchor, decay, source_map
     """
-    ticker = str(row.get("Ticker", "")).strip()
+    ticker = str(row.get("Ticker", "")).strip().upper()
     # 1) Live-data
     snap = fetch_yahoo_snapshot(ticker)
     time.sleep(0.35)  # mild throttling
     est  = fetch_finnhub_estimates(ticker)
 
-    src_map: Dict[str,str] = {}
-    src_map.update(snap.get("__sources", {}))
+    src_map = dict(snap.get("source_map") or {})  # kopia som vi fyller på
 
-    # 2) Inputs (med fallback från Data-bladet)
-    price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")));           _mark(src_map, "price",    src_map.get("price","Data") if price else "")
+    # 2) Inputs (med fallback från Data-bladet + källmarkering)
+    def take(name_snap, name_row, manual_tag="manual"):
+        """Ta värde från snapshot, annars rad; märk källa."""
+        val = snap.get(name_snap)
+        if val is None and (row.get(name_row) is not None and row.get(name_row) == row.get(name_row)):
+            val = _f(row.get(name_row))
+            if val is not None:
+                src_map[name_snap] = manual_tag
+        return val
+
+    price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
+    if price is None and _pos(row.get("Aktuell kurs")):
+        price = _pos(row.get("Aktuell kurs")); src_map["price"] = "manual"
     currency = str(_nz(snap.get("currency"), row.get("Valuta") or "USD")).upper()
     mcap     = _pos(snap.get("market_cap"))
     ev_now   = _pos(_nz(snap.get("ev"), None))
     shares   = _pos(_nz(snap.get("shares"), row.get("Utestående aktier")))
-    net_debt = _nz(snap.get("net_debt"), row.get("Net debt"))
+    if shares is None and _pos(row.get("Utestående aktier")):
+        shares = _pos(row.get("Utestående aktier")); src_map["shares"] = "manual"
 
-    rev_ttm    = _pos(_nz(snap.get("revenue_ttm"), row.get("Rev TTM")));        _mark(src_map, "revenue_ttm", "yahoo.info" if snap.get("revenue_ttm") else ("Data" if row.get("Rev TTM") else ""))
-    ebitda_ttm = _pos(_nz(snap.get("ebitda_ttm"), row.get("EBITDA TTM")));      _mark(src_map, "ebitda_ttm",  "yahoo.info" if snap.get("ebitda_ttm") else ("Data" if row.get("EBITDA TTM") else ""))
-    eps_ttm    = _pos(_nz(snap.get("eps_ttm"), row.get("EPS TTM")));            _mark(src_map, "eps_ttm",     "yahoo.info" if snap.get("eps_ttm") else ("Data" if row.get("EPS TTM") else ""))
+    net_debt   = _nz(snap.get("net_debt"), row.get("Net debt"))
+    if net_debt is None and _pos(row.get("Net debt")):
+        net_debt = _pos(row.get("Net debt")); src_map["net_debt"] = "manual"
+
+    rev_ttm    = _pos(_nz(snap.get("revenue_ttm"), row.get("Rev TTM")))
+    if rev_ttm is None and _pos(row.get("Rev TTM")):
+        rev_ttm = _pos(row.get("Rev TTM")); src_map["revenue_ttm"] = "manual"
+
+    ebitda_ttm = _pos(_nz(snap.get("ebitda_ttm"), row.get("EBITDA TTM")))
+    if ebitda_ttm is None and _pos(row.get("EBITDA TTM")):
+        ebitda_ttm = _pos(row.get("EBITDA TTM")); src_map["ebitda_ttm"] = "manual"
+
+    eps_ttm    = _pos(_nz(snap.get("eps_ttm"), row.get("EPS TTM")))
+    if eps_ttm is None and _pos(row.get("EPS TTM")):
+        eps_ttm = _pos(row.get("EPS TTM")); src_map["eps_ttm"] = "manual"
+
     pe_ttm     = _pos(_nz(snap.get("pe_ttm"), row.get("PE TTM")))
+    if pe_ttm is None and _pos(row.get("PE TTM")):
+        pe_ttm = _pos(row.get("PE TTM")); src_map["pe_ttm"] = "manual"
+
     pe_fwd     = _pos(_nz(snap.get("pe_fwd"), row.get("PE FWD")))
+    if pe_fwd is None and _pos(row.get("PE FWD")):
+        pe_fwd = _pos(row.get("PE FWD")); src_map["pe_fwd"] = "manual"
+
     ev_sales   = _pos(_nz(snap.get("ev_to_sales"), row.get("EV/Revenue")))
+    if ev_sales is None and _pos(row.get("EV/Revenue")):
+        ev_sales = _pos(row.get("EV/Revenue")); src_map["ev_to_sales"] = "manual"
+
     ev_ebitda  = _pos(_nz(snap.get("ev_to_ebitda"), row.get("EV/EBITDA")))
+    if ev_ebitda is None and _pos(row.get("EV/EBITDA")):
+        ev_ebitda = _pos(row.get("EV/EBITDA")); src_map["ev_to_ebitda"] = "manual"
+
     p_b        = _pos(_nz(snap.get("p_to_book"), row.get("P/B")))
+    if p_b is None and _pos(row.get("P/B")):
+        p_b = _pos(row.get("P/B")); src_map["p_to_book"] = "manual"
+
     bvps       = _pos(_nz(snap.get("bvps"), row.get("BVPS")))
-    rev_hint   = _pos(snap.get("revenue_growth"))
+    if bvps is None and _pos(row.get("BVPS")):
+        bvps = _pos(row.get("BVPS")); src_map["bvps"] = "manual"
 
     # Estimat / tillväxt
-    eps_1y_est = _pos(_nz(est.get("eps_1y"), _nz(snap.get("eps_fwd"), row.get("EPS 1Y"))))
-    if est.get("__source","").startswith("finnhub") and eps_1y_est is not None:
-        _mark(src_map, "eps_1y", "finnhub")
-    elif snap.get("eps_fwd") is not None and eps_1y_est is not None:
-        _mark(src_map, "eps_1y", "yahoo.forwardEps")
-    elif row.get("EPS 1Y") is not None and _pos(row.get("EPS 1Y")):
-        _mark(src_map, "eps_1y", "Data")
+    eps_1y_est = _pos(est.get("eps_1y")) if _pos(est.get("eps_1y")) else _pos(row.get("EPS 1Y"))
+    if _pos(est.get("eps_1y")): src_map["eps_1y"] = "finnhub"
+    elif _pos(row.get("EPS 1Y")): src_map["eps_1y"] = "manual"
+    else: src_map["eps_1y"] = ""
 
-    eps_2y_est = _pos(est.get("eps_2y"))
-    if eps_2y_est is not None:
-        _mark(src_map, "eps_2y", "finnhub")
+    eps_2y_est = _pos(est.get("eps_2y")) if _pos(est.get("eps_2y")) else None
+    if _pos(est.get("eps_2y")): src_map["eps_2y"] = "finnhub"
+    else: src_map["eps_2y"] = ""
 
     eps_cagr   = _f(row.get("EPS CAGR"))
-    if eps_cagr is not None:
-        _mark(src_map, "eps_cagr", "Data")
-
     rev_cagr   = _f(row.get("Rev CAGR"))
-    if rev_cagr is not None:
-        _mark(src_map, "rev_cagr", "Data")
 
     # 3) Härled EPS om saknas men PE+price finns
-    eps_ttm, eps_1y_est = _derive_eps_from_pe_if_missing(
-        price, pe_ttm, pe_fwd, eps_ttm, eps_1y_est, src_map
+    eps_ttm, src_eps_ttm, eps_1y_est2, src_eps_1y = _derive_eps_from_pe_if_missing(
+        price, pe_ttm, pe_fwd, eps_ttm, eps_1y_est
     )
+    if src_eps_ttm.startswith("derived"): src_map["eps_ttm"] = src_eps_ttm
+    if src_eps_1y.startswith("derived"):  src_map["eps_1y"]  = src_eps_1y
+    # Om finnub gav 1y, behåll den framför derivatan:
+    if _pos(est.get("eps_1y")):
+        eps_1y_est = _pos(est.get("eps_1y")); src_map["eps_1y"] = "finnhub"
+    else:
+        eps_1y_est = eps_1y_est2
 
     # 4) Anchors & decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
     decay = _f(settings.get("multiple_decay", 0.10)) or 0.10
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
-    if pe_anchor is not None:
-        _mark(src_map, "pe_anchor", f"weighted(TTM={w_ttm:.2f},FWD={1.0-w_ttm:.2f})")
 
-    # 5) Paths
-    e0, e1, e2, e3 = _eps_path(eps_ttm, eps_1y_est, eps_2y_est, eps_cagr, src_map)
-    r0, r1, r2, r3 = _rev_path(rev_ttm, rev_cagr, rev_hint, src_map)
-    b0, b1, b2, b3 = _ebitda_path(ebitda_ttm, r0, r1, r2, r3, src_map)
+    # 5) Paths (EPS prioriterar: ttm → 1y/2y (finnhub) → cagr; REV via cagr; EBITDA skalar med REV)
+    e0, e1, e2, e3 = _eps_path(eps_ttm, eps_1y_est, eps_2y_est, eps_cagr)
+    r0, r1, r2, r3 = _rev_path(rev_ttm, rev_cagr)
+    b0, b1, b2, b3 = _ebitda_path(ebitda_ttm, r0, r1, r2, r3)
 
-    # Multiplar med decay
+    # Multiplar med decay (antag re-rating nedåt)
     pe0  = pe_anchor
     pe1m = _decay_multiple(pe_anchor, 1, decay)
     pe2m = _decay_multiple(pe_anchor, 2, decay)
     pe3m = _decay_multiple(pe_anchor, 3, decay)
 
-    evs0, evs1, evs2, evs3 = ev_sales, _decay_multiple(ev_sales, 1, decay), _decay_multiple(ev_sales, 2, decay), _decay_multiple(ev_sales, 3, decay)
-    eve0, eve1, eve2, eve3 = ev_ebitda, _decay_multiple(ev_ebitda, 1, decay), _decay_multiple(ev_ebitda, 2, decay), _decay_multiple(ev_ebitda, 3, decay)
-    pb0,  pb1,  pb2,  pb3  = p_b,      _decay_multiple(p_b,      1, decay), _decay_multiple(p_b,      2, decay), _decay_multiple(p_b,      3, decay)
+    evs0, evs1, evs2, evs3 = (
+        ev_sales,
+        _decay_multiple(ev_sales, 1, decay),
+        _decay_multiple(ev_sales, 2, decay),
+        _decay_multiple(ev_sales, 3, decay),
+    )
+    eve0, eve1, eve2, eve3 = (
+        ev_ebitda,
+        _decay_multiple(ev_ebitda, 1, decay),
+        _decay_multiple(ev_ebitda, 2, decay),
+        _decay_multiple(ev_ebitda, 3, decay),
+    )
+    pb0, pb1, pb2, pb3 = (
+        p_b,
+        _decay_multiple(p_b, 1, decay),
+        _decay_multiple(p_b, 2, decay),
+        _decay_multiple(p_b, 3, decay),
+    )
 
     # 6) Priser per metod
     methods = []
-
     # P/E vs EPS
     methods.append({
         "Metod": "pe_hist_vs_eps",
@@ -815,7 +845,6 @@ def compute_methods_for_row(
         "2 år": _price_from_pe(e2, pe2m),
         "3 år": _price_from_pe(e3, pe3m),
     })
-
     # EV/Sales
     methods.append({
         "Metod": "ev_sales",
@@ -824,7 +853,6 @@ def compute_methods_for_row(
         "2 år": _equity_price_from_ev(_ev_from_sales(r2, evs2), net_debt, shares),
         "3 år": _equity_price_from_ev(_ev_from_sales(r3, evs3), net_debt, shares),
     })
-
     # EV/EBITDA
     methods.append({
         "Metod": "ev_ebitda",
@@ -833,7 +861,6 @@ def compute_methods_for_row(
         "2 år": _equity_price_from_ev(_ev_from_ebitda(b2, eve2), net_debt, shares),
         "3 år": _equity_price_from_ev(_ev_from_ebitda(b3, eve3), net_debt, shares),
     })
-
     # EV/DACF (proxy = EV/EBITDA tills DACF finns)
     methods.append({
         "Metod": "ev_dacf",
@@ -842,8 +869,7 @@ def compute_methods_for_row(
         "2 år": _equity_price_from_ev(_ev_from_ebitda(b2, eve2), net_debt, shares),
         "3 år": _equity_price_from_ev(_ev_from_ebitda(b3, eve3), net_debt, shares),
     })
-
-    # P/B (kräver BVPS – annars None)
+    # P/B (kräver BVPS)
     methods.append({
         "Metod": "p_b",
         "Idag": _price_from_pb(pb0, bvps),
@@ -851,18 +877,18 @@ def compute_methods_for_row(
         "2 år": _price_from_pb(pb2, bvps),
         "3 år": _price_from_pb(pb3, bvps),
     })
-
     # Platshållare för metoder som kräver per-aktie-tal vi ofta inte kan hämta automatiskt
     for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
         methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
-    # 7) Sanity
+    # 7) Sanity + meta
+    def ok(v): return "ok" if _pos(v) else "—"
     sanity = (
-        f"price={'ok' if price else '—'}, eps_ttm={'ok' if e0 else '—'}, "
-        f"eps_1y={'ok' if e1 else '—'}, eps_2y={'ok' if e2 else '—'}, "
-        f"rev_ttm={'ok' if r0 else '—'}, ebitda_ttm={'ok' if b0 else '—'}, shares={'ok' if shares else '—'}, "
+        f"price={ok(price)}, eps_ttm={ok(e0)} ({src_map.get('eps_ttm','') or '—'}), "
+        f"eps_1y={ok(e1)} ({src_map.get('eps_1y','') or '—'}), eps_2y={ok(e2)} ({src_map.get('eps_2y','') or '—'}), "
+        f"rev_ttm={ok(r0)}, ebitda_ttm={ok(b0)}, shares={ok(shares)}, "
         f"pe_anchor={round(pe_anchor,2) if pe_anchor else '—'}, decay={decay}"
     )
 
@@ -873,276 +899,352 @@ def compute_methods_for_row(
         "net_debt": net_debt,
         "pe_anchor": pe_anchor,
         "decay": decay,
-        "preferred": primary_override
+        "source_map": src_map,
+        "paths": {"eps": (e0, e1, e2, e3), "rev": (r0, r1, r2, r3), "ebitda": (b0, b1, b2, b3)},
+        "multiples": {"pe": (pe0, pe1m, pe2m, pe3m), "ev_sales": (evs0, evs1, evs2, evs3), "ev_ebitda": (eve0, eve1, eve2, eve3), "p_b": (pb0, pb1, pb2, pb3)},
     }
-    return methods_df, sanity, meta, src_map
+    return methods_df, sanity, meta
 
 # app.py — Del 3/4
 # ============================================================
-# UI per bolag: presentation + metodval + spar-funktioner
+# UI för bolagspresentation (en i taget), metodval i Analys,
+# källspårning & sparning till Sheets (Resultat/Primär metod)
 # ============================================================
 
-# ---------- Formatering ----------
-def _fmt_money(v: Optional[float], ccy: str) -> str:
-    if v is None or (isinstance(v, float) and not math.isfinite(v)):
-        return f"– {ccy}"
-    try:
-        return f"{float(v):,.2f} {ccy}".replace(",", " ").replace(".", ",")
-    except Exception:
-        return f"{v} {ccy}"
+# Ordning för metodpreferens (används vid auto-val)
+METHOD_LIST  = ["ev_ebitda","ev_sales","pe_hist_vs_eps","p_b","ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"]
+PREFER_ORDER = METHOD_LIST[:]  # samma ordning
 
-def _fmt_pct(v: Optional[float]) -> str:
+# ---------- Hjälpformat ----------
+def _fmt_money(v: Optional[float], ccy: str) -> str:
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return "–"
     try:
-        return f"{float(v)*100:,.1f}%".replace(",", " ")
+        return f"{v:,.2f} {ccy}".replace(",", " ").replace(".", ",")
     except Exception:
-        return f"{v}%"
+        return f"{v} {ccy}"
 
 def _fmt_sek(v: Optional[float]) -> str:
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return "0 SEK"
     try:
-        return f"{float(v):,.0f} SEK".replace(",", " ").replace(".", ",")
+        return f"{v:,.0f} SEK".replace(",", " ").replace(".", ",")
     except Exception:
         return f"{v} SEK"
 
-# ---------- Spara/uppdatera hjälp ----------
-def _save_primary_method_to_data(ticker: str, method: str) -> None:
+# ---------- Spara till fliken Resultat (append/overwrite senaste för ticker) ----------
+def _append_or_update_result(
+    ticker: str,
+    currency: str,
+    method: Optional[str],
+    today: Optional[float],
+    y1: Optional[float],
+    y2: Optional[float],
+    y3: Optional[float],
+) -> None:
+    res_df = _read_df(RESULT_TITLE)
+    ts = now_stamp()
+    new_row = {
+        "Timestamp": ts,
+        "Ticker": ticker,
+        "Valuta": currency,
+        "Metod": method or "",
+        "Riktkurs idag": today,
+        "Riktkurs 1 år": y1,
+        "Riktkurs 2 år": y2,
+        "Riktkurs 3 år": y3,
+    }
+    if not res_df.empty and "Ticker" in res_df.columns:
+        mask = res_df["Ticker"].astype(str) == ticker
+        if mask.any():
+            idx = res_df.index[mask][-1]
+            for k, v in new_row.items():
+                if k in res_df.columns:
+                    res_df.at[idx, k] = v
+                else:
+                    res_df[k] = np.nan
+                    res_df.at[idx, k] = v
+            _write_df(RESULT_TITLE, res_df)
+            return
+    # append
+    cols = list(res_df.columns) if not res_df.empty else list(new_row.keys())
+    for k in new_row.keys():
+        if k not in cols:
+            cols.append(k)
+    res_df = pd.concat([res_df, pd.DataFrame([new_row])[cols]], ignore_index=True)
+    _write_df(RESULT_TITLE, res_df[cols])
+
+# ---------- Uppdatera primär metod i Data ----------
+def _save_primary_method_in_data(ticker: str, method: str) -> None:
     df = read_data_df()
     if df.empty:
         st.warning("Data-bladet är tomt.")
         return
     if "Primär metod" not in df.columns:
         df["Primär metod"] = np.nan
-    mask = df["Ticker"].astype(str) == str(ticker)
+    mask = (df["Ticker"].astype(str).str.upper() == str(ticker).upper())
     if not mask.any():
-        st.warning(f"Hittade inte {ticker} i Data-bladet.")
+        st.warning(f"Hittade inte {ticker} i Data.")
         return
     df.loc[mask, "Primär metod"] = method
     write_data_df(df)
 
-def _append_or_update_result_row(ticker: str, currency: str, method: str,
-                                 today: Optional[float], y1: Optional[float],
-                                 y2: Optional[float], y3: Optional[float]) -> None:
-    res = _read_df(RESULT_TITLE)
-    now = now_stamp()
-    new_row = {
-        "Timestamp": now, "Ticker": ticker, "Valuta": currency, "Metod": method,
-        "Riktkurs idag": _f(today), "Riktkurs 1 år": _f(y1),
-        "Riktkurs 2 år": _f(y2), "Riktkurs 3 år": _f(y3),
-    }
-    if res.empty:
-        _write_df(RESULT_TITLE, pd.DataFrame([new_row]))
-        return
-    # upsert per Ticker
-    if "Ticker" in res.columns and (res["Ticker"].astype(str) == ticker).any():
-        idx = res.index[res["Ticker"].astype(str) == ticker][-1]
-        for k, v in new_row.items():
-            if k in res.columns:
-                res.at[idx, k] = v
-            else:
-                res[k] = np.nan
-                res.at[idx, k] = v
-        _write_df(RESULT_TITLE, res)
-    else:
-        cols = list(res.columns)
-        for k in new_row.keys():
-            if k not in cols:
-                cols.append(k)
-        res = pd.concat([res, pd.DataFrame([new_row])[cols]], ignore_index=True)
-        _write_df(RESULT_TITLE, res[cols])
-
-def _update_estimates_in_data(ticker: str, eps1y: Optional[float], eps2y: Optional[float],
-                              eps_cagr: Optional[float], rev_cagr: Optional[float]) -> None:
-    df = read_data_df()
-    if df.empty:
-        st.warning("Data-bladet är tomt.")
-        return
-    for c in ["EPS 1Y", "EPS CAGR", "Rev CAGR"]:
-        if c not in df.columns:
-            df[c] = np.nan
-    mask = df["Ticker"].astype(str) == str(ticker)
-    if not mask.any():
-        st.warning(f"Hittade inte {ticker} i Data-bladet.")
-        return
-    if eps1y is not None:  df.loc[mask, "EPS 1Y"]   = float(eps1y)
-    if eps_cagr is not None: df.loc[mask, "EPS CAGR"] = float(eps_cagr)
-    if rev_cagr is not None: df.loc[mask, "Rev CAGR"] = float(rev_cagr)
-    write_data_df(df)
-
-# ---------- Primärmetod-heuristik ----------
-PREFER_ORDER = ["ev_ebitda","ev_sales","pe_hist_vs_eps","p_b","ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"]
-
-def _pick_primary_from_table(met_df: pd.DataFrame) -> Optional[str]:
-    if met_df is None or met_df.empty:
-        return None
-    counts = met_df.set_index("Metod")[["Idag","1 år","2 år","3 år"]].notna().sum(axis=1)
-    if counts.empty:
-        return None
-    maxc = counts.max()
-    candidates = list(counts[counts == maxc].index)
-    for m in PREFER_ORDER:
-        if m in candidates:
-            return m
-    return candidates[0] if candidates else None
-
-# ---------- Källtabel ----------
-def _render_sources_card(src_map: Dict[str,str], meta: Dict[str, Any]) -> None:
-    with st.expander("🔎 Datakällor & härledningar", expanded=False):
-        # Visa nyckelvärden + källa
-        rows = []
-        show_keys = [
-            ("price", "Aktuell kurs"),
-            ("currency", "Valuta"),
-            ("shares_out", "Utestående aktier"),
-            ("net_debt", "Net debt"),
-            ("pe_anchor", "PE-ankare (TTM/FWD mix)"),
-            ("revenue_ttm", "Omsättning TTM"),
-            ("ebitda_ttm", "EBITDA TTM"),
-            ("eps_ttm", "EPS TTM"),
-            ("eps_1y", "EPS 1 år"),
-            ("eps_2y", "EPS 2 år"),
-            ("rev_cagr", "Rev CAGR"),
-            ("eps_cagr", "EPS CAGR"),
-        ]
-        for key, nice in show_keys:
-            src = src_map.get(key, "")
-            val = meta.get(key) if key in meta else None
-            rows.append({"Fält": nice, "Källa": src if src else "—", "Värde": val})
-        df_src = pd.DataFrame(rows)
-        st.dataframe(df_src, use_container_width=True)
-
-# ---------- Bolagspresentation ----------
-def render_company_view(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float], method_override: Optional[str] = None) -> None:
+# ---------- Rendera en bolagsvy ----------
+def render_company_view(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float], method_override: Optional[str] = None) -> Dict[str, Any]:
     tkr = str(row.get("Ticker", "")).strip().upper()
     name = str(_nz(row.get("Bolagsnamn"), tkr))
-    bucket = str(_nz(row.get("Bucket"), "")).strip() or "—"
+    bucket = str(_nz(row.get("Bucket"), "")).strip()
 
-    st.markdown(f"### {tkr} • {name} • {bucket}")
+    st.markdown(f"### {tkr} • {name} {'• ' + bucket if bucket else ''}")
 
     # Kör motor
-    met_df, sanity, meta, src_map = compute_methods_for_row(row, settings, fx_map, primary_override=method_override)
-
+    methods_df, sanity, meta = compute_methods_for_row(row, settings, fx_map)
     currency = meta.get("currency") or str(_nz(row.get("Valuta"), "USD")).upper()
     price_now = meta.get("price")
     fx = fx_map.get(currency, 1.0) or 1.0
+
+    # Tillgängliga metoder (icke-NaN)
+    available_methods = methods_df.loc[methods_df[["Idag","1 år","2 år","3 år"]].notna().any(axis=1), "Metod"].tolist()
+
+    # Välj primär metod: override → Data-blad → auto
+    saved_primary = str(_nz(row.get("Primär metod"), "")) if "Primär metod" in row.index else ""
+    chosen_method = None
+    if method_override and method_override in available_methods:
+        chosen_method = method_override
+    elif saved_primary and saved_primary in available_methods:
+        chosen_method = saved_primary
+    else:
+        cm, p0c, _, _, _ = choose_primary_method(methods_df)
+        if cm in available_methods:
+            chosen_method = cm
+        else:
+            chosen_method = available_methods[0] if available_methods else None
+
+    # Visa toppkort
+    st.caption(f"Sanity: {sanity}")
+    with st.expander("🔍 Metodtabell (alla)", expanded=False):
+        st.dataframe(methods_df, use_container_width=True)
+
+    # Primär riktkurs (från valt method)
+    p_row = methods_df[methods_df["Metod"] == chosen_method].iloc[0] if chosen_method else None
+    p0 = _f(p_row["Idag"]) if p_row is not None else None
+    p1 = _f(p_row["1 år"]) if p_row is not None else None
+    p2 = _f(p_row["2 år"]) if p_row is not None else None
+    p3 = _f(p_row["3 år"]) if p_row is not None else None
+
+    st.markdown("#### 🎯 Primär riktkurs")
+    cols = st.columns(5)
+    cols[0].metric("Aktuell kurs", _fmt_money(price_now, currency))
+    cols[1].metric("Idag", _fmt_money(p0, currency))
+    cols[2].metric("1 år", _fmt_money(p1, currency))
+    cols[3].metric("2 år", _fmt_money(p2, currency))
+    cols[4].metric("3 år", _fmt_money(p3, currency))
+    st.caption(f"Metod: **{chosen_method or '—'}** • Valuta: **{currency}** • PE-ankare vikt (TTM): {int(float(settings.get('pe_anchor_weight_ttm','0.5'))*100)}% • Decay: {settings.get('multiple_decay','0.10')}")
+
+    # Uppsida/ner-sida vs aktuell kurs
+    if _pos(price_now) and _pos(p0):
+        delta_pct = (p0/price_now - 1.0) * 100.0
+        st.metric("Uppsida (Idag mot aktuell kurs)", f"{delta_pct:,.1f}%".replace(",", " "))
+
+    # Källor & inputs
+    with st.expander("📎 Källor & inputs som beräkningen bygger på", expanded=True):
+        sm = meta.get("source_map", {}) or {}
+        paths = meta.get("paths", {}) or {}
+        multiples = meta.get("multiples", {}) or {}
+        # Visa viktiga inputs med källa
+        show_fields = [
+            ("price","Pris"), ("currency","Valuta"), ("shares","Utestående aktier"),
+            ("net_debt","Net debt"), ("revenue_ttm","Rev TTM"), ("ebitda_ttm","EBITDA TTM"),
+            ("eps_ttm","EPS TTM"), ("eps_1y","EPS 1Y (estimat)"), ("eps_2y","EPS 2Y (estimat)"),
+            ("pe_ttm","PE TTM"), ("pe_fwd","PE FWD"),
+            ("ev_to_sales","EV/Revenue"), ("ev_to_ebitda","EV/EBITDA"),
+            ("p_to_book","P/B"), ("bvps","BVPS")
+        ]
+        vals = []
+        snap = fetch_yahoo_snapshot(tkr)  # endast för att hämta raw-fält som saknas i row/meta
+        for key, label in show_fields:
+            # Hämta värde från meta/snap/row
+            v = None
+            if key in ("price","currency","shares","net_debt","revenue_ttm","ebitda_ttm","eps_ttm","pe_ttm","pe_fwd","ev_to_sales","ev_to_ebitda","p_to_book","bvps"):
+                v = snap.get(key, None)
+                # fallback från rad
+                if v is None:
+                    # mappa key -> datakolumn
+                    map_row = {
+                        "price":"Aktuell kurs", "currency":"Valuta", "shares":"Utestående aktier",
+                        "net_debt":"Net debt", "revenue_ttm":"Rev TTM", "ebitda_ttm":"EBITDA TTM",
+                        "eps_ttm":"EPS TTM", "pe_ttm":"PE TTM", "pe_fwd":"PE FWD",
+                        "ev_to_sales":"EV/Revenue", "ev_to_ebitda":"EV/EBITDA",
+                        "p_to_book":"P/B", "bvps":"BVPS"
+                    }
+                    v = _f(row.get(map_row.get(key,"")))
+            elif key in ("eps_1y","eps_2y"):
+                # tas från Finnhub i compute_methods_for_row -> meta.paths['eps']
+                eps_tuple = paths.get("eps") or (None,None,None,None)
+                idx = 1 if key == "eps_1y" else 2
+                v = eps_tuple[idx] if len(eps_tuple) > idx else None
+            src = sm.get(key, "")
+            vals.append([label, v, src or ""])
+
+        df_inputs = pd.DataFrame(vals, columns=["Fält","Värde","Källa"])
+        st.dataframe(df_inputs, use_container_width=True)
+
+        with st.expander("🧪 Använda paths & multiplar", expanded=False):
+            e0,e1,e2,e3 = (paths.get("eps") or (None,)*4)
+            r0,r1,r2,r3 = (paths.get("rev") or (None,)*4)
+            b0,b1,b2,b3 = (paths.get("ebitda") or (None,)*4)
+            pe0,pe1m,pe2m,pe3m = (multiples.get("pe") or (None,)*4)
+            evs0,evs1,evs2,evs3 = (multiples.get("ev_sales") or (None,)*4)
+            eve0,eve1,eve2,eve3 = (multiples.get("ev_ebitda") or (None,)*4)
+            pb0,pb1,pb2,pb3     = (multiples.get("p_b") or (None,)*4)
+            st.write("**EPS-path**:", e0, e1, e2, e3)
+            st.write("**REV-path**:", r0, r1, r2, r3)
+            st.write("**EBITDA-path**:", b0, b1, b2, b3)
+            st.write("**PE (med decay)**:", pe0, pe1m, pe2m, pe3m)
+            st.write("**EV/S (med decay)**:", evs0, evs1, evs2, evs3)
+            st.write("**EV/EBITDA (med decay)**:", eve0, eve1, eve2, eve3)
+            st.write("**P/B (med decay)**:", pb0, pb1, pb2, pb3)
+
+    # Utdelning (netto SEK) kommande 1–3 år
     shares_owned = _f(row.get("Antal aktier")) or 0.0
-
-    # Metodval (primär)
-    saved_primary = str(_nz(row.get("Primär metod"), ""))
-    heuristic = _pick_primary_from_table(met_df) or "pe_hist_vs_eps"
-    default_method = method_override or (saved_primary if saved_primary in met_df["Metod"].tolist() else heuristic)
-
-    # UI-rad
-    top1, top2, top3 = st.columns([1.2, 1, 1])
-    with top1:
-        st.caption(f"Sanity: {sanity}")
-        st.dataframe(met_df, use_container_width=True)
-    with top2:
-        sel = st.selectbox("Värderingssätt (primärt)", met_df["Metod"].tolist(),
-                           index=met_df.index[met_df["Metod"] == default_method].tolist()[0] if default_method in met_df["Metod"].tolist() else 0,
-                           key=f"method_{tkr}")
-        st.caption("Välj temporärt här — spara som primär i Data om du vill behålla valet.")
-        if st.button("💾 Spara som primär i Data", key=f"save_primary_{tkr}"):
-            _save_primary_method_to_data(tkr, sel)
-            st.success(f"Sparade primär metod '{sel}' till Data.")
-    with top3:
-        _render_sources_card(src_map, {
-            "price": price_now,
-            "currency": currency,
-            "shares_out": meta.get("shares_out"),
-            "net_debt": meta.get("net_debt"),
-            "pe_anchor": meta.get("pe_anchor"),
-            "revenue_ttm": _f(row.get("Rev TTM")) or None,
-            "ebitda_ttm": _f(row.get("EBITDA TTM")) or None,
-            "eps_ttm": _f(row.get("EPS TTM")) or None,
-            "eps_1y": None,   # visas i tabellen nedan (hämtas/deriveras i engine)
-            "eps_2y": None,
-            "rev_cagr": _f(row.get("Rev CAGR")),
-            "eps_cagr": _f(row.get("EPS CAGR")),
-        })
-
-    # Utvalda mål (vald metod)
-    choose_row = met_df[met_df["Metod"] == sel].iloc[0]
-    p0 = _f(choose_row["Idag"])
-    p1 = _f(choose_row["1 år"])
-    p2 = _f(choose_row["2 år"])
-    p3 = _f(choose_row["3 år"])
-
-    st.markdown("#### 🎯 Fair value (vald metod)")
-    mcols = st.columns(4)
-    mcols[0].metric("Idag", _fmt_money(p0, currency))
-    mcols[1].metric("1 år", _fmt_money(p1, currency))
-    mcols[2].metric("2 år", _fmt_money(p2, currency))
-    mcols[3].metric("3 år", _fmt_money(p3, currency))
-    st.caption(f"Metod: **{sel}** • Valuta: **{currency}** • PE-ankare (TTM/FWD vikt): {settings.get('pe_anchor_weight_ttm','0.5')} • Decay/år: {settings.get('multiple_decay','0.10')}")
-
-    # Uppsida vs pris
-    if _pos(price_now):
-        upcols = st.columns(4)
-        for i, (label, target) in enumerate([("Idag", p0),("1 år", p1),("2 år", p2),("3 år", p3)]):
-            if _pos(target):
-                delta = (target/price_now - 1.0)
-                upcols[i].metric(f"Uppsida {label}", _fmt_pct(delta))
-            else:
-                upcols[i].metric(f"Uppsida {label}", "–")
-
-    # Utdelning (netto SEK) 1–3 år
-    dps_now  = _f(row.get("Årlig utdelning"))
+    dps_now = _f(row.get("Årlig utdelning"))
     dps_cagr = _f(row.get("Utdelning CAGR"))
     divs = forecast_dividends_net_sek(currency, shares_owned, dps_now, dps_cagr, fx_map, settings)
-    with st.expander("💰 Utdelning (netto, SEK) – prognos", expanded=True):
+    with st.expander("💰 Utdelning (netto, SEK)", expanded=True):
         st.write(f"• **1 år:** {_fmt_sek(divs['y1'])} • **2 år:** {_fmt_sek(divs['y2'])} • **3 år:** {_fmt_sek(divs['y3'])}")
         st.caption(f"Källskatt {currency}: {int(get_withholding_for(currency, settings)*100)}% • Antal aktier: {int(shares_owned)}")
 
-    # Innehavsvärde nu (SEK)
-    port_sek = (price_now or 0.0) * shares_owned * fx
-    with st.expander("🧾 Innehavsvärde (nu)", expanded=True):
-        st.write(f"Totalt värde: **{_fmt_sek(port_sek)}**  • Pris: {price_now if price_now else '—'} {currency} • FX: {fx:.3f}")
-
+    # Åtgärder (primär metod, spara riktkurs)
     st.divider()
-    a, b, c = st.columns(3)
+    c1, c2, c3 = st.columns([2,2,3])
+    # Välj metod i analysvyn (override)
+    method_choice = c1.selectbox(
+        "Primär metod (välj här för att testa; spara för att lagra i Data)",
+        options=available_methods,
+        index=available_methods.index(chosen_method) if chosen_method in available_methods else 0,
+        key=f"method_sel_{tkr}"
+    )
+    if c2.button("💾 Spara primär metod till Data", key=f"save_pm_{tkr}"):
+        _save_primary_method_in_data(tkr, method_choice)
+        st.success(f"Primär metod sparad: {method_choice}")
 
-    if a.button("🔄 Uppdatera Estimat/CAGR", key=f"upd_est_{tkr}"):
-        try:
-            # hämta igen
-            est = fetch_finnhub_estimates(tkr)
-            snap = fetch_yahoo_snapshot(tkr)
-            eps_ttm = _pos(_nz(snap.get("eps_ttm"), row.get("EPS TTM")))
-            eps1 = _pos(_nz(est.get("eps_1y"), row.get("EPS 1Y")))
-            eps2 = _pos(est.get("eps_2y"))
-            eps_cagr = _f(row.get("EPS CAGR"))
-            if eps_cagr is None and _pos(eps_ttm) and _pos(eps1) and eps_ttm > 0:
-                eps_cagr = (eps1/eps_ttm) - 1.0
-            _update_estimates_in_data(tkr, eps1, eps2, eps_cagr, _f(row.get("Rev CAGR")))
-            st.success("Estimat/CAGR uppdaterade i Data.")
-        except Exception as e:
-            st.error(f"Kunde inte uppdatera estimat: {e}")
+    if c3.button("🧷 Spara primär riktkurs till Resultat", key=f"save_res_{tkr}"):
+        prow = methods_df[methods_df["Metod"] == method_choice].iloc[0]
+        _append_or_update_result(
+            tkr, currency, method_choice,
+            _f(prow["Idag"]), _f(prow["1 år"]), _f(prow["2 år"]), _f(prow["3 år"])
+        )
+        st.success("Primär riktkurs sparad till fliken Resultat.")
 
-    if b.button("💾 Spara vald metods riktkurser → Resultat", key=f"save_res_{tkr}"):
-        try:
-            _append_or_update_result_row(tkr, currency, sel, p0, p1, p2, p3)
-            st.success("Primär riktkurs sparad till fliken Resultat.")
-        except Exception as e:
-            st.error(f"Kunde inte spara Resultat: {e}")
+    return {
+        "ticker": tkr,
+        "currency": currency,
+        "price": price_now,
+        "method": method_choice,
+        "p0": p0, "p1": p1, "p2": p2, "p3": p3,
+        "upside_today_pct": ((p0/price_now - 1.0)*100.0) if (_pos(p0) and _pos(price_now)) else None,
+        "methods_df": methods_df,
+        "meta": meta,
+    }
 
-    if c.button("📷 Snapshot (alla metoder) → Snapshot-flik", key=f"snap_{tkr}"):
-        try:
-            save_quarter_snapshot(tkr, met_df, {"currency": currency, "pe_anchor": meta.get("pe_anchor"), "decay": meta.get("decay")})
-            st.success("Snapshot sparad.")
-        except Exception as e:
-            st.error(f"Kunde inte spara snapshot: {e}")
+# ---------- Analys-sidan: en-i-taget, sorterat på störst uppsida ----------
+def page_analysis():
+    st.header("🔬 Analys – en i taget (störst uppsida först)")
+    settings = get_settings_map()
+    fx_map   = get_fx_map()
+    df       = read_data_df()
+    if df.empty:
+        st.info("Data-bladet är tomt. Gå till **Editor** och lägg till ett bolag.")
+        return
+
+    # Filter
+    f1, f2, f3 = st.columns([2,2,2])
+    buckets = f1.multiselect("Bucket", DEFAULT_BUCKETS, default=DEFAULT_BUCKETS)
+    owned_only = f2.selectbox("Urval", ["Alla", "Endast innehav (antal > 0)", "Endast watchlist (antal = 0)"], index=0)
+    throttle = f3.slider("Fördröjning per bolag (sek)", 0.0, 1.5, 0.30, 0.05)
+
+    q = df.copy()
+    if buckets:
+        q = q[q["Bucket"].isin(buckets)]
+    if owned_only == "Endast innehav (antal > 0)":
+        q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce") > 0)]
+    elif owned_only == "Endast watchlist (antal = 0)":
+        q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce").fillna(0) == 0)]
+    q = q.reset_index(drop=True)
+
+    # Knapp för att beräkna ranking (för att spara API-kvot)
+    if st.button("⚡ Beräkna & sortera på uppsida (Idag vs vald primär metod)"):
+        results = []
+        prog = st.progress(0.0)
+        for i in range(len(q)):
+            r = q.iloc[i]
+            # hämtar ev sparad primär metod
+            saved_primary = str(_nz(r.get("Primär metod"), ""))
+            # beräkna
+            met_df, sanity, meta = compute_methods_for_row(r, settings, fx_map)
+            # välj metod: sparad → auto
+            available = met_df.loc[met_df[["Idag","1 år","2 år","3 år"]].notna().any(axis=1), "Metod"].tolist()
+            if saved_primary in available:
+                chosen = saved_primary
+            else:
+                chosen, _, _, _, _ = choose_primary_method(met_df)
+                if chosen not in available and available:
+                    chosen = available[0]
+            # ta fair idag & pris
+            prow = met_df[met_df["Metod"] == chosen].iloc[0] if chosen else None
+            fair_today = _f(prow["Idag"]) if prow is not None else None
+            price_now = meta.get("price")
+            up = (fair_today/price_now - 1.0)*100.0 if (_pos(fair_today) and _pos(price_now)) else None
+            results.append({"idx": i, "ticker": r.get("Ticker"), "up": up, "met": chosen})
+            time.sleep(throttle)
+            prog.progress((i+1)/max(1,len(q)))
+        prog.empty()
+        # sortera och spara i session
+        results.sort(key=lambda x: (x["up"] is None, -(x["up"] or -1e9)))
+        st.session_state["anal_sorted"] = results
+        st.session_state["anal_idx"] = 0
+
+    # Init tom sortering om saknas
+    if "anal_sorted" not in st.session_state or not st.session_state["anal_sorted"]:
+        st.info("Tryck på **Beräkna & sortera** för att skapa listan.")
+        return
+
+    # Bläddra
+    total = len(st.session_state["anal_sorted"])
+    if "anal_idx" not in st.session_state:
+        st.session_state["anal_idx"] = 0
+    cprev, cinfo, cnext = st.columns([1,2,1])
+    if cprev.button("⬅️ Föregående") and st.session_state["anal_idx"] > 0:
+        st.session_state["anal_idx"] -= 1
+    if cnext.button("Nästa ➡️") and st.session_state["anal_idx"] < total-1:
+        st.session_state["anal_idx"] += 1
+    cur = st.session_state["anal_idx"]
+    cinfo.write(f"Post **{cur+1} / {total}** • Störst uppsida först")
+
+    # Visa vald post
+    cur_idx = st.session_state["anal_sorted"][cur]["idx"]
+    cur_row = q.iloc[cur_idx]
+
+    # Metodoverride-val för just denna vy
+    # (startvärde = sparad metod, annars auto)
+    saved_primary = str(_nz(cur_row.get("Primär metod"), ""))
+    method_override = st.selectbox(
+        "Temporärt metodval för denna vy (kan sparas nedan)",
+        options=METHOD_LIST,
+        index=METHOD_LIST.index(saved_primary) if saved_primary in METHOD_LIST else 0,
+        key=f"override_sel_{cur_row.get('Ticker')}"
+    )
+
+    # Rendera bolagskortet
+    render_company_view(cur_row, settings, fx_map, method_override=method_override)
 
 # app.py — Del 4/4
 # ============================================================
-# Sidor: Editor / Analys (med bläddring) / Ranking / Inställningar / Batch
-# Snapshot och main()
+# Sidor: Editor / Ranking / Inställningar / Batch
+# Snapshot + choose_primary_method + main()
 # ============================================================
 
-# -------------------------
-# Snapshot till "Snapshot"-fliken
-# -------------------------
+# ---------- Snapshot till "Snapshot"-fliken ----------
 def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: Dict[str, Any]) -> None:
     snap = _read_df(SNAPSHOT_TITLE)
     ts = now_stamp()
@@ -1163,6 +1265,25 @@ def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: Dict[str,
     snap = pd.concat([snap, pd.DataFrame(rows)], ignore_index=True) if not snap.empty else pd.DataFrame(rows)
     _write_df(SNAPSHOT_TITLE, snap)
 
+# ---------- Val av primär metod (auto) ----------
+def choose_primary_method(met_df: pd.DataFrame) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    if met_df is None or met_df.empty:
+        return None, None, None, None, None
+    counts = met_df.set_index("Metod")[["Idag","1 år","2 år","3 år"]].notna().sum(axis=1)
+    if counts.empty:
+        return None, None, None, None, None
+    maxc = counts.max()
+    candidates = list(counts[counts == maxc].index)
+    chosen = None
+    for p in PREFER_ORDER:
+        if p in candidates:
+            chosen = p
+            break
+    if chosen is None:
+        chosen = candidates[0]
+    row = met_df[met_df["Metod"] == chosen].iloc[0]
+    return chosen, _f(row["Idag"]), _f(row["1 år"]), _f(row["2 år"]), _f(row["3 år"])
+
 # ============================================================
 #                   SIDA: Editor (Lägg till/Uppdatera)
 # ============================================================
@@ -1176,18 +1297,21 @@ def page_editor():
 
     init = {}
     if not is_new and not df.empty:
-        init = df[df["Ticker"].astype(str) == pick].iloc[0].to_dict()
+        row = df[df["Ticker"].astype(str).str.upper() == str(pick).upper()].head(1)
+        if not row.empty:
+            init = row.iloc[0].to_dict()
 
     with st.form("edit_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
-        tkr   = c1.text_input("Ticker", value="" if is_new else pick).strip().upper()
-        name  = c2.text_input("Bolagsnamn", value=str(_nz(init.get("Bolagsnamn"), "")))
-        sect  = c3.text_input("Sektor", value=str(_nz(init.get("Sektor"), "")))
+        ticker  = c1.text_input("Ticker", value="" if is_new else str(pick)).strip().upper()
+        name    = c2.text_input("Bolagsnamn", value=str(_nz(init.get("Bolagsnamn"), "")))
+        sector  = c3.text_input("Sektor", value=str(_nz(init.get("Sektor"), "")))
 
-        bucket = st.selectbox("Bucket/Kategori", DEFAULT_BUCKETS,
-                              index=DEFAULT_BUCKETS.index(_nz(init.get("Bucket"), DEFAULT_BUCKETS[0])) if init.get("Bucket") in DEFAULT_BUCKETS else 0)
-        valuta = st.selectbox("Valuta", ["USD","EUR","NOK","CAD","SEK"],
-                              index=["USD","EUR","NOK","CAD","SEK"].index(str(_nz(init.get("Valuta"), "USD")).upper()))
+        bucket  = st.selectbox("Bucket/Kategori", DEFAULT_BUCKETS,
+                               index=DEFAULT_BUCKETS.index(_nz(init.get("Bucket"), DEFAULT_BUCKETS[0]))
+                               if init.get("Bucket") in DEFAULT_BUCKETS else 0)
+        valuta  = st.selectbox("Valuta", ["USD","EUR","NOK","CAD","SEK"],
+                               index=["USD","EUR","NOK","CAD","SEK"].index(str(_nz(init.get("Valuta"), "USD")).upper()))
 
         d1, d2, d3, d4 = st.columns(4)
         antal   = d1.number_input("Antal aktier", min_value=0, step=1, value=int(_nz(_f(init.get("Antal aktier")), 0)))
@@ -1217,42 +1341,33 @@ def page_editor():
         revcg   = h1.number_input("Rev CAGR", min_value=0.0, step=0.001, value=float(_nz(_f(init.get("Rev CAGR")), 0.0)))
         dps     = h2.number_input("Årlig utdelning (DPS)", min_value=0.0, step=0.01, value=float(_nz(_f(init.get("Årlig utdelning")), 0.0)))
         dpscg   = h3.number_input("Utdelning CAGR", min_value=0.0, step=0.001, value=float(_nz(_f(init.get("Utdelning CAGR")), 0.0)))
-        prim    = h4.selectbox("Primär metod", PREFER_ORDER,
-                               index=PREFER_ORDER.index(str(_nz(init.get("Primär metod"), "ev_ebitda"))) if _nz(init.get("Primär metod"), "ev_ebitda") in PREFER_ORDER else 0)
+        prim    = h4.selectbox("Primär metod", METHOD_LIST,
+                               index=METHOD_LIST.index(str(_nz(init.get("Primär metod"), "ev_ebitda"))) if str(_nz(init.get("Primär metod"), "ev_ebitda")) in METHOD_LIST else 0)
 
         i1, i2, i3 = st.columns(3)
-        btn_fetch = i1.form_submit_button("🔎 Hämta från Yahoo (visa)")
-        btn_fill  = i2.form_submit_button("↙️ Fyll 'Aktuell kurs' från Yahoo")
-        btn_save  = i3.form_submit_button("💾 Spara till Data")
+        fetch_btn  = i1.form_submit_button("🔎 Hämta från Yahoo")
+        fill_btn   = i2.form_submit_button("↩️ Fyll fält ovan från Yahoo")
+        save_btn   = i3.form_submit_button("💾 Spara till Data")
 
-    if btn_fetch and tkr:
-        snap = fetch_yahoo_snapshot(tkr)
+    if (fetch_btn or fill_btn) and ticker:
+        snap = fetch_yahoo_snapshot(ticker)
         st.info(
-            f"Hämtat ({tkr}): pris={snap.get('price')} {snap.get('currency')}, "
+            f"Hämtat från Yahoo: pris={snap.get('price')} {snap.get('currency')}, "
             f"MCAP={snap.get('market_cap')}, EV/Rev={snap.get('ev_to_sales')}, "
             f"EV/EBITDA={snap.get('ev_to_ebitda')}, P/B={snap.get('p_to_book')}, "
-            f"BVPS={snap.get('bvps')}, EPS TTM={snap.get('eps_ttm')}"
+            f"BVPS={snap.get('bvps')}, EPS_TTM={snap.get('eps_ttm')}"
         )
+        if fill_btn:
+            # Tips: Fyll i manuellt i UI-fälten enligt rutan ovan och klicka Spara.
+            st.warning("Fyll i de fält du vill spara enligt info-rutan ovan och tryck **Spara**.")
 
-    if btn_fill and tkr:
-        snap = fetch_yahoo_snapshot(tkr)
-        if snap.get("price") is not None:
-            st.session_state["Aktuell_kurs_prefill"] = float(snap["price"])
-            st.success("Fyllde 'Aktuell kurs' i sessionen. Ändra vid behov och klicka Spara.")
-        else:
-            st.warning("Hittade inget pris i Yahoo för att fylla i.")
-
-    if btn_save and tkr:
-        # ev. session-fyllning
-        if "Aktuell_kurs_prefill" in st.session_state:
-            kurs = float(st.session_state["Aktuell_kurs_prefill"])
-        df = read_data_df()
-        ts = now_stamp()
+    if save_btn and ticker:
+        # Säkerställ full kolumnuppsättning
         new_row = {
-            "Timestamp": ts,
-            "Ticker": tkr,
+            "Timestamp": now_stamp(),
+            "Ticker": ticker,
             "Bolagsnamn": name,
-            "Sektor": sect,
+            "Sektor": sector,
             "Bucket": bucket,
             "Valuta": valuta,
             "Antal aktier": antal,
@@ -1275,120 +1390,41 @@ def page_editor():
             "Årlig utdelning": dps,
             "Utdelning CAGR": dpscg,
             "Primär metod": prim,
+            "Riktkurs idag": np.nan,
+            "Riktkurs 1 år": np.nan,
+            "Riktkurs 2 år": np.nan,
+            "Riktkurs 3 år": np.nan,
             "Senast auto uppdaterad": "",
             "Auto källa": "Manuell",
         }
         if df.empty:
-            df = pd.DataFrame([new_row], columns=DATA_COLUMNS)
+            df_new = pd.DataFrame([new_row], columns=DATA_COLUMNS)
         else:
-            if (df["Ticker"].astype(str) == tkr).any():
-                mask = df["Ticker"].astype(str) == tkr
+            df_new = df.copy()
+            # lägg ev saknade kolumner
+            for c in DATA_COLUMNS:
+                if c not in df_new.columns:
+                    df_new[c] = np.nan
+            if (df_new["Ticker"].astype(str).str.upper() == ticker.upper()).any():
+                mask = (df_new["Ticker"].astype(str).str.upper() == ticker.upper())
                 for k, v in new_row.items():
-                    if k in df.columns:
-                        df.loc[mask, k] = v
-                    else:
-                        df[k] = np.nan
-                        df.loc[mask, k] = v
+                    df_new.loc[mask, k] = v
             else:
-                for k in new_row.keys():
-                    if k not in df.columns:
-                        df[k] = np.nan
-                df = pd.concat([df, pd.DataFrame([new_row])[df.columns]], ignore_index=True)
-        write_data_df(df)
+                # union av kolumner
+                union_cols = list(dict.fromkeys(list(df_new.columns) + list(new_row.keys())))
+                row_df = pd.DataFrame([new_row])
+                for c in union_cols:
+                    if c not in row_df.columns:
+                        row_df[c] = np.nan
+                df_new = pd.concat([df_new[union_cols], row_df[union_cols]], ignore_index=True)
+        write_data_df(df_new)
         st.success("Sparat till Data.")
-
-# ============================================================
-#                   SIDA: Analys (bläddringsvy)
-# ============================================================
-def _calc_upside_row(r: pd.Series, settings: Dict[str,str], fx_map: Dict[str,float], method_override: Optional[str]) -> Dict[str, Any]:
-    met_df, sanity, meta, _src = compute_methods_for_row(r, settings, fx_map, primary_override=method_override)
-    # välj metod: override > sparad > heuristik
-    saved = str(_nz(r.get("Primär metod"), ""))
-    chosen = (method_override or (saved if saved in met_df["Metod"].tolist() else _pick_primary_from_table(met_df) or "pe_hist_vs_eps"))
-    row = met_df[met_df["Metod"] == chosen].iloc[0]
-    fair_today = _f(row["Idag"])
-    price = meta.get("price")
-    up = None
-    if _pos(price) and _pos(fair_today):
-        up = (fair_today/price - 1.0) * 100.0
-    return {
-        "met_df": met_df, "meta": meta, "sanity": sanity,
-        "chosen": chosen, "fair_today": fair_today, "upside": up
-    }
-
-def page_analysis():
-    st.header("🔬 Analys — bläddra ett bolag i taget")
-
-    settings = get_settings_map()
-    fx_map   = get_fx_map()
-    df       = read_data_df()
-    if df.empty:
-        st.info("Data-bladet är tomt. Gå till Editor och lägg till ett bolag.")
-        return
-
-    # Filter
-    f1, f2, f3 = st.columns(3)
-    buckets = f1.multiselect("Bucket", DEFAULT_BUCKETS, default=DEFAULT_BUCKETS)
-    mode = f2.selectbox("Urval", ["Alla", "Innehav (antal > 0)", "Watchlist (antal = 0)"], index=0)
-    method_pref = f3.selectbox(
-        "Värderingssätt för vy",
-        ["Auto (primär/heuristik)"] + PREFER_ORDER,
-        index=0
-    )
-    method_override = None if method_pref.startswith("Auto") else method_pref
-
-    q = df.copy()
-    if buckets:
-        q = q[q["Bucket"].isin(buckets)]
-    if mode == "Innehav (antal > 0)":
-        q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce") > 0)]
-    elif mode == "Watchlist (antal = 0)":
-        q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce").fillna(0) == 0)]
-
-    if q.empty:
-        st.warning("Inget matchade filtret.")
-        return
-
-    # Beräkna uppsida & sortera
-    rows_with_scores = []
-    prog = st.progress(0.0)
-    for i, (_, r) in enumerate(q.iterrows()):
-        try:
-            res = _calc_upside_row(r, settings, fx_map, method_override)
-            rows_with_scores.append((r, res))
-        except Exception:
-            rows_with_scores.append((r, {"met_df": pd.DataFrame(), "meta": {}, "sanity": "", "chosen":"", "fair_today":None, "upside":None}))
-        prog.progress((i+1)/len(q))
-    prog.empty()
-
-    rows_with_scores.sort(key=lambda x: (x[1].get("upside") is None, -1 if x[1].get("upside") is None else x[1]["upside"]), reverse=False)
-
-    # Bläddringsindex i session
-    key_ns = f"browse_idx_{hash(tuple(q['Ticker'].astype(str)))}_{method_override or 'auto'}"
-    if key_ns not in st.session_state:
-        st.session_state[key_ns] = 0
-
-    # Navigering
-    n = len(rows_with_scores)
-    col_nav1, col_nav2, col_nav3 = st.columns([1,1,6])
-    if col_nav1.button("⬅️ Föregående"):
-        st.session_state[key_ns] = (st.session_state[key_ns] - 1) % n
-    if col_nav2.button("Nästa ➡️"):
-        st.session_state[key_ns] = (st.session_state[key_ns] + 1) % n
-    col_nav3.caption(f"Visar {st.session_state[key_ns]+1} / {n} • Sorterat på störst uppsida")
-
-    # Rendera ett bolag (störst uppsida först)
-    idx = st.session_state[key_ns]
-    row, res = rows_with_scores[idx]
-    # render_company_view använder sitt eget metod-val UI, men vi skickar override om användaren valt något annat än Auto.
-    render_company_view(row, settings, fx_map, method_override=method_override)
 
 # ============================================================
 #                   SIDA: Ranking (tabell)
 # ============================================================
 def page_ranking():
-    st.header("🏁 Ranking – Uppsida mot vald (primär/override) fair value (Idag)")
-
+    st.header("🏁 Ranking – Uppsida mot primär fair value (Idag)")
     settings = get_settings_map()
     fx_map   = get_fx_map()
     df       = read_data_df()
@@ -1398,49 +1434,52 @@ def page_ranking():
 
     b1, b2 = st.columns(2)
     buckets = b1.multiselect("Bucket", DEFAULT_BUCKETS, default=DEFAULT_BUCKETS)
-    view = b2.selectbox("Urval", ["Innehav (antal > 0)","Watchlist (antal = 0)","Alla"], index=0)
-    msel = st.selectbox("Värderingssätt för ranking", ["Auto (primär/heuristik)"] + PREFER_ORDER, index=0)
-    method_override = None if msel.startswith("Auto") else msel
+    owned_tab = b2.selectbox("Urval", ["Innehav (antal > 0)","Watchlist (antal = 0)"], index=0)
 
     q = df.copy()
     if buckets:
         q = q[q["Bucket"].isin(buckets)]
-    if view == "Innehav (antal > 0)":
+    if owned_tab.startswith("Innehav"):
         q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce") > 0)]
-    elif view == "Watchlist (antal = 0)":
+    else:
         q = q[(pd.to_numeric(q["Antal aktier"], errors="coerce").fillna(0) == 0)]
-
-    if q.empty:
-        st.warning("Inget matchade filtret.")
-        return
 
     rows = []
     prog = st.progress(0.0)
     for i, (_, r) in enumerate(q.iterrows()):
         try:
-            res = _calc_upside_row(r, settings, fx_map, method_override)
-            price = res["meta"].get("price")
-            fair_today = res["fair_today"]
-            up = res["upside"]
+            met_df, _, meta = compute_methods_for_row(r, settings, fx_map)
+            saved_primary = str(_nz(r.get("Primär metod"), ""))
+            avail = met_df.loc[met_df[["Idag","1 år","2 år","3 år"]].notna().any(axis=1), "Metod"].tolist()
+            if saved_primary in avail:
+                chosen = saved_primary
+            else:
+                chosen, _, _, _, _ = choose_primary_method(met_df)
+                if chosen not in avail and avail:
+                    chosen = avail[0]
+            prow = met_df[met_df["Metod"] == chosen].iloc[0] if chosen else None
+            fair_today = _f(prow["Idag"]) if prow is not None else None
+            price = meta.get("price")
+            up = (fair_today/price - 1.0) * 100.0 if (_pos(fair_today) and _pos(price)) else None
             rows.append({
                 "Ticker": r.get("Ticker"),
                 "Bolagsnamn": r.get("Bolagsnamn"),
                 "Bucket": r.get("Bucket"),
-                "Valuta": res["meta"].get("currency"),
+                "Valuta": meta.get("currency"),
                 "Pris": price,
-                "Metod": res["chosen"],
+                "Primär metod": chosen,
                 "Fair value (Idag)": fair_today,
                 "Uppsida %": up,
             })
+            time.sleep(0.15)
         except Exception:
             rows.append({
                 "Ticker": r.get("Ticker"),
                 "Bolagsnamn": r.get("Bolagsnamn"),
                 "Bucket": r.get("Bucket"),
                 "Valuta": r.get("Valuta"),
-                "Pris": None, "Metod": None, "Fair value (Idag)": None, "Uppsida %": None
+                "Pris": None, "Primär metod": None, "Fair value (Idag)": None, "Uppsida %": None
             })
-        prog.progress((i+1)/len(q))
     prog.empty()
 
     out = pd.DataFrame(rows)
@@ -1449,58 +1488,56 @@ def page_ranking():
     st.dataframe(out, use_container_width=True)
 
 # ============================================================
-#               SIDA: Inställningar (källskatt, modell, FX)
+#               SIDA: Inställningar (källskatt, parametrar)
 # ============================================================
 def page_settings():
     st.header("⚙️ Inställningar")
-
-    # Källskatt per valuta (dynamisk lista baserat på FX-arket)
-    fx_df = _read_df(FX_TITLE)
-    currencies = ["USD","EUR","NOK","CAD","SEK"]
-    s_map = get_settings_map()
+    settings = get_settings_map()
 
     st.subheader("Källskatt per valuta")
+    currencies = ["USD","EUR","NOK","CAD","SEK"]
     with st.form("wh_form"):
         cols = st.columns(len(currencies))
         vals = {}
         for i, ccy in enumerate(currencies):
-            default = 0.0 if ccy == "SEK" else 0.15
-            cur = float(s_map.get(f"withholding_{ccy}", default))
+            key = f"withholding_{ccy}"
+            cur = float(settings.get(key, "0.15" if ccy!="SEK" else "0.0"))
             vals[ccy] = cols[i].number_input(f"{ccy}", min_value=0.0, max_value=1.0, step=0.01, value=cur, format="%.2f")
-        submit = st.form_submit_button("💾 Spara källskatt")
-    if submit:
+        w_submit = st.form_submit_button("💾 Spara källskatt")
+    if w_submit:
         s = _read_df(SETTINGS_TITLE)
-        if s.empty: s = pd.DataFrame(columns=SETTINGS_COLUMNS)
-        def upsert(k, v):
-            if (s["Key"] == k).any():
-                s.loc[s["Key"] == k, "Value"] = str(v)
+        if s.empty:
+            s = pd.DataFrame(columns=SETTINGS_COLUMNS)
+        def upsert(df_s, k, v):
+            if (df_s["Key"] == k).any():
+                df_s.loc[df_s["Key"] == k, "Value"] = str(v)
             else:
-                s = pd.concat([s, pd.DataFrame([[k, str(v)]], columns=SETTINGS_COLUMNS)], ignore_index=True)
-            return s
+                df_s = pd.concat([df_s, pd.DataFrame([[k, str(v)]], columns=SETTINGS_COLUMNS)], ignore_index=True)
+            return df_s
         for ccy, v in vals.items():
-            s = upsert(f"withholding_{ccy}", v)
+            s = upsert(s, f"withholding_{ccy}", v)
         _write_df(SETTINGS_TITLE, s)
         st.success("Källskatt uppdaterad.")
 
     st.subheader("Modellparametrar")
     p1, p2 = st.columns(2)
-    cur = get_settings_map()
-    pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05, value=float(cur.get("pe_anchor_weight_ttm","0.5")))
-    decay = p2.number_input("Multipel-decay per år (0..1)", min_value=0.0, max_value=1.0, step=0.01, value=float(cur.get("multiple_decay","0.10")))
+    pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05, value=float(settings.get("pe_anchor_weight_ttm","0.5")))
+    decay = p2.number_input("Multipel-decay per år (0..1)",  min_value=0.0, max_value=1.0, step=0.01, value=float(settings.get("multiple_decay","0.10")))
     if st.button("💾 Spara modellparametrar"):
         s = _read_df(SETTINGS_TITLE)
-        if s.empty: s = pd.DataFrame(columns=SETTINGS_COLUMNS)
-        def setv(k, v):
-            if (s["Key"] == k).any():
-                s.loc[s["Key"] == k, "Value"] = str(v)
+        if s.empty:
+            s = pd.DataFrame(columns=SETTINGS_COLUMNS)
+        def setv(df_s, k, v):
+            if (df_s["Key"] == k).any():
+                df_s.loc[df_s["Key"] == k, "Value"] = str(v)
             else:
-                s.loc[len(s)] = [k, str(v)]
-        setv("pe_anchor_weight_ttm", pe_w)
-        setv("multiple_decay", decay)
+                df_s.loc[len(df_s)] = [k, str(v)]
+        setv(s, "pe_anchor_weight_ttm", pe_w)
+        setv(s, "multiple_decay", decay)
         _write_df(SETTINGS_TITLE, s)
         st.success("Parametrar uppdaterade.")
 
-    st.subheader("Valutakurser (SEK per 1)")
+    st.subheader("Valutakurser")
     if st.button("🔄 Hämta & uppdatera FX från Yahoo"):
         mp = _load_fx_and_update_sheet()
         st.success("Valutakurser uppdaterade.")
@@ -1511,13 +1548,10 @@ def page_settings():
 # ============================================================
 def page_batch():
     st.header("🧰 Batch-uppdatering")
-
-    df = read_data_df()
+    df       = read_data_df()
     if df.empty:
         st.info("Inga bolag i Data.")
         return
-    settings = get_settings_map()
-    fx_map   = get_fx_map()
 
     throttle = st.slider("Fördröjning per bolag (sek)", min_value=0.1, max_value=2.0, value=0.6, step=0.1)
 
@@ -1525,27 +1559,21 @@ def page_batch():
         prog = st.progress(0.0)
         df2 = df.copy()
         for i, (idx, r) in enumerate(df2.iterrows()):
-            t = str(r["Ticker"]).strip().upper()
-            snap = fetch_yahoo_snapshot(t)
+            tkr = str(r["Ticker"]).strip().upper()
+            snap = fetch_yahoo_snapshot(tkr)
             # skriv över fält vi kan
-            mapping = {
-                "Aktuell kurs": "price",
-                "Valuta": "currency",
-                "Rev TTM": "revenue_ttm",
-                "EBITDA TTM": "ebitda_ttm",
-                "EPS TTM": "eps_ttm",
-                "PE TTM": "pe_ttm",
-                "PE FWD": "pe_fwd",
-                "EV/Revenue": "ev_to_sales",
-                "EV/EBITDA": "ev_to_ebitda",
-                "P/B": "p_to_book",
-                "BVPS": "bvps",
-                "Net debt": "net_debt",
-            }
-            for col, key in mapping.items():
-                val = snap.get(key)
-                if val is not None:
-                    df2.at[idx, col] = val
+            if snap.get("price") is not None:       df2.at[idx, "Aktuell kurs"] = snap["price"]
+            if snap.get("currency"):                df2.at[idx, "Valuta"] = snap["currency"]
+            if snap.get("revenue_ttm") is not None: df2.at[idx, "Rev TTM"] = snap["revenue_ttm"]
+            if snap.get("ebitda_ttm") is not None:  df2.at[idx, "EBITDA TTM"] = snap["ebitda_ttm"]
+            if snap.get("eps_ttm") is not None:     df2.at[idx, "EPS TTM"] = snap["eps_ttm"]
+            if snap.get("pe_ttm") is not None:      df2.at[idx, "PE TTM"] = snap["pe_ttm"]
+            if snap.get("pe_fwd") is not None:      df2.at[idx, "PE FWD"] = snap["pe_fwd"]
+            if snap.get("ev_to_sales") is not None: df2.at[idx, "EV/Revenue"] = snap["ev_to_sales"]
+            if snap.get("ev_to_ebitda") is not None:df2.at[idx, "EV/EBITDA"] = snap["ev_to_ebitda"]
+            if snap.get("p_to_book") is not None:   df2.at[idx, "P/B"] = snap["p_to_book"]
+            if snap.get("bvps") is not None:        df2.at[idx, "BVPS"] = snap["bvps"]
+            if snap.get("net_debt") is not None:    df2.at[idx, "Net debt"] = snap["net_debt"]
             df2.at[idx, "Senast auto uppdaterad"] = now_stamp()
             df2.at[idx, "Auto källa"] = "Yahoo"
             time.sleep(throttle)
@@ -1556,13 +1584,17 @@ def page_batch():
 
     if st.button("📷 Spara snapshots (alla)"):
         prog = st.progress(0.0)
+        count = 0
+        settings = get_settings_map()
+        fx_map = get_fx_map()
         for i, (_, r) in enumerate(df.iterrows()):
-            met_df, _, meta, _ = compute_methods_for_row(r, settings, fx_map, primary_override=None)
+            met_df, _, meta = compute_methods_for_row(r, settings, fx_map)
             save_quarter_snapshot(str(r["Ticker"]).strip().upper(), met_df, meta)
+            count += 1
             time.sleep(throttle)
             prog.progress((i+1)/len(df))
         prog.empty()
-        st.success("Snapshot sparade.")
+        st.success(f"Snapshot sparade för {count} bolag.")
 
 # ============================================================
 #                           MAIN
@@ -1571,7 +1603,7 @@ def run_main_ui():
     st.title(APP_TITLE)
 
     with st.expander("📊 Status (FX & inställningar)", expanded=False):
-        st.write("FX:", get_fx_map())
+        st.write("FX (SEK per 1):", get_fx_map())
         st.write("Settings:", get_settings_map())
 
     page = st.sidebar.radio("Sidor", ["Editor", "Analys", "Ranking", "Inställningar", "Batch"], index=1)
@@ -1579,7 +1611,7 @@ def run_main_ui():
     if page == "Editor":
         page_editor()
     elif page == "Analys":
-        page_analysis()
+        page_analysis()   # från Del 3/4
     elif page == "Ranking":
         page_ranking()
     elif page == "Inställningar":
