@@ -2,7 +2,7 @@
 # ============================================================
 # Bas: Streamlit-app för fair value / riktkurser / portfölj
 # Lagring: Google Sheets (Data, Resultat, Valutakurser, Settings, Snapshot)
-# Hämtning: Yahoo (yfinance) + (Del 2) Finnhub/deriveringar
+# Hämtning: Yahoo (yfinance) + (valfritt) Finnhub
 # ============================================================
 
 from __future__ import annotations
@@ -52,7 +52,8 @@ def now_stamp() -> str:
 
 def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
-    if v: return v
+    if v: 
+        return v
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -85,16 +86,19 @@ def _with_backoff(callable_fn, *args, **kwargs):
                 continue
             raise
         except Exception:
-            if i == 5: raise
+            if i == 5:
+                raise
             time.sleep(delay)
             delay *= 1.6
 
 def _f(x) -> Optional[float]:
     try:
-        if x is None: return None
+        if x is None: 
+            return None
         if isinstance(x, str):
             s = x.strip().replace(" ", "").replace(",", ".")
-            if s == "": return None
+            if s == "": 
+                return None
             v = float(s)
         else:
             v = float(x)
@@ -289,7 +293,8 @@ FX_PAIRS = {"USD":"USDSEK=X","EUR":"EURSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X",
 def _fetch_fx_from_yahoo() -> Dict[str, float]:
     out = {"SEK":1.0}
     for code, pair in FX_PAIRS.items():
-        if pair is None: continue
+        if pair is None: 
+            continue
         try:
             t = yf.Ticker(pair)
             px = None
@@ -391,8 +396,7 @@ def append_result_row(row: Dict[str, Any]):
         res = pd.concat([res, pd.DataFrame([row])[cols]], ignore_index=True)
         _write_df(RESULT_TITLE, res[cols])
 
-# ===== Hotfix-guard: säkerställ kritiska symboler finns =====
-# Primära metodlistor (om något klistrats in i fel ordning senare)
+# ===== Hotfix-guard: säkerställ listor finns om filen klistras i annan ordning =====
 if 'METHOD_LIST' not in globals():
     METHOD_LIST = [
         "ev_ebitda","ev_sales","pe_hist_vs_eps","p_b",
@@ -515,93 +519,6 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     return out
 
 # -------------------------
-# Yahoo – EPS-forecast 1–2 år (earnings trend när den finns)
-# -------------------------
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_yahoo_eps_forecast(ticker: str) -> Dict[str, Optional[float]]:
-    """
-    Försöker läsa EPS-prognoser från yfinance 'earnings trend'.
-    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "yahoo_trend"|"none"}.
-    Robust mot olika yfinance-versioner (DataFrame/dict/None).
-    """
-    try:
-        tk = yf.Ticker(ticker)
-        # För nya yfinance: egenskapen kan vara en DataFrame
-        try:
-            trend_df = tk.earnings_trend
-        except Exception:
-            trend_df = None
-        # Vissa versioner har en metod:
-        if trend_df is None:
-            try:
-                trend_df = tk.get_earnings_trend()
-            except Exception:
-                trend_df = None
-
-        eps_1y, eps_2y = None, None
-
-        # Tolka DataFrame (index typ: '0y', '+1y', '+2y' eller 'current', 'nextYear', 'yearAfter')
-        def _take(df, label_list):
-            for lbl in label_list:
-                try:
-                    row = df.loc[df.index.astype(str).str.lower() == str(lbl).lower()]
-                    if not row.empty:
-                        # kolumnnamn kan vara 'epsTrend'/'earningsEstimate' med 'avg'
-                        for col in ("epsTrend", "earningsEstimate", "epsEstimate"):
-                            if col in row.columns:
-                                cell = row.iloc[0][col]
-                                if isinstance(cell, (dict, Mapping)):
-                                    v = _safe_float(cell.get("avg"))
-                                    if v is not None:
-                                        return v
-                                else:
-                                    v = _safe_float(cell)
-                                    if v is not None:
-                                        return v
-                        # ibland separata kolumner 'epsHigh/Low/Avg'
-                        for col in ("epsAvg", "epsAverage", "eps_mean", "avg"):
-                            if col in row.columns:
-                                v = _safe_float(row.iloc[0][col])
-                                if v is not None:
-                                    return v
-                except Exception:
-                    pass
-            return None
-
-        if trend_df is not None and hasattr(trend_df, "empty") and not trend_df.empty:
-            # Normalisera index till str
-            trend_df = trend_df.copy()
-            try:
-                trend_df.index = trend_df.index.astype(str)
-            except Exception:
-                pass
-            eps_1y = _take(trend_df, ["+1y", "nextyear", "next year", "1y"])
-            eps_2y = _take(trend_df, ["+2y", "yearafter", "year after", "2y"])
-
-        # Vissa versioner returnerar dict-liknande 'earnings_trend'
-        if (eps_1y is None or eps_2y is None) and trend_df is None:
-            try:
-                d = tk.get_earnings_trend(as_dict=True)  # om det finns
-            except Exception:
-                d = None
-            if isinstance(d, Mapping):
-                def pick(m, keys):
-                    for k in keys:
-                        v = m.get(k)
-                        v = _safe_float(v)
-                        if v is not None:
-                            return v
-                    return None
-                eps_1y = eps_1y or pick(d, ["eps_next_year_avg", "eps_1y"])
-                eps_2y = eps_2y or pick(d, ["eps_year_after_avg", "eps_2y"])
-
-        if eps_1y is None and eps_2y is None:
-            return {"eps_1y": None, "eps_2y": None, "source": "none"}
-        return {"eps_1y": eps_1y, "eps_2y": eps_2y, "source": "yahoo_trend"}
-    except Exception:
-        return {"eps_1y": None, "eps_2y": None, "source": "none"}
-
-# -------------------------
 # Finnhub (valfritt) – EPS-estimat 1–2 år
 # -------------------------
 def _get_finnhub_key() -> Optional[str]:
@@ -613,8 +530,8 @@ def _get_finnhub_key() -> Optional[str]:
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
     """
-    EPS-estimat 1–2 år framåt från Finnhub (om nyckel finns).
-    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "finnhub"|"none"}.
+    Försöker hämta EPS-estimat 1–2 år framåt från Finnhub (om nyckel finns).
+    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "finnhub"|"none"}
     """
     key = _get_finnhub_key()
     if not key:
@@ -627,6 +544,7 @@ def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
         if r.ok:
             js = r.json()
             rows = js if isinstance(js, list) else js.get("data", [])
+            # sortera på period
             try:
                 rows = sorted(rows or [], key=lambda x: str(x.get("period", "")))
             except Exception:
@@ -727,7 +645,8 @@ def _derive_eps_from_pe_if_missing(price: Optional[float], pe_ttm: Optional[floa
 def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optional[float], eps_cagr: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Returnerar (eps_0, eps_1, eps_2, eps_3).
-    • Om eps_1y saknas men eps_cagr finns: extrapolera från ttm.
+    • EPS 2Y hämtas automatiskt från Finnhub om möjligt.
+    • Om eps_1y saknas men eps_cagr finns: extrapolera från TTM.
     • Om eps_2y saknas men eps_1y+eps_cagr finns: extrapolera ett år till.
     • eps_3y extrapoleras vidare om eps_cagr finns.
     """
@@ -800,14 +719,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     # 1) Live-data
     snap = fetch_yahoo_snapshot(ticker)
     time.sleep(0.35)  # mild throttling för att undvika 429
-
-    # 1b) EPS-forecast från Yahoo (earnings trend) – bäst först
-    yf_eps = fetch_yahoo_eps_forecast(ticker)
-
-    # 1c) Finnhub fallback om något saknas
-    fin_eps = {"eps_1y": None, "eps_2y": None, "source": "none"}
-    if yf_eps.get("eps_1y") is None or yf_eps.get("eps_2y") is None:
-        fin_eps = fetch_finnhub_estimates(ticker)
+    est  = fetch_finnhub_estimates(ticker)
 
     # 2) Inputs (med fallback från Data-bladet)
     price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
@@ -825,9 +737,9 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     p_b        = _pos(_nz(snap.get("p_to_book"), row.get("P/B")))
     bvps       = _pos(_nz(snap.get("bvps"), row.get("BVPS")))
 
-    # Estimat / tillväxt (ordning: Yahoo-trend → Finnhub → Sheet)
-    eps_1y_est = _pos(_nz(yf_eps.get("eps_1y"), _nz(fin_eps.get("eps_1y"), row.get("EPS 1Y"))))
-    eps_2y_est = _pos(_nz(yf_eps.get("eps_2y"), _nz(fin_eps.get("eps_2y"), row.get("EPS 2Y"))))
+    # Estimat / tillväxt
+    eps_1y_est = _pos(_nz(est.get("eps_1y"), row.get("EPS 1Y")))
+    eps_2y_est = _pos(_nz(est.get("eps_2y"), row.get("EPS 2Y")))
     eps_cagr   = _f(row.get("EPS CAGR"))
     rev_cagr   = _f(row.get("Rev CAGR"))
 
@@ -843,18 +755,20 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
         price, pe_ttm, pe_fwd, eps_ttm, eps_1y_est
     )
 
-    # 4) Anchors & decay
+    # 4) Paths (EPS 2Y fylls automatiskt om möjligt via Finnhub eller CAGR)
+    e0, e1, e2, e3 = _eps_path(eps_ttm, eps_1y_est, eps_2y_est, eps_cagr)
+    r0, r1, r2, r3 = _rev_path(rev_ttm, rev_cagr)
+
+    # EBITDA följer omsättningsbanan som proxy om vi saknar specifika estimat
+    b0, b1, b2, b3 = _ebitda_path(ebitda_ttm, r0, r1, r2, r3)
+
+    # 5) Anchors & decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
     decay = _f(settings.get("multiple_decay", 0.10)) or 0.10
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
-    # 5) Paths
-    e0, e1, e2, e3 = _eps_path(eps_ttm, eps_1y_est, eps_2y_est, eps_cagr)
-    r0, r1, r2, r3 = _rev_path(rev_ttm, rev_cagr)
-    b0, b1, b2, b3 = _ebitda_path(ebitda_ttm, r0, r1, r2, r3)
-
     # Multiplar med decay
-    pe0 = pe_anchor
+    pe0  = pe_anchor
     pe1m = _decay_multiple(pe_anchor, 1, decay)
     pe2m = _decay_multiple(pe_anchor, 2, decay)
     pe3m = _decay_multiple(pe_anchor, 3, decay)
@@ -903,7 +817,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
         "3 år": _equity_price_from_ev(_ev_from_ebitda(b3, eve3), net_debt, shares),
     })
 
-    # P/B (kräver BVPS – annars None)
+    # P/B (kräver BVPS)
     methods.append({
         "Metod": "p_b",
         "Idag": _price_from_pb(pb0, bvps),
@@ -920,15 +834,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
 
     # 7) Sanity + META
     src = snap.get("sources", {})
-    # välj vilket källnamn som faktiskt gav 1y/2y
-    eps1_src = "yahoo_trend" if _pos(yf_eps.get("eps_1y")) else ("finnhub" if _pos(fin_eps.get("eps_1y")) else (src_eps_1y or "sheet/derived"))
-    eps2_src = "yahoo_trend" if _pos(yf_eps.get("eps_2y")) else ("finnhub" if _pos(fin_eps.get("eps_2y")) else "sheet/derived")
-
     sanity = (
         f"price={'ok' if price else '—'}({src.get('price','?')}), "
         f"eps_ttm={'ok' if e0 else '—'}({src.get('eps_ttm','?') or 'derived'}), "
-        f"eps_1y={'ok' if e1 else '—'}({eps1_src}), "
-        f"eps_2y={'ok' if e2 else '—'}({eps2_src}), "
+        f"eps_1y={'ok' if e1 else '—'}, eps_2y={'ok' if e2 else '—'}, "
         f"rev_ttm={'ok' if r0 else '—'}({src.get('revenue_ttm','?')}), "
         f"ebitda_ttm={'ok' if b0 else '—'}({src.get('ebitda_ttm','?')}), "
         f"shares={'ok' if shares else '—'}({src.get('shares','?')}), "
@@ -944,8 +853,8 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
         "decay": decay,
         "sources": {
             **src,
-            "eps_1y_source": eps1_src,
-            "eps_2y_source": eps2_src,
+            "eps_1y_source": "finnhub" if est.get("source") == "finnhub" and _pos(est.get("eps_1y")) else "sheet/derived",
+            "eps_2y_source": "finnhub" if est.get("source") == "finnhub" and _pos(est.get("eps_2y")) else "sheet/derived",
         },
         "eps_path": {"ttm": e0, "y1": e1, "y2": e2, "y3": e3},
         "rev_path": {"ttm": r0, "y1": r1, "y2": r2, "y3": r3},
@@ -993,10 +902,7 @@ def _fmt_sek(v: Optional[float]) -> str:
         return f"{v} SEK"
 
 # ---------- Heuristik: välj primär metod ----------
-_PREFER_ORDER = [
-    "ev_ebitda","ev_sales","pe_hist_vs_eps","p_b",
-    "ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"
-]
+_PREFER_ORDER = ["ev_ebitda","ev_sales","pe_hist_vs_eps","p_b","ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"]
 
 def _pick_primary_from_table(met_df: pd.DataFrame, preset: Optional[str] = None) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float], Optional[float]]:
     if met_df is None or met_df.empty:
@@ -1162,7 +1068,7 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
         st.success("Riktkurser sparade till fliken Resultat.")
 
     if b3.button("♻️ Uppdatera estimat/CAGR i Data", key=f"upd_est_{tkr}"):
-        # Enkel uppdatering: räkna om EPS CAGR om ttm + 1y finns
+        # Enkel uppdatering: räkna om EPS CAGR om TTM + 1Y finns
         df = read_data_df()
         mask = df["Ticker"].astype(str).str.upper() == tkr
         if mask.any():
@@ -1175,8 +1081,11 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
                 except Exception:
                     new_cagr = None
             if "EPS 1Y" not in df.columns: df["EPS 1Y"] = np.nan
+            if "EPS 2Y" not in df.columns: df["EPS 2Y"] = np.nan
             if "EPS CAGR" not in df.columns: df["EPS CAGR"] = np.nan
             if _pos(e1): df.loc[mask, "EPS 1Y"] = float(e1)
+            if _pos(meta.get("eps_path", {}).get("y2")):
+                df.loc[mask, "EPS 2Y"] = float(meta["eps_path"]["y2"])
             if new_cagr is not None: df.loc[mask, "EPS CAGR"] = float(new_cagr)
             write_data_df(df)
             st.success("Estimat/CAGR uppdaterade i Data.")
@@ -1269,7 +1178,7 @@ def page_analysis():
 
 # app.py — Del 4/4
 # ============================================================
-# Sidor: Editor / Ranking / Settings / Batch
+# Sidor: Editor / Ranking / Inställningar / Batch
 # Snapshot-funktion och main()
 # ============================================================
 
@@ -1318,7 +1227,7 @@ def page_editor():
     tkr_sel = st.selectbox("Välj ticker", tickers, index=0, key="editor_tkr_sel")
     is_new  = (tkr_sel == "— nytt —")
 
-    # Session-state för prefill (påverkas av "Hämta & fyll från Yahoo")
+    # Session-state för prefill (påverkas av "Hämta & fyll")
     if "editor_prefill" not in st.session_state:
         st.session_state["editor_prefill"] = {}
 
@@ -1333,7 +1242,7 @@ def page_editor():
     merged = dict(init)
     merged.update({k: v for k, v in st.session_state["editor_prefill"].items() if v is not None})
 
-    st.caption("Tips: Använd **Hämta & fyll från Yahoo/Finnhub** för att auto-populera formuläret. Spara sedan.")
+    st.caption("Tips: Använd **Hämta & fyll från Yahoo** för att auto-populera formuläret. Spara sedan.")
 
     with st.form("edit_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
@@ -1380,7 +1289,7 @@ def page_editor():
         prim    = h4.selectbox("Primär metod", prim_choices, index=prim_idx)
 
         c_left, c_right = st.columns(2)
-        fetch_btn = c_left.form_submit_button("🔎 Hämta & fyll från Yahoo/Finnhub")
+        fetch_btn = c_left.form_submit_button("🔎 Hämta & fyll från Yahoo")
         save_btn  = c_right.form_submit_button("💾 Spara till Data")
 
     # Hantera "Hämta & fyll"
@@ -1389,11 +1298,13 @@ def page_editor():
             st.warning("Ange en ticker först.")
             st.stop()
         snap = fetch_yahoo_snapshot(ticker)
-        est  = fetch_finnhub_estimates(ticker)  # EPS 1Y & 2Y om möjligt
-
-        # lägg in vettiga fält i prefill och kör om
+        # Försök även hämta EPS-estimat (1–2 år) via Finnhub (om nyckel finns)
+        est = fetch_finnhub_estimates(ticker)
         st.session_state["editor_prefill"] = {
             "Ticker": ticker,
+            "Bolagsnamn": _nz(name, None),
+            "Sektor": _nz(sector, None),
+            "Bucket": _nz(bucket, None),
             "Valuta": snap.get("currency"),
             "Aktuell kurs": snap.get("price"),
             "Rev TTM": snap.get("revenue_ttm"),
@@ -1407,11 +1318,10 @@ def page_editor():
             "BVPS": snap.get("bvps"),
             "Net debt": snap.get("net_debt"),
             "Utestående aktier": snap.get("shares"),
-            # Estimat
             "EPS 1Y": est.get("eps_1y"),
             "EPS 2Y": est.get("eps_2y"),
         }
-        st.success("Fält förifyllda — granska och klicka **Spara**.")
+        st.success("Fält förifyllda – granska och klicka **Spara**.")
         st.experimental_rerun()
 
     # Hantera "Spara"
@@ -1443,7 +1353,7 @@ def page_editor():
             "EPS 1Y": eps1y,
             "EPS 2Y": eps2y,
             "Rev CAGR": revcg,
-            "EPS CAGR": np.nan,  # räknas i analys vid behov
+            "EPS CAGR": _f(merged.get("EPS CAGR")),  # kan räknas om i Analys
             "Årlig utdelning": dps,
             "Utdelning CAGR": dpscg,
             "Primär metod": prim,
@@ -1517,7 +1427,7 @@ def page_ranking():
                 "Fair value (Idag)": fair_today,
                 "Uppsida %": upside,
             })
-            time.sleep(0.15)
+            time.sleep(0.12)
         except Exception:
             rows.append({
                 "Ticker": r.get("Ticker"),
@@ -1535,7 +1445,7 @@ def page_ranking():
     st.dataframe(out, use_container_width=True)
 
 # ============================================================
-#                     SIDA: Settings
+#                     SIDA: Inställningar
 # ============================================================
 def page_settings():
     st.header("⚙️ Inställningar")
