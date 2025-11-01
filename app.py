@@ -1,10 +1,11 @@
-# app.py — Riktkurser + Google Sheets (v5.0, split 1/4)
-# Nytt i v5.0:
-# - Auto-läge för tillväxt: Analytiker (Finnhub) → CAGR⊕Manuell → Manuell
-# - Fixad autoskalning med slutlig clamp + sanity-flaggor
-# - Portföljvärde i SEK, pris visas i bolagets valuta
-# - Kvartalssnapshots + PE-band från Finnhub
-# - Writeback av autoskalade per-aktie-värden till fliken Data
+# app.py — Riktkurser + Google Sheets (v5.1, patchad)
+# Nytt/patchat:
+# • Rate-limit-pauser mellan alla nätanrop/Sheets-skrivningar (konfigurerbart i sidopanel)
+# • Re-ankring av EPS & BV mot Finnhub P/E TTM och P/B TTM innan autoskalning
+# • Auto-tillväxt: Analytiker → (CAGR ⊕ Manuell) → Manuell
+# • Pris i bolagets valuta; portfölj summeras i SEK
+# • Kvartalssnapshots & PE-band (p25/p50/p75)
+# • Writeback av autoskalade per-aktie-värden till fliken Data/Resultat
 
 from __future__ import annotations
 import math, json, re, time
@@ -28,6 +29,9 @@ try:
     st.sidebar.caption("Service-konto: " + st.secrets["GOOGLE_CREDENTIALS"].get("client_email", "<saknas>"))
 except Exception:
     pass
+
+# ============== Rate-limit (kan justeras i sidopanelen) ==============
+RATE_LIMIT_SLEEP = float(st.secrets.get("RATE_LIMIT_SLEEP", 1.2))  # sek
 
 # ============== Hjälpfunktioner ==============
 def now_ts() -> str:
@@ -412,7 +416,7 @@ def persist_fx(ws_fx: gspread.Worksheet, rates: Dict[str, float]):
     if rows:
         ws_fx.append_rows(rows, value_input_option="USER_ENTERED")
 
-# ---------- Finnhub (EPS/BV & P/E-band) ----------
+# ---------- Finnhub (EPS/BV & P/E-band + P/E TTM & P/B TTM) ----------
 @st.cache_data(show_spinner=False, ttl=1800)
 def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
     api = st.secrets.get("FINNHUB_API_KEY", "")
@@ -428,8 +432,13 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
         return {}
     metric = data.get("metric", {}) or {}
     series = data.get("series", {}) or {}
+
     eps_ttm = metric.get("epsBasicExclExtraTTM") or metric.get("epsInclExtraTTM") or metric.get("epsTTM")
     book_ps = metric.get("bookValuePerShareAnnual") or metric.get("bookValuePerShareTTM")
+
+    # Nya: P/E TTM & P/B TTM
+    pe_ttm = metric.get("peExclExtraTTM") or metric.get("peTTM")
+    pb_ttm = metric.get("pbAnnual") or metric.get("pbTTM") or metric.get("priceToBookAnnual") or metric.get("priceToBookTTM")
 
     vals: List[float] = []
     def _collect(arr):
@@ -454,9 +463,13 @@ def fetch_finnhub_metrics(symbol: str) -> Dict[str, Any]:
     pe_p50 = np.percentile(vals, 50) if vals else None
     pe_p75 = np.percentile(vals, 75) if vals else None
     if pe_p50 is None:
-        pe_p50 = metric.get("peExclExtraTTM") or metric.get("peTTM")
+        pe_p50 = pe_ttm
 
-    return {"eps_ttm": eps_ttm, "book_ps": book_ps, "pe_band": (pe_p25, pe_p50, pe_p75)}
+    return {
+        "eps_ttm": eps_ttm, "book_ps": book_ps,
+        "pe_ttm": pe_ttm, "pb_ttm": pb_ttm,
+        "pe_band": (pe_p25, pe_p50, pe_p75)
+    }
 
 # ---------- Analytikerestimat (Finnhub) & CAGR (Yahoo) för Auto-läge ----------
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -718,24 +731,30 @@ def choose_primary_method(bucket: str, sector: str, industry: str, ticker: str,
             return "p_fcf"
         return "p_b"
 
-# ========== Del 3/4 — UI, Sheets-öppning, snapshots & spara/uppdatera en ticker ==========
+# ========== Del 3/4 — UI, öppna Sheets, snapshots, autofyll & spara/uppdatera en ticker ==========
 
-# ---------- Sidopanel: datakällor, tillväxtkälla, filter, export & massuppdatering ----------
+# ---------- Sidopanel ----------
 with st.sidebar:
     st.header("Inställningar & datakällor")
+
+    # Datakällor
     use_finnhub   = st.checkbox("Använd Finnhub (EPS/BV/P-E-band)", value=True)
-    try_sec       = st.checkbox("Försök SEC beta (NII/AFFO per aktie)", value=False)
+    try_sec       = st.checkbox("Försök hämta NII/AFFO via SEC (beta)", value=False)
     autosave_hist = st.checkbox("Autospara kvartalssnapshots vid massuppdatering", value=True)
 
     st.markdown("---")
-    st.subheader("Bull/Bear")
-    bull_mult = st.number_input("Bull × (på 1-års riktkurs)", value=1.15, step=0.05, format="%.2f")
-    bear_mult = st.number_input("Bear × (på 1-års riktkurs)", value=0.85, step=0.05, format="%.2f")
+    # Rate-limit (sekunder mellan nätanrop/Sheets-skriv)
+    RATE_LIMIT_SLEEP = st.number_input("Paus mellan hämtningar (sek)", min_value=0.2, value=float(RATE_LIMIT_SLEEP), step=0.1, format="%.1f")
+
+    st.markdown("---")
+    st.subheader("Bull/Bear på 1 år")
+    bull_mult = st.number_input("Bull ×", value=1.15, step=0.05, format="%.2f")
+    bear_mult = st.number_input("Bear ×", value=0.85, step=0.05, format="%.2f")
 
     st.markdown("---")
     st.subheader("Tillväxtkälla (G1–G3)")
     growth_source = st.selectbox(
-        "Välj källa för framtida tillväxt",
+        "Auto-tillväxt",
         ["Auto (Analytiker → CAGR⊕Manuell)", "Analytiker (Finnhub)", "Historik (CAGR 3–5 år)", "Manuell"],
         index=0
     )
@@ -745,9 +764,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Skriv tillbaka")
-    writeback_autoscaled = st.checkbox("Skriv tillbaka autoskalade per-aktie-värden när jag sparar 'Resultat'", value=True)
-    writeback_in_mass    = st.checkbox("Skriv tillbaka autoskalade vid massuppdatering", value=True)
-    st.caption("Visning sker i bolagets valuta; portföljvärde summeras i SEK.")
+    writeback_autoscaled = st.checkbox("Skriv tillbaka autoskalade per-aktie-värden vid 'Spara Resultat'", value=True)
+    writeback_in_mass    = st.checkbox("Skriv tillbaka autoskalade i massuppdatering", value=True)
+    st.caption("Pris & riktkurser visas i bolagets valuta; portfölj summeras i SEK.")
 
     st.markdown("---")
     st.subheader("Filter")
@@ -755,12 +774,11 @@ with st.sidebar:
         "Bucket A tillväxt","Bucket B tillväxt","Bucket C tillväxt",
         "Bucket A utdelning","Bucket B utdelning","Bucket C utdelning",
     ]
-    pick_buckets = st.multiselect("Välj buckets att visa", bucket_opts, default=bucket_opts)
-    only_owned = st.checkbox("Visa endast innehav (>0 aktier)", value=False)
-    only_watch = st.checkbox("Visa endast bevakning (0 aktier)", value=False)
+    pick_buckets = st.multiselect("Välj buckets", bucket_opts, default=bucket_opts)
+    only_owned   = st.checkbox("Visa endast innehav (>0 aktier)", value=False)
+    only_watch   = st.checkbox("Visa endast bevakning (0 aktier)", value=False)
 
     st.markdown("---")
-    st.subheader("Uppdatering")
     do_mass_refresh = st.button("🔄 Uppdatera alla (Yahoo + Finnhub + SEC + FX)")
 
     st.markdown("---")
@@ -778,19 +796,20 @@ with st.sidebar:
     except Exception:
         st.write("—")
 
-# ---------- Lägg till / uppdatera bolag ----------
-st.markdown("## ➕ Lägg till/uppdatera bolag")
-cols_top = st.columns(5)
-ticker_in = cols_top[0].text_input("Ticker (t.ex. NVDA)", "")
-bucket_in = cols_top[1].selectbox("Bucket", bucket_opts, index=0)
-antal_in  = cols_top[2].number_input("Antal aktier", min_value=0, value=0, step=1)
-pref_method_in = cols_top[3].selectbox(
+# ---------- Form: Lägg till / uppdatera bolag ----------
+st.markdown("## ➕ Lägg till / uppdatera bolag")
+
+c_top = st.columns(5)
+ticker_in = c_top[0].text_input("Ticker (t.ex. NVDA)", "")
+bucket_in = c_top[1].selectbox("Bucket", bucket_opts, index=0)
+antal_in  = c_top[2].number_input("Antal aktier", min_value=0, value=0, step=1)
+pref_method_in = c_top[3].selectbox(
     "Preferred metod (valfritt – annars AUTO)",
     ["AUTO","pe_hist_vs_eps","ev_fcf","p_fcf","ev_sales","ev_ebitda",
      "p_nav","ev_dacf","p_affo","p_b","p_tbv","p_nii"],
     index=0
 )
-g1_in = cols_top[4].number_input("G1 (år 1, t.ex. 0.15 = 15%)", value=0.15, step=0.01, format="%.2f")
+g1_in = c_top[4].number_input("G1 (år 1, 0.15=15%)", value=0.15, step=0.01, format="%.2f")
 g2_in = st.number_input("G2 (år 2)", value=0.12, step=0.01, format="%.2f")
 g3_in = st.number_input("G3 (år 3)", value=0.10, step=0.01, format="%.2f")
 
@@ -814,7 +833,7 @@ with st.expander("Avancerat (frivilligt) – multiplar & per-aktie-inputs"):
     tbv_ps0    = c12.number_input("TBV/aktie (idag)", value=0.00, step=0.01, format="%.2f")
 
     c13,c14,c15,c16 = st.columns(4)
-    rotce   = c13.number_input("ROTCE (t.ex. 0.12 = 12%)", value=0.12, step=0.01, format="%.2f")
+    rotce   = c13.number_input("ROTCE (0.12 = 12%)", value=0.12, step=0.01, format="%.2f")
     payout  = c14.number_input("Payout-ratio", value=0.30, step=0.05, format="%.2f")
     affo_ps0 = c15.number_input("AFFO/aktie (idag)", value=0.00, step=0.01, format="%.2f")
     nav_ps0  = c16.number_input("NAV/aktie (idag)", value=0.00, step=0.01, format="%.2f")
@@ -826,20 +845,20 @@ with st.expander("Avancerat (frivilligt) – multiplar & per-aktie-inputs"):
 
 save_clicked = st.button("💾 Spara till Google Sheets (hämtar Yahoo + Finnhub + SEC + FX)")
 
-# ---------- Öppna Sheets ----------
+# ---------- Öppna Google Sheet ----------
 try:
     sh, ws_data, ws_fx, ws_res, ws_hist = open_sheets()
 except Exception:
     st.error("Kunde inte öppna Google Sheet. Kontrollera SHEET_ID/SHEET_URL och delning med service-kontot.")
     st.stop()
 
-# ---------- Snapshot-funktion (för fliken Historik) ----------
+# ---------- Snapshot till fliken Historik ----------
 def save_quarter_snapshot(row: Dict[str,Any],
                           pe_band: Tuple[Optional[float],Optional[float],Optional[float]],
                           primary: str,
                           fair_tuple: Tuple[float,float,float,float],
                           b1: float, br1: float, upside_pct: float):
-    """Sparar en rad till fliken Historik med nyckel Ticker|YYYY-QX."""
+    """Spara rad till fliken Historik med nyckel Ticker|YYYY-QX."""
     _,_, yq = yq_of()
     key = f"{row.get('Ticker','')}|{yq}"
     p25,p50,p75 = (pe_band or (None,None,None))
@@ -866,9 +885,10 @@ def save_quarter_snapshot(row: Dict[str,Any],
 
 # ---------- Autofyll från källor (Finnhub/SEC) ----------
 def auto_fill_from_sources(tk: str, row: Dict[str,Any], use_finn: bool, use_sec_beta: bool) -> Dict[str,Any]:
-    # Finnhub: EPS TTM / Book value per share + P/E-band
+    # Finnhub: EPS TTM / BV per aktie + P/E-band
     if use_finn:
         fm = fetch_finnhub_metrics(tk) or {}
+        time.sleep(RATE_LIMIT_SLEEP)
         if fm.get("eps_ttm") and not row.get("EPS0"):    row["EPS0"]   = fm["eps_ttm"]
         if fm.get("book_ps") and not row.get("BV_ps0"):  row["BV_ps0"] = fm["book_ps"]
         row["_pe_band"] = fm.get("pe_band")
@@ -886,10 +906,11 @@ def auto_fill_from_sources(tk: str, row: Dict[str,Any], use_finn: bool, use_sec_
         if row.get("BV_ps0"):
             row["NAV_ps0"] = row["BV_ps0"]
 
-    # SEC beta: NII/AFFO per aktie
+    # SEC (beta): NII/AFFO per aktie
     if use_sec_beta:
         try:
             secv = sec_try_nii_affo_ps(tk) or {}
+            time.sleep(RATE_LIMIT_SLEEP)
             if secv.get("nii_ps") and not row.get("NII_ps0"):
                 row["NII_ps0"] = secv["nii_ps"]
             if not row.get("AFFO_ps0"):
@@ -899,17 +920,24 @@ def auto_fill_from_sources(tk: str, row: Dict[str,Any], use_finn: bool, use_sec_
             pass
     return row
 
-# ---------- Spara/uppdatera en ticker ----------
+# ---------- Spara/uppdatera en ticker (Yahoo + FX + Finnhub/SEC) ----------
 def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: str,
                            g1: float, g2: float, g3: float,
                            adv: Dict[str, Any], use_finn: bool, use_sec_beta: bool) -> Dict[str,Any]:
     tk = (ticker or "").strip().upper()
+
+    # Yahoo snapshot
     snap = fetch_yahoo_snapshot(tk)
+    time.sleep(RATE_LIMIT_SLEEP)
 
     cur = snap.get("currency") or "SEK"
+    # FX
     rates = fetch_fx_to_sek([cur])
+    time.sleep(RATE_LIMIT_SLEEP)
     persist_fx(ws_fx, rates)
+    time.sleep(RATE_LIMIT_SLEEP)
 
+    # Bygg rad
     row = {
         "Timestamp": now_ts(), "Ticker": tk,
         "Bolagsnamn": snap.get("long_name") or snap.get("short_name") or "",
@@ -941,11 +969,16 @@ def handle_one_ticker_save(ticker: str, bucket: str, antal: int, pref_method: st
         "Dividend Yield": snap.get("dividend_yield") or 0.0,
     }
 
+    # Autofyll per-aktie från Finnhub/SEC
     row = auto_fill_from_sources(tk, row, use_finn, use_sec_beta)
+    time.sleep(RATE_LIMIT_SLEEP)
+
+    # Upsert till Data
     upsert_row(ws_data, "Ticker", tk, row)
+    time.sleep(RATE_LIMIT_SLEEP)
     return row
 
-# ---------- UI-knapp: spara en ----------
+# ---------- Hantera klick: Spara en ----------
 if save_clicked and ticker_in:
     adv = dict(
         pe_hist=pe_hist, eps0=eps0,
@@ -1018,7 +1051,7 @@ def autoscale_ps(value: float, price: float, min_ratio: float, max_ratio: float,
 
     return v
 
-# ---------- Värdering för en rad (Auto-tillväxt + sanity + autoskalning) ----------
+# ---------- Värdering för en rad (Auto-tillväxt + re-ankring + sanity + autoskalning) ----------
 def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     flags: List[str] = []
 
@@ -1064,7 +1097,18 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     p_tbv_mult   = float(nz(r.get("P_TBV_mult"), 1.2))
     p_nii_mult   = float(nz(r.get("P_NII_mult"), 10.0))
 
-    # Per-aktie-inputs + autoskalning
+    # --- (nytt) Hämta P/E TTM & P/B TTM för förankring (om Finnhub används) ---
+    pe_ttm = pb_ttm = None
+    try:
+        if use_finnhub:
+            fm_anch = fetch_finnhub_metrics((r.get("Ticker") or "").upper()) or {}
+            pe_ttm = fm_anch.get("pe_ttm")
+            pb_ttm = fm_anch.get("pb_ttm")
+            time.sleep(RATE_LIMIT_SLEEP)
+    except Exception:
+        pass
+
+    # Per-aktie-inputs (råa)
     eps0    = float(nz(r.get("EPS0"), 0.0))
     bv_ps0  = float(nz(r.get("BV_ps0"), 0.0))
     nav_ps0 = float(nz(r.get("NAV_ps0"), 0.0))
@@ -1075,15 +1119,24 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     rotce   = float(nz(r.get("ROTCE"), 0.12))
     payout  = float(nz(r.get("Payout"), 0.30))
 
+    # --- Re-ankring mot nuvarande multiplar för att undvika 10x-fel (split/skalor) ---
+    if pe_ttm and pe_ttm > 1 and px > 0:
+        eps_implied = px / pe_ttm
+        eps0 = np.median([v for v in [eps0, eps_implied] if v and v > 0]) if eps0 > 0 else eps_implied
+    if pb_ttm and pb_ttm > 0 and px > 0:
+        bv_implied = px / pb_ttm
+        bv_ps0 = np.median([v for v in [bv_ps0, bv_implied] if v and v > 0]) if bv_ps0 > 0 else bv_implied
+
+    # Förhands-sanity + autoskalning (clamp)
     if eps0 > 1000:
         eps0 /= 100.0; flags.append("eps÷100")
-    eps0    = autoscale_ps(eps0,  px, 5.0, 200.0, "eps",   flags)
-    bv_ps0  = autoscale_ps(bv_ps0,px, 0.2, 20.0,  "bv",    flags)
-    nav_ps0 = autoscale_ps(nav_ps0,px, 0.2, 10.0, "nav",   flags)
-    affo_ps0= autoscale_ps(affo_ps0,px, 5.0, 40.0, "affo", flags)
-    nii_ps0 = autoscale_ps(nii_ps0,px, 5.0, 20.0, "nii",   flags)
-    fcf_ps0 = autoscale_ps(fcf_ps0,px, 5.0, 60.0, "fcfps", flags)
-    tbv_ps0 = autoscale_ps(tbv_ps0,px, 0.2, 20.0, "tbv",   flags)
+    eps0    = autoscale_ps(eps0,  px, 5.0, 200.0, "eps",   flags)   # P/E 5–200
+    bv_ps0  = autoscale_ps(bv_ps0,px, 0.2, 20.0,  "bv",    flags)   # P/B 0.2–20
+    nav_ps0 = autoscale_ps(nav_ps0,px, 0.2, 10.0, "nav",   flags)   # P/NAV 0.2–10
+    affo_ps0= autoscale_ps(affo_ps0,px, 5.0, 40.0, "affo", flags)   # P/AFFO 5–40
+    nii_ps0 = autoscale_ps(nii_ps0,px, 5.0, 20.0, "nii",   flags)   # P/NII 5–20
+    fcf_ps0 = autoscale_ps(fcf_ps0,px, 5.0, 60.0, "fcfps", flags)   # P/FCF 5–60
+    tbv_ps0 = autoscale_ps(tbv_ps0,px, 0.2, 20.0, "tbv",   flags)   # P/TBV 0.2–20
 
     # --- Tillväxt (Auto-läge finns i sidopanel) ---
     raw_g1 = nz(r.get("G1"), 0.15); base_g1 = _norm_rate(raw_g1)
@@ -1099,7 +1152,6 @@ def compute_methods_row(r: pd.Series) -> Dict[str, Any]:
     tk = (r.get("Ticker") or "").upper()
 
     def _blend_with_manual(cagr_rate: Optional[float], w: float) -> tuple[float,float,float]:
-        """Blanda CAGR med manuella G med vikt w (0..1)."""
         if cagr_rate is None:
             return base_g1, base_g2, base_g3
         g_c = float(cagr_rate)
@@ -1238,10 +1290,11 @@ if do_mass_refresh:
         st.warning("Inga bolag i Data ännu.")
     else:
         persist_fx(ws_fx, fetch_fx_to_sek(sorted({(c or "SEK") for c in df["Valuta"].tolist()})))
+        time.sleep(RATE_LIMIT_SLEEP)
         done = 0
         for _, r0 in df.iterrows():
             tk = r0.get("Ticker","")
-            if not tk: 
+            if not tk:
                 continue
             try:
                 adv = dict(
@@ -1265,11 +1318,13 @@ if do_mass_refresh:
                 res = compute_methods_row(pd.Series(newrow))
                 if writeback_in_mass:
                     writeback_autoscaled_row(tk, res["AutoscaledInputs"])
+                    time.sleep(RATE_LIMIT_SLEEP)
                 if autosave_hist and use_finnhub:
                     band = fetch_finnhub_metrics(tk).get("pe_band")
                     primary, fairt, b1, br1, upc = compute_primary_for_snapshot(newrow)
                     save_quarter_snapshot(newrow, band, primary, fairt, b1, br1, upc)
-                time.sleep(0.6)
+                    time.sleep(RATE_LIMIT_SLEEP)
+                time.sleep(RATE_LIMIT_SLEEP)
                 done += 1
             except Exception as e:
                 st.warning(f"Misslyckades uppdatera {tk}: {e}")
@@ -1313,7 +1368,7 @@ c2.metric("Total utdelning kommande 12m (SEK)", _sek(total_div_year_sek))
 c3.metric("Utdelning per månad (SEK)", _sek(total_div_month_sek))
 st.caption("Summorna gäller bolagen i tabellen nedan (enligt dina filter).")
 
-# ---------- Rankingtabell ----------
+# ---------- Rangordning ----------
 st.markdown("## 🧮 Rangordning (störst uppsida →)")
 show_cols = [
     "Ticker","Namn","Bucket","Valuta","Pris","Primär metod","Sanity",
@@ -1339,6 +1394,7 @@ if st.button("💾 Spara primära riktkurser till fliken Resultat"):
         persist_result_row(r["Ticker"], r["Valuta"], r["Pris"], r["Alla metoder"], r["Inputs"], r["Primär metod"], r.get("Sanity",""))
         if writeback_autoscaled:
             writeback_autoscaled_row(r["Ticker"], r["AutoscaledInputs"])
+            time.sleep(RATE_LIMIT_SLEEP)
     st.success("Primära riktkurser sparade till 'Resultat'." + (" (autoskalade värden skrevs tillbaka)" if writeback_autoscaled else ""))
 
 # ---------- Detaljer per bolag & snapshots ----------
@@ -1377,6 +1433,7 @@ for _, r in calc_df.iterrows():
                     t0,t1,t2,t3 = r["Alla metoder"][r["Primär metod"]]
                     bb1,bb2 = bull_bear(t1, bull_mult, bear_mult)
                     save_quarter_snapshot(row_dict, band, r["Primär metod"], (t0,t1,t2,t3), bb1, bb2, r["Upside_%"])
+                    time.sleep(RATE_LIMIT_SLEEP)
                     st.success(f"{tk}: snapshot sparad för {yq_of()[2]}.")
 
             if c3.button("Spara snapshot för alla i listan", key=f"snap_all_{tk}"):
@@ -1390,5 +1447,6 @@ for _, r in calc_df.iterrows():
                         t0,t1,t2,t3 = cr["Alla metoder"][cr["Primär metod"]]
                         b1x,b2x = bull_bear(t1, bull_mult, bear_mult)
                         save_quarter_snapshot(row_dict, b2, cr["Primär metod"], (t0,t1,t2,t3), b1x, b2x, cr["Upside_%"])
+                        time.sleep(RATE_LIMIT_SLEEP)
                         done += 1
                 st.success(f"Snapshots sparade för {done} tickers ({yq_of()[2]}).")
