@@ -1,6 +1,6 @@
 # ============================================================
-# BucketApp — värdering & riktkurser med estimat→CAGR-fallback
-# Visning i bolagets valuta, portföljvärde i SEK
+# BucketApp — värdering & riktkurser med Estimat→CAGR-fallback
+# Priser/riktkurser i bolagets valuta, portföljsummor i SEK
 # ============================================================
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def nz(x: Any, default: float = 0.0) -> float:
         if isinstance(x, (int, float)) and not np.isnan(x):
             return float(x)
         if isinstance(x, str) and x.strip() != "":
-            return float(x)
+            return float(x.replace(" ", "").replace(",", "."))
     except Exception:
         pass
     return default
@@ -140,7 +140,7 @@ def _open_spreadsheet():
             return gc.open_by_url(sheet_url)
         if sheet_id:
             return gc.open_by_key(sheet_id)
-    except Exception as e:
+    except Exception:
         st.error("Kunde inte öppna Google Sheet. Kontrollera SHEET_URL/SHEET_ID och delning.")
         st.stop()
 
@@ -160,7 +160,7 @@ WS_HIST       = _get_ws(SPREAD, "Historik")
 # Läs/skriv Data som DataFrame
 # ---------------------------
 DATA_COLUMNS = [
-    "Ticker", "Bolagsnamn", "Bucket", "Valuta", "Antal aktier",
+    "Ticker", "Bolagsnamn", "Bucket", "Valuta", "Antal aktier", "Preferred metod",
     "Last Price", "Market Cap", "EV", "Shares Out",
     "PE TTM", "PE FWD", "EV/Revenue", "EV/EBITDA",
     "EPS_CAGR_5Y",
@@ -798,6 +798,55 @@ def persist_fx_latest():
     return rates
 
 # -------------------------
+# Historik: kvartalssnapshot (enkelt, robust)
+# -------------------------
+def append_hist_snapshot(ticker: str, snap: Dict[str, Any]):
+    """Appendar en rad till fliken Historik. Skapar header om tom."""
+    ts = now_ts()
+    _, _, yq = yq_of(ts)
+    row = {
+        "Timestamp": ts,
+        "Period": yq,
+        "Ticker": ticker,
+        "Valuta": snap.get("currency"),
+        "Last Price": snap.get("last_price"),
+        "Market Cap": snap.get("market_cap"),
+        "EV": snap.get("enterprise_value"),
+        "Shares Out": snap.get("shares_out"),
+        "Revenue TTM": snap.get("revenue_ttm"),
+        "EBITDA TTM": snap.get("ebitda_ttm"),
+        "FCF TTM": snap.get("fcf_ttm"),
+        "PE TTM": snap.get("pe_ttm"),
+        "PE FWD": snap.get("pe_forward"),
+        "EV/Revenue": snap.get("ev_to_revenue"),
+        "EV/EBITDA": snap.get("ev_to_ebitda"),
+        "Dividend/ps": snap.get("dividend_ps"),
+        "DividendYield": snap.get("dividend_yield"),
+    }
+    # Läs befintligt
+    vals = WS_HIST.get_all_values()
+    if not vals:
+        header = list(row.keys())
+        WS_HIST.update([header, [row.get(h, "") for h in header]])
+        return
+    header = vals[0]
+    # Säkerställ att alla row-keys finns i header (håll det enkelt: re-skriv hela arket om olika schema)
+    if set(row.keys()) - set(header):
+        # Union + re-skriv
+        new_header = list(dict.fromkeys(header + list(row.keys())))
+        df = pd.DataFrame(vals[1:], columns=header)
+        # fyll ev. saknade kolumner
+        for c in new_header:
+            if c not in df.columns:
+                df[c] = ""
+        new_row = {c: row.get(c, "") for c in new_header}
+        WS_HIST.clear()
+        WS_HIST.update([new_header] + df[new_header].values.tolist() + [list(new_row.values())])
+        return
+    # Samma schema → append
+    WS_HIST.append_row([row.get(h, "") for h in header], value_input_option="RAW")
+
+# -------------------------
 # Sidopanel — inställningar
 # -------------------------
 with st.sidebar:
@@ -921,17 +970,15 @@ def handle_one_ticker_save(ticker: str,
     snap = fetch_yahoo_snapshot(tk)
     time.sleep(rate_sleep)
 
-    # 2) Finnhub – nivådata + EPS-CAGR
-    eps_cagr = None
+    # 2) Finnhub – (valfritt) trigga cache för senare beräkning
     if use_finn:
         try:
-            qeps = fetch_finnhub_eps_quarterly(tk)
+            _ = fetch_finnhub_estimates(tk)
             time.sleep(rate_sleep)
-            eps_cagr = eps_cagr_from_quarters(qeps, years=5)
-            if eps_cagr is None:
-                eps_cagr = eps_cagr_from_quarters(qeps, years=3)
+            _ = fetch_finnhub_eps_quarterly(tk)
+            time.sleep(rate_sleep)
         except Exception:
-            eps_cagr = None
+            pass
 
     # 3) FX → uppdatera valutaflik
     try:
@@ -947,6 +994,7 @@ def handle_one_ticker_save(ticker: str,
         "Bucket": bucket,
         "Valuta": snap.get("currency") or "SEK",
         "Antal aktier": int(antal),
+        "Preferred metod": pref_method if pref_method else "AUTO",
 
         # Snapshot
         "Last Price":  snap.get("last_price") or np.nan,
@@ -981,13 +1029,20 @@ def handle_one_ticker_save(ticker: str,
         "FCF/ps":  adv.get("fcf_ps0"),
         "NII/ps":  adv.get("nii_ps0"),
 
-        "EPS_CAGR_5Y": eps_cagr if eps_cagr is not None else np.nan,
+        # EPS_CAGR fylls/uppdateras vid beräkning i Del 4 (kan fyllas här om du vill)
+        "EPS_CAGR_5Y": np.nan,
     }
 
     # 5) Upsert i Data
     df = read_data_df()
     df2 = upsert_row_df(df, "Ticker", row)
     write_data_df(df2)
+
+    # 6) Snapshot till Historik
+    try:
+        append_hist_snapshot(tk, snap)
+    except Exception:
+        pass
 
     return row
 
@@ -1007,7 +1062,7 @@ if save_clicked and ticker_in:
         adv, use_finnhub, rate_limit_sleep
     )
     if saved.get("Last Price"):
-        st.success(f"{ticker_in} sparad/uppdaterad i fliken **Data**.")
+        st.success(f"{ticker_in} sparad/uppdaterad i fliken **Data** och snapshot loggad i **Historik**.")
     else:
         st.warning(f"{ticker_in}: kunde inte läsa pris från Yahoo just nu.")
 
@@ -1101,7 +1156,6 @@ def stringify_inputs(d: Dict[str, Any]) -> str:
         except Exception:
             parts.append(f"{k}={v}")
     s = ";".join(parts)
-    # hålla kort
     return (s[:990] + "…") if len(s) > 1000 else s
 
 # ------------ Beräkning per rad ------------
@@ -1114,46 +1168,64 @@ def compute_methods_row(r: pd.Series,
 
     tkr = (r.get("Ticker") or "").upper()
     cur = (r.get("Valuta") or "SEK")
-    px  = float(nz(r.get("Last Price"), 0.0))
-    mc  = float(nz(r.get("Market Cap"), 0.0))
-    shs = float(nz(r.get("Shares Out"), 0.0))
+
+    # ---- SÄKER NUMERISK PARSNING (fix för str − str) ----
+    def num(val, default=0.0):
+        v = to_float(val, None)
+        return default if v is None else float(v)
+
+    px   = num(r.get("Last Price"), 0.0)
+    mc   = num(r.get("Market Cap"), 0.0)
+    shs  = num(r.get("Shares Out"), 0.0)
+    ev_row = to_float(r.get("EV"), None)
+
     if px <= 0 and mc > 0 and shs > 0:
         px = mc / shs
 
-    # Bas
-    rev0    = float(nz(r.get("Revenue TTM"), 0.0))
-    ebitda0 = float(nz(r.get("EBITDA TTM"), 0.0))
-    fcf0    = float(nz(r.get("FCF TTM"), 0.0))
-    total_debt = float(nz(r.get("Total Debt"), nz(r.get("EV") - r.get("Market Cap"), 0.0)))
-    cash       = float(nz(r.get("Cash"), 0.0))
-    net_debt = total_debt - cash
+    # TTM baser
+    rev0    = num(r.get("Revenue TTM"), 0.0)
+    ebitda0 = num(r.get("EBITDA TTM"), 0.0)
+    fcf0    = num(r.get("FCF TTM"), 0.0)
+
+    # Net debt = EV - Market Cap (motsvarar TotalDebt - Cash)
+    if ev_row is not None and mc > 0:
+        net_debt = float(ev_row) - float(mc)
+    else:
+        net_debt = 0.0
+
     shares_out = shs if shs > 0 else safe_div(mc, px, 0.0)
 
-    # Multiplar (manuella med ankare från Yahoo om saknas)
-    ev_s_mult   = float(nz(r.get("ev_s_mult"), nz(r.get("EV/Revenue"), 5.0)))
-    ev_eb_mult  = float(nz(r.get("ev_eb_mult"), nz(r.get("EV/EBITDA"), 12.0)))
-    ev_fcf_mult = float(nz(r.get("ev_fcf_mult"), 18.0))
-    dacf_mult   = float(nz(r.get("dacf_mult"), ev_eb_mult))
+    # Multiplar (manuella; ankra mot Yahoo-fält om tomt)
+    ev_s_mult   = to_float(r.get("ev_s_mult"), None)
+    if ev_s_mult is None or ev_s_mult <= 0:
+        ev_s_mult = to_float(r.get("EV/Revenue"), 5.0)
 
-    p_fcf_mult  = float(nz(r.get("p_fcf_mult"), 20.0))
-    p_nav_mult  = float(nz(r.get("p_nav_mult"), 1.0))
-    p_affo_mult = float(nz(r.get("p_affo_mult"), 13.0))
-    p_b_mult    = float(nz(r.get("p_b_mult"), 1.5))
-    p_tbv_mult  = float(nz(r.get("p_tbv_mult"), 1.2))
-    p_nii_mult  = float(nz(r.get("p_nii_mult"), 10.0))
+    ev_eb_mult  = to_float(r.get("ev_eb_mult"), None)
+    if ev_eb_mult is None or ev_eb_mult <= 0:
+        ev_eb_mult = to_float(r.get("EV/EBITDA"), 12.0)
 
-    # Per-aktie proxies (kan vara 0 → då blir serie = 0)
-    fcf_ps0  = float(nz(r.get("FCF/ps"), 0.0))
-    nav_ps0  = float(nz(r.get("NAV/ps"), 0.0))
-    affo_ps0 = float(nz(r.get("AFFO/ps"), 0.0))
-    bv_ps0   = float(nz(r.get("BV/ps"), 0.0))
-    tbv_ps0  = float(nz(r.get("TBV/ps"), 0.0))
-    nii_ps0  = float(nz(r.get("NII/ps"), 0.0))
+    ev_fcf_mult = to_float(r.get("ev_fcf_mult"), 18.0)
+    dacf_mult   = to_float(r.get("dacf_mult"),   ev_eb_mult)
+
+    p_fcf_mult  = to_float(r.get("p_fcf_mult"),  20.0)
+    p_nav_mult  = to_float(r.get("p_nav_mult"),  1.0)
+    p_affo_mult = to_float(r.get("p_affo_mult"), 13.0)
+    p_b_mult    = to_float(r.get("p_b_mult"),    1.5)
+    p_tbv_mult  = to_float(r.get("p_tbv_mult"),  1.2)
+    p_nii_mult  = to_float(r.get("p_nii_mult"),  10.0)
+
+    # Per-aktie proxies (kan vara 0)
+    fcf_ps0  = num(r.get("FCF/ps"), 0.0)
+    nav_ps0  = num(r.get("NAV/ps"), 0.0)
+    affo_ps0 = num(r.get("AFFO/ps"), 0.0)
+    bv_ps0   = num(r.get("BV/ps"), 0.0)
+    tbv_ps0  = num(r.get("TBV/ps"), 0.0)
+    nii_ps0  = num(r.get("NII/ps"), 0.0)
 
     # Tillväxt manuellt om inget estimat/CAGR
-    g1 = float(nz(r.get("G1"), 0.15))
-    g2 = float(nz(r.get("G2"), 0.12))
-    g3 = float(nz(r.get("G3"), 0.10))
+    g1 = num(r.get("G1"), 0.15)
+    g2 = num(r.get("G2"), 0.12)
+    g3 = num(r.get("G3"), 0.10)
 
     # Estimat (Finnhub)
     est = {}
@@ -1252,7 +1324,7 @@ def compute_methods_row(r: pd.Series,
     bv0, bv1, bv2, bv3 = series_from_est_or_cagr(bv_ps0, None, None, cagr_bv, g1, g2, g3)
     vals["p_b"]       = price_multiple_from_series(bv0, bv1, bv2, bv3, p_b_mult,   p_comp_rate)
 
-    # ---- P/TBV (via ROTCE/payout om du senare lägger in) → här enkel CAGR-proxy via cagr_bv ----
+    # ---- P/TBV ----
     tb0, tb1, tb2, tb3 = series_from_est_or_cagr(tbv_ps0, None, None, cagr_bv, g1, g2, g3)
     vals["p_tbv"]     = price_multiple_from_series(tb0, tb1, tb2, tb3, p_tbv_mult, p_comp_rate)
 
@@ -1272,8 +1344,8 @@ def compute_methods_row(r: pd.Series,
     t_today, t_1y, t_2y, t_3y = vals[primary]
     b1, br1 = bull_bear(t_1y, bull_mult, bear_mult)
 
-    # Dividendinfo (om Yahoo saknar → 0)
-    div_ps = 0.0  # vi lagrar inte här; kan byggas ut
+    # Dividendinfo (placeholder → 0)
+    div_ps = 0.0
     da = 0.0
     if px > 0 and div_ps > 0:
         da = (div_ps/px)*100.0
@@ -1369,8 +1441,7 @@ for _, r in view_df.iterrows():
     antal = int(nz(r.get("Antal aktier"), 0))
     rate = _rate(cur)
     innehav_sek.append(antal * pris * rate)
-    # utd per år okänd här → 0 (kan utökas senare)
-    utd_år_sek.append(0.0)
+    utd_år_sek.append(0.0)  # kan byggas ut
 
 total_value_sek      = float(np.nansum(innehav_sek))
 total_div_year_sek   = float(np.nansum(utd_år_sek))
