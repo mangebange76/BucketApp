@@ -1,18 +1,20 @@
 # ============================================================
-# Bas & infrastruktur: UI, helpers, Google Sheets I/O, schema,
-# FX och Settings. (Inga sidor ännu.)
+# app.py — Aktieanalys & investeringsförslag
+# Del 1/4: Bas & infrastruktur (UI, helpers, Sheets I/O, schema, FX/Settings)
 # ============================================================
 
 from __future__ import annotations
+
+# ---------- Standardbibliotek ----------
 import os, json, math, time
 from typing import Any, Dict, List, Optional, Tuple
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+import datetime as dt
 
+# ---------- Tredjepart ----------
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 import yfinance as yf
 import gspread
 from gspread import Spreadsheet, Worksheet
@@ -44,17 +46,17 @@ def now_stamp() -> str:
     try:
         import pytz
         tz = pytz.timezone("Europe/Stockholm")
-        return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        return dt.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def today_date() -> datetime.date:
+def today_date() -> dt.date:
     try:
         import pytz
         tz = pytz.timezone("Europe/Stockholm")
-        return datetime.now(tz).date()
+        return dt.datetime.now(tz).date()
     except Exception:
-        return datetime.now().date()
+        return dt.datetime.now().date()
 
 def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
@@ -232,7 +234,7 @@ DATA_COLUMNS = [
     "PE TTM","PE FWD","EV/Revenue","EV/EBITDA","P/B","BVPS",
     "EPS 1Y","EPS 2Y","Rev CAGR","EPS CAGR",
     "Årlig utdelning","Utdelning CAGR",
-    # 👇 NYTT för utdelningslistan
+    # Utdelningslista
     "Utdelningsfrekvens",                # "M","Q","S","A"
     "Nästa utdelningsdatum",             # YYYY-MM-DD
     "Nästa utdelning (per aktie)",       # DPS nästa
@@ -456,23 +458,27 @@ if 'METHOD_LIST' not in globals():
     ]
 if 'PREFER_ORDER' not in globals():
     PREFER_ORDER = METHOD_LIST
+
 # ============================================================
-# Del 1/4 slut — fortsätt med Del 2/4 (datainsamling & beräkningar)
+# Del 1/4 slut — fortsätt i Del 2/4 (datainsamling & beräkningsmotor)
 # ============================================================
 
 # ============================================================
-# Del 2/4 — Datainsamling (Yahoo primärt) & beräkningsmotor
+# app.py — Del 2/4
+# Datainsamling (Yahoo/Finnhub) & beräkningsmotor
 #  • TTM via kvartalssummor (EPS/Rev/EBITDA) från Yahoo
 #  • Estimat (EPS 1–2 år) från Yahoo trend (+ Finnhub fallback)
 #  • CAGR-härledningar, multipel-decay, metodpriser
 # ============================================================
 
 import requests
+import pandas as pd
+import numpy as np
 
 # -------------------------
 # Små hjälpare (index-pick, TTM-summerare)
 # -------------------------
-def _ix_pick(df: pd.DataFrame, candidates: list[str]) -> Optional[pd.Series]:
+def _ix_pick(df: pd.DataFrame, candidates: list[str]):
     """Hitta rad i df (index) via kandidater — case/space-insensitivt."""
     if df is None or getattr(df, "empty", True):
         return None
@@ -494,12 +500,13 @@ def _ix_pick(df: pd.DataFrame, candidates: list[str]) -> Optional[pd.Series]:
                     pass
     return None
 
-def _sum_last4(ser_like) -> Optional[float]:
+def _sum_last4(ser_like):
+    """Summera de 4 senaste datapunkterna (för kvartalsserier)."""
     try:
         s = pd.to_numeric(pd.Series(ser_like), errors="coerce").dropna()
         if s.empty:
             return None
-        # säkerställ kronologisk ordning på kolumner (datum)
+        # säkerställ kronologisk ordning (datumkolumner)
         try:
             s.index = pd.to_datetime(s.index, errors="coerce")
             s = s.sort_index()
@@ -512,18 +519,18 @@ def _sum_last4(ser_like) -> Optional[float]:
     except Exception:
         return None
 
-def _sum_eps_last4(ser_like) -> Optional[float]:
+def _sum_eps_last4(ser_like):
     """Summera senaste 4 kvartalens EPS (Diluted/Basic)."""
     return _sum_last4(ser_like)
 
 # -------------------------
-# Yahoo (yfinance) – robust snapshot med TTM via kvartal
+# Yahoo (yfinance) – robust snapshot
 # -------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     """
     Hämtar pris/valuta + nyckeltal från Yahoo.
-    Förbättring: TTM byggs primärt från kvartalssummor (income_stmt quarterly).
+    TTM byggs primärt från kvartalssummor.
     Keys (urval):
       price, currency, market_cap, ev, shares,
       revenue_ttm, ebitda_ttm, eps_ttm,
@@ -567,7 +574,7 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     set_if_missing("pe_fwd",       gi("forwardPE"),           "yahoo_info")
     set_if_missing("p_to_book",    gi("priceToBook"),         "yahoo_info")
     set_if_missing("bvps",         gi("bookValue"),           "yahoo_info")
-    set_if_missing("eps_ttm",      gi("trailingEps"),         "yahoo_info")   # kan bli överskriven av kvartal
+    set_if_missing("eps_ttm",      gi("trailingEps"),         "yahoo_info")   # kan bli överskriven
 
     # Namn/sector/industry
     try:
@@ -617,7 +624,6 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
             pass
 
     # --- TTM via kvartal (income statement quarterly)
-    # Fields att leta efter
     EPS_KEYS_Q     = ["DilutedEPS", "BasicEPS", "EPS"]
     REV_KEYS_Q     = ["TotalRevenue", "Total Revenue", "Revenue"]
     EBITDA_KEYS_Q  = ["Ebitda", "EBITDA"]
@@ -631,15 +637,15 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
         if inc_q is not None and not getattr(inc_q, "empty", True):
             dfq = inc_q.copy()
 
-            # EPS TTM – preferera att summera kvartals-EPS
+            # EPS TTM
             eps_row = _ix_pick(dfq, EPS_KEYS_Q)
             eps_ttm_q = _sum_eps_last4(eps_row) if eps_row is not None else None
 
-            # Revenue TTM – summera 4 senaste
+            # Revenue TTM
             rev_row = _ix_pick(dfq, REV_KEYS_Q)
             rev_ttm_q = _sum_last4(rev_row) if rev_row is not None else None
 
-            # EBITDA TTM – summera 4 senaste
+            # EBITDA TTM
             ebitda_row = _ix_pick(dfq, EBITDA_KEYS_Q)
             ebitda_ttm_q = _sum_last4(ebitda_row) if ebitda_row is not None else None
 
@@ -662,7 +668,6 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
                 out["revenue_ttm"] = float(rev_ttm_q)
                 out["sources"]["revenue_ttm"] = "yahoo_quarterly_TTM"
             else:
-                # info()-fallback (kan vara felaktig men bättre än tomt)
                 set_if_missing("revenue_ttm", gi("totalRevenue"), "yahoo_info")
 
             if ebitda_ttm_q is not None:  # EBITDA kan vara <=0
@@ -921,7 +926,7 @@ def _ev_from_sales(rev: Optional[float], mult: Optional[float]) -> Optional[floa
     return r * m
 
 def _ev_from_ebitda(ebitda: Optional[float], mult: Optional[float]) -> Optional[float]:
-    e = _pos(ebitda)
+    e = _f(ebitda)  # får vara negativ/0
     m = _pos(mult)
     if e is None or m is None:
         return None
@@ -1006,7 +1011,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
     currency = str(_nz(snap.get("currency"), row.get("Valuta") or "USD")).upper()
     shares   = _pos(_nz(snap.get("shares"), row.get("Utestående aktier")))
-    net_debt = _nz(sap := snap.get("net_debt"), row.get("Net debt"))
+    net_debt = _nz(snap.get("net_debt"), row.get("Net debt"))
 
     rev_ttm    = _nz(snap.get("revenue_ttm"), row.get("Rev TTM"))
     ebitda_ttm = _nz(snap.get("ebitda_ttm"), row.get("EBITDA TTM"))
@@ -1107,7 +1112,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     # 7) Sanity + META
     src = snap.get("sources", {}) or {}
     eps1_src = "yahoo_trend" if _pos(yh_eps.get("eps_1y")) else ("finnhub" if _pos(fh.get("eps_1y")) else ("sheet" if _pos(row.get("EPS 1Y")) else "filled_by_rule"))
-    eps2_src = "yahoo_trend" if _pos(yh_eps.get("eps_2y")) else ("finnhub" if _pos(fh.get("eps_2y")) else ("sheet/derived" if _pos(row.get("EPS 2Y")) or _pos(e2) else "filled_by_rule"))
+    eps2_src = "yahoo_trend" if _pos(yh_eps.get("eps_2y")) else ("finnhub" if _pos(fh.get("eps_2y")) else ("sheet/derived" if _pos(row.get("EPS 2Y")) else "filled_by_rule"))
     revc_src = "yahoo_financials" if revcg_yh.get("rev_cagr") is not None else ("sheet" if _f(row.get("Rev CAGR")) is not None else "none")
 
     sanity = (
@@ -1152,15 +1157,21 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     return methods_df, sanity, meta
 
 # ============================================================
-# Del 2/4 slut — fortsätt med Del 3/4 (Analys/Portfölj/Ranking UI)
+# Del 2/4 slut — fortsätt i Del 3/4 (Analys/Portfölj/Ranking UI)
 # ============================================================
 
 # ============================================================
-# Del 3/4 — Analys/Portfölj/Ranking UI + utdelningslista
-#  • Robust mot saknade kolumner (fixar KeyError i portföljen)
-#  • P/L i SEK, fair value-uppsidor, primär metod-val
-#  • Lista över kommande utdelningsutbetalningar
+# app.py — Del 3/4
+# Analys / Portfölj / Ranking + utdelningslista & hjälpfunktioner
+# • Fix: använd dt.date (inte datetime.date) för isinstance-checks
+# • Fix: robust "Datum"-kolumn (tilldelar alltid enskilt datumsvar)
 # ============================================================
+
+from typing import Optional, Dict, Any, List, Tuple
+import datetime as dt
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 # ---------- Format-hjälpare ----------
 def _fmt_money(v: Optional[float], ccy: str) -> str:
@@ -1195,6 +1206,96 @@ def _fmt_sek(v: Optional[float]) -> str:
     except Exception:
         return f"{v} SEK"
 
+# ---------- Utdelningshjälpare ----------
+def _add_months(d: dt.date, n: int) -> dt.date:
+    y = d.year + (d.month - 1 + n) // 12
+    m = (d.month - 1 + n) % 12 + 1
+    day = min(d.day, [31,
+        29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28,
+        31,30,31,30,31,31,30,31,30,31][m-1])
+    return dt.date(y, m, day)
+
+def _roll_forward(d: Optional[dt.date], freq: str) -> Optional[dt.date]:
+    if not isinstance(d, dt.date):
+        return None
+    freq = (freq or "").upper()
+    if freq == "M":  return _add_months(d, 1)
+    if freq == "Q":  return _add_months(d, 3)
+    if freq == "S":  return _add_months(d, 6)
+    if freq == "A":  return _add_months(d, 12)
+    return None
+
+def _dps_from_annual_and_freq(annual: Optional[float], freq: str) -> Optional[float]:
+    a = _f(annual)
+    if a is None:
+        return None
+    freq = (freq or "").upper()
+    if freq == "M": return a / 12.0
+    if freq == "Q": return a / 4.0
+    if freq == "S": return a / 2.0
+    if freq == "A": return a
+    return None
+
+def today_date() -> dt.date:
+    try:
+        import pytz
+        tz = pytz.timezone("Europe/Stockholm")
+        return dt.datetime.now(tz).date()
+    except Exception:
+        return dt.date.today()
+
+def forecast_dividends_net_sek(currency: str, shares_own: float,
+                               dps_now: Optional[float], dps_cagr: Optional[float],
+                               fx_map: Dict[str, float], settings: Dict[str, str]) -> Dict[str, float]:
+    """Prognos 1–3 år, netto i SEK (källskatt enligt settings)."""
+    ccy = (currency or "USD").upper()
+    wh  = get_withholding_for(ccy, settings)
+    fx  = fx_map.get(ccy, 1.0) or 1.0
+    dps0 = _f(dps_now) or 0.0
+    g    = _f(dps_cagr) or 0.0
+    def yr(n):
+        gross = (dps0 * ((1.0 + g) ** n)) * (shares_own or 0.0)
+        return gross * (1.0 - wh) * fx
+    return {"y1": yr(1), "y2": yr(2), "y3": yr(3)}
+
+def update_next_dividends_in_df(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """Rulla fram 'Nästa utdelningsdatum' som passerat och fyll 'Nästa utdelning (per aktie)' om möjligt."""
+    if df.empty:
+        return df, 0
+    out = df.copy()
+    # säkerställ kolumner
+    for c in ["Utdelningsfrekvens","Nästa utdelningsdatum","Nästa utdelning (per aktie)","Årlig utdelning"]:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    out["Utdelningsfrekvens"] = out["Utdelningsfrekvens"].fillna("").astype(str).str.upper()
+    # parse datum → date
+    out["Nästa utdelningsdatum"] = pd.to_datetime(out["Nästa utdelningsdatum"], errors="coerce").dt.date
+
+    n_changed = 0
+    today = today_date()
+    for idx, r in out.iterrows():
+        freq = str(r.get("Utdelningsfrekvens") or "").upper()
+        d    = r.get("Nästa utdelningsdatum")
+        if isinstance(d, dt.date):
+            safe = 0
+            while d is not None and d <= today and freq in ("M","Q","S","A") and safe < 36:
+                d = _roll_forward(d, freq)
+                safe += 1
+            if d != r.get("Nästa utdelningsdatum"):
+                out.at[idx, "Nästa utdelningsdatuM".replace("M","m")] = d  # försäkrar rätt namn vid ev. felstavning
+                out.at[idx, "Nästa utdelningsdatum"] = d
+                n_changed += 1
+
+        # DPS nästa (om tom men vi har annual + freq)
+        if pd.isna(r.get("Nästa utdelning (per aktie)")) or float(_f(r.get("Nästa utdelning (per aktie)")) or 0) == 0.0:
+            dps = _dps_from_annual_and_freq(_f(r.get("Årlig utdelning")), freq)
+            if dps is not None:
+                out.at[idx, "Nästa utdelning (per aktie)"] = dps
+                n_changed += 1
+
+    return out, n_changed
+
 # ---------- Heuristik: välj primär metod ----------
 if "_PREFER_ORDER" not in globals():
     _PREFER_ORDER = ["ev_ebitda","ev_sales","pe_hist_vs_eps","p_b","ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"]
@@ -1221,7 +1322,7 @@ def _pick_primary_from_table(met_df: pd.DataFrame, preset: Optional[str] = None)
     row = met_df[met_df["Metod"] == chosen].iloc[0]
     return chosen, _f(row["Idag"]), _f(row["1 år"]), _f(row["2 år"]), _f(row["3 år"])
 
-# ---------- Skriv "Primär metod" till Data-bladet ----------
+# ---------- Spara primär metod & målpriser ----------
 def _save_primary_method_to_data(ticker: str, method: str):
     df = read_data_df()
     if df.empty or "Ticker" not in df.columns:
@@ -1236,13 +1337,12 @@ def _save_primary_method_to_data(ticker: str, method: str):
     df.loc[mask, "Primär metod"] = method
     write_data_df(df)
 
-# ---------- Spara riktkurser till Resultat ----------
-def _save_targets_to_result(ticker: str, currency: str, method: Optional[str],
+def _save_targets_to_result(tkr: str, currency: str, method: Optional[str],
                             t0: Optional[float], t1: Optional[float], t2: Optional[float], t3: Optional[float]):
     res = _read_df(RESULT_TITLE)
     row = {
         "Timestamp": now_stamp(),
-        "Ticker": ticker,
+        "Ticker": tkr,
         "Valuta": currency,
         "Metod": method or "",
         "Riktkurs idag": t0,
@@ -1258,7 +1358,7 @@ def _save_targets_to_result(ticker: str, currency: str, method: Optional[str],
         if k not in cols:
             cols.append(k)
             res[k] = np.nan
-    mask = res["Ticker"].astype(str).str.upper() == str(ticker).upper()
+    mask = res["Ticker"].astype(str).str.upper() == str(tkr).upper()
     if mask.any():
         idx = res.index[mask][-1]
         for k, v in row.items():
@@ -1267,7 +1367,7 @@ def _save_targets_to_result(ticker: str, currency: str, method: Optional[str],
         res = pd.concat([res, pd.DataFrame([row])[cols]], ignore_index=True)
     _write_df(RESULT_TITLE, res[cols])
 
-# ---------- Hjälp: innehav/anskaffning/PNL i SEK ----------
+# ---------- Innehav/anskaffning/PNL i SEK ----------
 def _holding_metrics(currency: str, price_now: Optional[float], shares_own: Optional[float], gav_sek: Optional[float], fx_rate: float) -> Dict[str, Optional[float]]:
     if not _pos(shares_own):
         return {"value_sek": None, "cost_sek": None, "pnl_sek": None, "pnl_pct": None}
@@ -1359,8 +1459,8 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
         with left:
             st.markdown("**Ankare & parametrar**")
             st.write(f"• **PE-ankare:** { _fmt_num(meta.get('pe_anchor')) }")
-            st.write(f"• **Multipel-decay/år:** { settings.get('multiple_decay','0.10') }")
-            st.write(f"• **Vikt TTM i PE-ankare:** { settings.get('pe_anchor_weight_ttm','0.50') }")
+            st.write(f"• **Multipel-decay/år:** { get_settings_map().get('multiple_decay','0.10') }")
+            st.write(f"• **Vikt TTM i PE-ankare:** { get_settings_map().get('pe_anchor_weight_ttm','0.50') }")
             st.write(f"• **Valuta:** {currency}  • **FX:** {fx_rate:.3f}")
             st.write(f"• **Aktuell kurs:** {_fmt_money(price_now, currency)}")
         with right:
@@ -1378,7 +1478,7 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
         shares_own = _f(row.get("Antal aktier")) or 0.0
         dps_now = _f(row.get("Årlig utdelning"))
         dps_cagr = _f(row.get("Utdelning CAGR"))
-        divs = forecast_dividends_net_sek(currency, shares_own, dps_now, dps_cagr, fx_map, settings)
+        divs = forecast_dividends_net_sek(currency, shares_own, dps_now, dps_cagr, fx_map, get_settings_map())
         with st.expander("💰 Utdelning (netto SEK, prognos 1–3 år)", expanded=False):
             st.write(f"• 1 år: {_fmt_sek(divs['y1'])}  • 2 år: {_fmt_sek(divs['y2'])}  • 3 år: {_fmt_sek(divs['y3'])}")
     except Exception:
@@ -1416,7 +1516,6 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
             st.warning("Kunde inte hitta raden i Data för uppdatering.")
 
     st.caption(f"Sanity: {sanity}")
-
     return method_sel, t0, t1, t2, t3, meta
 
 # ---------- Analys-sida ----------
@@ -1489,13 +1588,11 @@ def page_analysis():
 
     cprev, cpos, cnext = st.columns([1,2,1])
     with cprev:
-        if st.button("⬅️ Föregående", use_container_width=True, disabled=(st.session_state[key_idx] <= 0)):
-            st.session_state[key_idx] = max(0, st.session_state[key_idx]-1)
+        st.button("⬅️ Föregående", use_container_width=True, disabled=(st.session_state[key_idx] <= 0), on_click=lambda: st.session_state.update({key_idx: max(0, st.session_state[key_idx]-1)}))
     with cpos:
         st.write(f"**{st.session_state[key_idx]+1} / {len(ordered_rows)}** — sorterat efter störst uppsida")
     with cnext:
-        if st.button("Nästa ➡️", use_container_width=True, disabled=(st.session_state[key_idx] >= len(ordered_rows)-1)):
-            st.session_state[key_idx] = min(len(ordered_rows)-1, st.session_state[key_idx]+1)
+        st.button("Nästa ➡️", use_container_width=True, disabled=(st.session_state[key_idx] >= len(ordered_rows)-1), on_click=lambda: st.session_state.update({key_idx: min(len(ordered_rows)-1, st.session_state[key_idx]+1)}))
 
     row = ordered_rows[st.session_state[key_idx]]
     with st.container(border=True):
@@ -1594,10 +1691,9 @@ def page_portfolio():
     show_cols = ["Ticker","Bolagsnamn","Bucket","Valuta","Antal aktier","GAV (SEK)","Pris","Fair value (Idag)","Uppsida %","Värde (SEK)","Anskaffning (SEK)","P/L (SEK)","P/L %"]
     st.dataframe(out[show_cols], use_container_width=True)
 
-    # ------- Kommande utdelningsutbetalningar (robust mot saknade kolumner) -------
+    # ------- Kommande utdelningsutbetalningar (netto i SEK) -------
     st.subheader("🗓️ Kommande utdelningsutbetalningar (netto i SEK)")
 
-    # Läs Data igen & säkerställ kolumner finns för att undvika KeyError
     dd = read_data_df().copy()
     needed_cols = ["Årlig utdelning","Nästa utdelningsdatum","Utdelningsfrekvens","Nästa utdelning (per aktie)","Antal aktier","Valuta","Ticker","Bolagsnamn"]
     for c in needed_cols:
@@ -1620,31 +1716,31 @@ def page_portfolio():
     pays_mask = (pd.to_numeric(dd["Årlig utdelning"], errors="coerce").fillna(0) > 0) | dd["Nästa utdelningsdatum"].notna()
     dd = dd[pays_mask]
 
-    # Säkerställ datum-typ och rulla fram passerade datum i minnet (utan att spara)
-    if dd["Nästa utdelningsdatum"].notna().any():
-        dd["Nästa utdelningsdatum"] = pd.to_datetime(dd["Nästa utdelningsdatum"], errors="coerce").dt.date
+    # Datum-typ och rulla fram passerade datum (i minnet)
+    dd["Nästa utdelningsdatum"] = pd.to_datetime(dd["Nästa utdelningsdatum"], errors="coerce").dt.date
 
     def _rolled_future(d, freq):
-        if not isinstance(d, datetime.date):
-            return None
+        if not isinstance(d, dt.date):
+            return np.nan
+        x = d
         today = today_date()
         safe = 0
-        while d <= today and freq in ("M","Q","S","A") and safe < 24:
-            d = _roll_forward(d, freq)
+        freq = (freq or "").upper()
+        while x <= today and freq in ("M","Q","S","A") and safe < 24:
+            x = _roll_forward(x, freq)
             safe += 1
-        return d
+        return x
 
     dd["Utdelningsfrekvens"] = dd["Utdelningsfrekvens"].fillna("").astype(str).str.upper()
-    dd["Datum"] = dd.apply(lambda r: _rolled_future(r.get("Nästa utdelningsdatum"), str(_nz(r.get("Utdelningsfrekvens"), "")).upper()), axis=1)
+    dd["Datum"] = dd.apply(lambda r: _rolled_future(r.get("Nästa utdelningsdatum"), r.get("Utdelningsfrekvens")), axis=1)
 
     # DPS per aktie nästa gång
     def _next_dps_row(r):
         v = _f(r.get("Nästa utdelning (per aktie)"))
         if v is not None:
             return v
-        # fallback från annual
         annual = _f(r.get("Årlig utdelning"))
-        freq = str(_nz(r.get("Utdelningsfrekvens"), "")).upper()
+        freq   = str(r.get("Utdelningsfrekvens") or "").upper()
         return _dps_from_annual_and_freq(annual, freq)
 
     dd["DPS_nästa"] = dd.apply(_next_dps_row, axis=1)
@@ -1654,9 +1750,9 @@ def page_portfolio():
 
     # Beräkna brutto & netto SEK
     def _net_sek_row(r):
-        ccy = str(_nz(r.get("Valuta"), "USD")).upper()
-        wh = get_withholding_for(ccy, settings)
-        fx = fx_map.get(ccy, 1.0) or 1.0
+        ccy = str(r.get("Valuta") or "USD").upper()
+        wh = get_withholding_for(ccy, get_settings_map())
+        fx = get_fx_map().get(ccy, 1.0) or 1.0
         shares = _f(r.get("Antal aktier")) or 0.0
         dps = _f(r.get("DPS_nästa")) or 0.0
         gross_ccy = dps * shares
@@ -1677,7 +1773,7 @@ def page_portfolio():
     st.dataframe(dd[cols_pay], use_container_width=True)
 
     # Summering nästa 60 dagar
-    horizon = today_date() + timedelta(days=60)
+    horizon = today_date() + dt.timedelta(days=60)
     mask60 = (dd["Datum"] <= horizon)
     tot60 = pd.to_numeric(dd.loc[mask60, "Netto (SEK)"], errors="coerce").sum()
     right.metric("Netto utdelning kommande 60 dagar", _fmt_sek(tot60))
@@ -1774,17 +1870,25 @@ def page_ranking():
     st.dataframe(out[show_cols], use_container_width=True)
 
 # ============================================================
-# Del 3/4 slut — fortsätt med Del 4/4 (Inställningar, Editor, Batch, Main)
+# Del 3/4 slut — fortsätt med Del 4/4 (Inställningar, Editor, Batch & Main)
 # ============================================================
 
 # ============================================================
-# Del 4/4 — Inställningar, Editor, Batch & Main
-#  • Editor: "Hämta & fyll från Yahoo" inkluderar EPS/REV-estimat
-#  • Batch: massuppdatering med fördröjning
-#  • Main: robusta felmeddelanden per sida
+# app.py — Del 4/4
+# Inställningar • Editor • Batch • Main
+# • Alla formulär har form_submit_button() (fix för "Missing Submit Button")
+# • Datumhantering använder datetime som dt och isinstance(..., dt.date)
 # ============================================================
 
-# ---------- Hjälpare ----------
+from __future__ import annotations
+from typing import Any, Dict, Optional, Tuple, List
+import datetime as dt
+import time
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------- Små hjälpare ----------
 def _nan_if_zero(v):
     try:
         f = float(v)
@@ -1825,12 +1929,9 @@ def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: Dict[str,
 
 # ---------- Startup-refresh (valfritt via Settings) ----------
 def _startup_refresh():
-    """Lätt auto-uppdatering av pris/valuta/antal aktier på uppstart om Settings->auto_refresh_on_start='1'."""
+    """Lätt auto-uppdatering vid uppstart om Settings['auto_refresh_on_start']=='1'."""
     s = get_settings_map()
-    try:
-        flag = str(s.get("auto_refresh_on_start","0")).strip()
-    except Exception:
-        flag = "0"
+    flag = str(s.get("auto_refresh_on_start", "0")).strip()
     if flag != "1":
         return
     df = read_data_df()
@@ -1838,7 +1939,7 @@ def _startup_refresh():
         return
     df2 = df.copy()
     for idx, r in df2.iterrows():
-        tkr = str(r.get("Ticker","")).strip().upper()
+        tkr = str(r.get("Ticker", "")).strip().upper()
         if not tkr:
             continue
         try:
@@ -1854,7 +1955,7 @@ def _startup_refresh():
     write_data_df(df2)
 
 # ============================================================
-#                        SIDA: Editor
+#                       SIDA: Editor
 # ============================================================
 def page_editor():
     st.header("📝 Lägg till / Uppdatera bolag")
@@ -1881,7 +1982,7 @@ def page_editor():
     merged = dict(init)
     merged.update({k: v for k, v in st.session_state["editor_prefill"].items() if v is not None})
 
-    st.caption("Tip: Använd **Hämta & fyll från Yahoo** för att auto-populera formuläret (inkl. EPS/REV-estimat). Spara sedan.")
+    st.caption("Tips: Använd **Hämta & fyll från Yahoo** för att auto-populera (inkl. EPS/REV-estimat). Spara sedan.")
 
     with st.form("edit_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
@@ -1927,17 +2028,20 @@ def page_editor():
         prim_idx = prim_choices.index(prim_default) if prim_default in prim_choices else 0
         prim    = h4.selectbox("Primär metod", prim_choices, index=prim_idx)
 
-        # Manuell möjlighet att sätta frekvens/DPS nästa/datum om auto misslyckas
+        # Manuell möjlighet att sätta frekvens/DPS nästa/datum
         j1, j2, j3 = st.columns(3)
-        freq_in = j1.selectbox("Utdelningsfrekvens (M/Q/S/A)", ["", "M","Q","S","A"], index=["","M","Q","S","A"].index(str(_nz(merged.get("Utdelningsfrekvens"), "")).upper()))
-        next_dps = j2.number_input("Nästa utdelning (per aktie)", step=0.0001, value=float(_nz(_f(merged.get("Nästa utdelning (per aktie)")), 0.0)))
+        freq_in = j1.selectbox("Utdelningsfrekvens (M/Q/S/A)", ["", "M","Q","S","A"],
+                               index=["","M","Q","S","A"].index(str(_nz(merged.get("Utdelningsfrekvens"), "")).upper()))
+        next_dps = j2.number_input("Nästa utdelning (per aktie)", step=0.0001,
+                                   value=float(_nz(_f(merged.get("Nästa utdelning (per aktie)")), 0.0)))
         next_dt_default = merged.get("Nästa utdelningsdatum")
         if isinstance(next_dt_default, str):
             try:
                 next_dt_default = pd.to_datetime(next_dt_default, errors="coerce").date()
             except Exception:
                 next_dt_default = None
-        next_dt = j3.date_input("Nästa utdelningsdatum", value=next_dt_default if isinstance(next_dt_default, datetime.date) else None)
+        next_dt = j3.date_input("Nästa utdelningsdatum",
+                                value=next_dt_default if isinstance(next_dt_default, dt.date) else None)
 
         c_left, c_right = st.columns(2)
         fetch_btn = c_left.form_submit_button("🔎 Hämta & fyll från Yahoo")
@@ -1949,7 +2053,7 @@ def page_editor():
             st.warning("Ange en ticker först.")
             st.stop()
 
-        # 1) Snapshot (pris, valuta, TTM-nycklar, EV, shares, P/B, BVPS …)
+        # 1) Snapshot (pris, valuta, TTM-nycklar, EV, shares …)
         snap = fetch_yahoo_snapshot(ticker)
 
         # 2) EPS-estimat (current/next year) + long-term EPS CAGR (trend)
@@ -1962,14 +2066,11 @@ def page_editor():
         comp_name, comp_sector = None, None
         try:
             tk = yf.Ticker(ticker)
-            try:
-                inf = tk.info or {}
-            except Exception:
-                inf = {}
+            inf = tk.info or {}
             comp_name   = inf.get("longName") or inf.get("shortName") or None
             comp_sector = inf.get("sector") or inf.get("industry") or None
         except Exception:
-            comp_name, comp_sector = None, None
+            pass
 
         # 5) Prisfallback via historik
         px = snap.get("price")
@@ -1999,7 +2100,7 @@ def page_editor():
             "BVPS": snap.get("bvps"),
             "Net debt": snap.get("net_debt"),
             "Utestående aktier": snap.get("shares"),
-            # Estimat/tilväxt:
+            # Estimat/tillväxt:
             "EPS 1Y": yh_eps.get("eps_1y"),
             "EPS 2Y": yh_eps.get("eps_2y"),
             "Rev CAGR": revcg_yh.get("rev_cagr"),
@@ -2039,11 +2140,11 @@ def page_editor():
             "EPS 1Y": _n(eps1y),
             "EPS 2Y": _n(eps2y),
             "Rev CAGR": _n(revcg),
-            "EPS CAGR": np.nan,  # beräknas i analysknappen vid behov
+            "EPS CAGR": np.nan,  # beräknas i analys/knapp vid behov
             "Årlig utdelning": _n(dps),
             "Utdelning CAGR": _n(dpscg),
             "Utdelningsfrekvens": (freq_in if freq_in else np.nan),
-            "Nästa utdelningsdatum": next_dt if next_dt else np.nan,
+            "Nästa utdelningsdatum": next_dt if isinstance(next_dt, dt.date) else np.nan,
             "Nästa utdelning (per aktie)": _n(next_dps),
             "Primär metod": prim,
             "Senast auto uppdaterad": "",
@@ -2102,10 +2203,14 @@ def page_settings():
         st.success("Källskatt uppdaterad.")
 
     st.subheader("Modellparametrar")
-    p1, p2 = st.columns(2)
-    pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05, value=float(settings.get("pe_anchor_weight_ttm","0.5")))
-    decay = p2.number_input("Multipel-decay per år (0..1)", min_value=0.0, max_value=1.0, step=0.01, value=float(settings.get("multiple_decay","0.10")))
-    if st.button("💾 Spara modellparametrar"):
+    with st.form("model_form"):
+        p1, p2 = st.columns(2)
+        pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05,
+                                value=float(settings.get("pe_anchor_weight_ttm","0.5")))
+        decay = p2.number_input("Multipel-decay per år (0..1)", min_value=0.0, max_value=1.0, step=0.01,
+                                value=float(settings.get("multiple_decay","0.10")))
+        p_submit = st.form_submit_button("💾 Spara modellparametrar")
+    if p_submit:
         s = _read_df(SETTINGS_TITLE)
         if s.empty: s = pd.DataFrame(columns=SETTINGS_COLUMNS)
         def setv(sdf, k, v):
@@ -2130,7 +2235,7 @@ def page_settings():
 # ============================================================
 def page_batch():
     st.header("🧰 Batch-uppdatering")
-    df       = read_data_df()
+    df = read_data_df()
     if df.empty:
         st.info("Inga bolag i Data.")
         return
@@ -2228,7 +2333,7 @@ def run_main_ui():
     except KeyError as e:
         st.error(f"💥 Nyckelfel (saknad kolumn eller fält): {e}. Kontrollera att bladet **Data** har alla kolumner enligt schema.")
     except Exception as e:
-        st.error(f"💥 Ov\u00e4ntat fel i sidan '{page}': {e}")
+        st.error(f"💥 Oväntat fel i sidan '{page}': {e}")
 
 def main():
     run_main_ui()
