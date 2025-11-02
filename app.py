@@ -403,9 +403,10 @@ if 'PREFER_ORDER' not in globals():
     PREFER_ORDER = METHOD_LIST
 # ===== slut hotfix =====
 
-# app.py — Del 2/4
+# app.py — Del 2/4 (A av B)
 # ============================================================
-# Datainsamling (Yahoo primärt, Finnhub fallback) + beräkningsmotor & utdelning
+# Datainsamling (Yahoo primärt, valfritt Finnhub) + beräkningsmotor & utdelning
+# — Robust mot saknade fält, flera källor, och med dämpade fallback-regler —
 # ============================================================
 
 import requests
@@ -431,6 +432,16 @@ def _parse_growth_pct(v) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+def _clamp(v: Optional[float], lo: Optional[float]=None, hi: Optional[float]=None) -> Optional[float]:
+    x = _f(v)
+    if x is None:
+        return None
+    if lo is not None and x < lo:
+        x = lo
+    if hi is not None and x > hi:
+        x = hi
+    return x
 
 # -------------------------
 # Yahoo (yfinance) – robust snapshot med källmarkering
@@ -534,11 +545,10 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
     """
     Plockar EPS currentYear/nextYear från Yahoo earnings trend (earningsEstimate.avg).
     Försöker härleda 2Y via långsiktig EPS-growth ('next5Years') om den finns.
-    Returnerar: {"eps_1y": float|None, "eps_2y": float|None, "eps_cagr_long": float|None, "source": "yahoo_trend"|"none"}
+    Returnerar: {"eps_1y": float|None, "eps_2y": float|None, "eps_cagr_long": float|None, "source": "..."}
     """
     try:
         tk = yf.Ticker(ticker)
-        # yfinance ≥0.2.x brukar exponera .get_earnings_trend() eller .earnings_trend
         try:
             trend = tk.get_earnings_trend()
         except Exception:
@@ -547,139 +557,173 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
             return {"eps_1y": None, "eps_2y": None, "eps_cagr_long": None, "source": "none"}
 
         df = trend.copy()
-        # Normalisera kolumnnamn (kan vara multi/flattened)
+        # Flatten & lower
         df.columns = [str(c).lower() for c in df.columns]
-        if "period" in df.columns:
-            # Hämta EPS 1Y (nextYear)
-            eps_1y = None
-            eps_2y = None
-            eps_cagr_long = None
-
-            # Försök hitta earningsEstimate.avg
-            def get_eps_avg(rowname: str) -> Optional[float]:
-                sub = df[df["period"].astype(str).str.lower() == rowname]
-                if sub.empty:
-                    return None
-                row = sub.iloc[0]
-                # Sök några möjliga kolumnetiketter:
-                for k in ["earningsestimate.avg","earningsestimate_average","earningsestimate.avg.0","earningsestimate_avg","epsestimate.avg","epsestimate_average"]:
-                    if k in df.columns:
-                        return _safe_float(row.get(k))
-                # Alternativ väg: 'epsTrend.current' finns ibland
-                for k in ["epstrend.current","epstrend_current","epstrend.mean"]:
-                    if k in df.columns:
-                        return _safe_float(row.get(k))
-                return None
-
-            # 'nextYear' är vanligt i Yahoo-trend
-            eps_1y = get_eps_avg("nextyear")
-            # 'currentYear' ibland finns – kan hjälpa att härleda tillväxt om 1Y saknas
-            eps_cy = get_eps_avg("currentyear")
-
-            # Plocka långsiktig growth (next5Years) om finns
-            def get_growth(rowname: str) -> Optional[float]:
-                sub = df[df["period"].astype(str).str.lower() == rowname]
-                if sub.empty:
-                    return None
-                row = sub.iloc[0]
-                for k in ["growth","growthrate","longtermgrowthrate","epsgrowth"]:
-                    if k in df.columns:
-                        g = _parse_growth_pct(row.get(k))
-                        if g is not None:
-                            return g
-                return None
-
-            eps_cagr_long = get_growth("next5years")
-
-            # Härled 2Y om möjlig tillväxt finns
-            if _pos(eps_1y) and eps_cagr_long is not None:
-                eps_2y = float(eps_1y) * (1.0 + float(eps_cagr_long))
-            else:
-                eps_2y = None
-
-            return {"eps_1y": eps_1y, "eps_2y": eps_2y, "eps_cagr_long": eps_cagr_long, "source": "yahoo_trend"}
-        else:
+        if "period" not in df.columns:
             return {"eps_1y": None, "eps_2y": None, "eps_cagr_long": None, "source": "none"}
+
+        def pick_row(lbls: List[str]) -> Optional[pd.Series]:
+            m = df["period"].astype(str).str.lower()
+            for l in lbls:
+                hit = df[m == l]
+                if not hit.empty:
+                    return hit.iloc[0]
+            return None
+
+        row_next  = pick_row(["nextyear","next year"])
+        row_cur   = pick_row(["currentyear","current year"])
+        row_long  = pick_row(["next5years","next 5 years","longterm"])
+
+        def eps_avg(row: Optional[pd.Series]) -> Optional[float]:
+            if row is None: return None
+            for k in ["earningsestimate.avg","earningsestimate_average","epsestimate.avg","epsestimate_average",
+                      "epstrend.current","epstrend.mean","epstrend_current"]:
+                if k in df.columns:
+                    return _safe_float(row.get(k))
+            # ibland ligger värdet direkt under 'mean'
+            return _safe_float(row.get("mean"))
+
+        eps_1y = eps_avg(row_next)
+        eps_cy = eps_avg(row_cur)
+
+        def growth(row: Optional[pd.Series]) -> Optional[float]:
+            if row is None: return None
+            for k in ["growth","growthrate","longtermgrowthrate","epsgrowth"]:
+                g = _parse_growth_pct(row.get(k))
+                if g is not None:
+                    return g
+            return None
+
+        eps_cagr_long = growth(row_long)
+
+        # Härled 2Y via långsiktig CAGR om möjligt
+        eps_2y = None
+        if _pos(eps_1y) and eps_cagr_long is not None:
+            eps_2y = float(eps_1y) * (1.0 + float(eps_cagr_long))
+
+        # Sista fallback: om 1Y saknas men currentYear + long-term finns → 1Y via ett steg upp
+        if eps_1y is None and _pos(eps_cy) and eps_cagr_long is not None:
+            eps_1y = float(eps_cy) * (1.0 + float(eps_cagr_long))
+
+        return {"eps_1y": eps_1y, "eps_2y": eps_2y, "eps_cagr_long": eps_cagr_long, "source": "yahoo_trend"}
     except Exception:
         return {"eps_1y": None, "eps_2y": None, "eps_cagr_long": None, "source": "none"}
 
 # -------------------------
-# Yahoo – Revenue CAGR från årsredovisade intäkter
+# Yahoo – Revenue CAGR från års- ELLER kvartalsdata (flera vägar)
 # -------------------------
+def _pick_totalrevenue_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    """
+    Tar yfinance income statement DF och försöker extrahera Total Revenue-serien,
+    oavsett om det ligger som index eller kolumn (olika versioner förekommer).
+    """
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return None
+    x = df.copy()
+
+    # Fall 1: klassiskt – 'TotalRevenue' i index
+    for key in ["TotalRevenue", "Total Revenue", "Revenue", "TotalRevenueUSD"]:
+        if key in x.index:
+            return pd.to_numeric(pd.Series(x.loc[key]).dropna(), errors="coerce").dropna()
+
+    # Fall 2: nyare – 'TotalRevenue' som kolumn
+    for key in ["TotalRevenue", "Total Revenue", "Revenue", "TotalRevenueUSD"]:
+        if key in x.columns:
+            return pd.to_numeric(pd.Series(x[key]).dropna(), errors="coerce").dropna()
+
+    # Fall 3: fuzzy – leta efter rad/kolumn som innehåller 'total' och 'revenue'
+    def _match(s: str) -> bool:
+        s2 = s.replace(" ", "").lower()
+        return "revenue" in s2 and ("total" in s2 or s2 == "revenue")
+
+    for idx in list(x.index):
+        try:
+            if _match(str(idx)):
+                return pd.to_numeric(pd.Series(x.loc[idx]).dropna(), errors="coerce").dropna()
+        except Exception:
+            pass
+    for col in list(x.columns):
+        try:
+            if _match(str(col)):
+                return pd.to_numeric(pd.Series(x[col]).dropna(), errors="coerce").dropna()
+        except Exception:
+            pass
+    return None
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yahoo_rev_cagr(ticker: str, min_years: int = 3, max_years: int = 5) -> Dict[str, Optional[float]]:
     """
-    Försöker hämta annual income statement och beräkna Rev CAGR över 3–5 år (så långt det går).
-    Returnerar {"rev_cagr": float|None, "years": int|None, "source": "yahoo_financials"|"none"}.
+    Beräknar Rev CAGR över 3–5 år via annual statements; om saknas,
+    aggregerar 8–12 kvartal och skattar CAGR över ~2–3 år.
     """
     try:
         tk = yf.Ticker(ticker)
+        # --- Annual ---
+        inc_a = None
         try:
-            # nyare yfinance
-            inc = tk.get_income_stmt(freq="annual")
+            inc_a = tk.get_income_stmt(freq="annual")
         except Exception:
-            inc = getattr(tk, "income_stmt", None)
+            inc_a = getattr(tk, "income_stmt", None)
 
-        if inc is None or (hasattr(inc, "empty") and inc.empty):
-            return {"rev_cagr": None, "years": None, "source": "none"}
+        ser = _pick_totalrevenue_series(inc_a) if inc_a is not None else None
+        if ser is not None and not ser.empty:
+            # sortera på datum/år stigande
+            try:
+                s2 = ser.copy()
+                s2.index = pd.to_datetime(s2.index, errors="coerce")
+                s2 = s2.sort_index()
+            except Exception:
+                s2 = ser.sort_index()
 
-        df = inc.copy()
-        # Rader som 'TotalRevenue' eller liknande
-        # Stötta både index som rader och kolumner–beroende på version
-        total_rev = None
-        if "TotalRevenue" in df.index:
-            total_rev = df.loc["TotalRevenue"]
-        elif "Total Revenue" in df.index:
-            total_rev = df.loc["Total Revenue"]
-        else:
-            # sök fuzzy
-            for idx in df.index:
-                s = str(idx).replace(" ", "").lower()
-                if "totalrevenue" in s or "revenue" == s:
-                    total_rev = df.loc[idx]
-                    break
+            vals = s2.dropna().astype(float).values.tolist()
+            if len(vals) >= 2:
+                n = min(max_years, len(vals))
+                vals = vals[-n:]
+                years = len(vals) - 1
+                if years >= (min_years - 1):
+                    try:
+                        cagr = (vals[-1] / vals[0]) ** (1.0 / years) - 1.0
+                        cagr = _clamp(cagr, lo=-0.50, hi=1.00)  # sanitet
+                        return {"rev_cagr": cagr, "years": years, "source": "yahoo_fin_annual"}
+                    except Exception:
+                        pass
 
-        if total_rev is None:
-            return {"rev_cagr": None, "years": None, "source": "none"}
-
-        # Kolumner är år (datetime/str). Hämta senaste max_years värden
-        ser = pd.to_numeric(pd.Series(total_rev).dropna(), errors="coerce").dropna()
-        if ser.empty:
-            return {"rev_cagr": None, "years": None, "source": "none"}
-
-        # sortera på kolumnnamn som datum/år
+        # --- Quarterly → årlig aggregation (fallback) ---
+        inc_q = None
         try:
-            ordered = ser.copy()
-            ordered.index = pd.to_datetime(ordered.index, errors="coerce")
-            ordered = ordered.sort_index()
+            inc_q = tk.get_income_stmt(freq="quarterly")
         except Exception:
-            ordered = ser
+            inc_q = getattr(tk, "quarterly_income_stmt", None)
 
-        vals = ordered.dropna().values.tolist()
-        if len(vals) < 2:
-            return {"rev_cagr": None, "years": None, "source": "none"}
+        ser_q = _pick_totalrevenue_series(inc_q) if inc_q is not None else None
+        if ser_q is not None and not ser_q.empty:
+            q = ser_q.copy()
+            try:
+                q.index = pd.to_datetime(q.index, errors="coerce")
+                q = q.sort_index()
+            except Exception:
+                q = q.sort_index()
+            # rullande 4Q TTM som proxy för år
+            ttm = q.rolling(4).sum().dropna()
+            if len(ttm) >= 2:
+                # välj 3–5 års “årskanter” om möjligt; annars så långt det går
+                vals = ttm.values.tolist()
+                n = min(max_years, len(vals))
+                vals = vals[-n:]
+                years = len(vals) - 1
+                if years >= 1:
+                    try:
+                        cagr = (vals[-1] / vals[0]) ** (1.0 / years) - 1.0
+                        cagr = _clamp(cagr, lo=-0.50, hi=1.00)
+                        return {"rev_cagr": cagr, "years": years, "source": "yahoo_fin_quarterly_ttm"}
+                    except Exception:
+                        pass
 
-        # Begränsa till 3–5 år bakåt om möjligt
-        n = min(max_years, len(vals))
-        # Ta sista n
-        vals = vals[-n:]
-        n_years = len(vals) - 1
-        if n_years < 1 or n_years < min_years-1:
-            # för kort historik
-            return {"rev_cagr": None, "years": len(vals), "source": "yahoo_financials"}
-
-        try:
-            cagr = (vals[-1] / vals[0]) ** (1.0 / n_years) - 1.0
-        except Exception:
-            cagr = None
-
-        return {"rev_cagr": cagr, "years": n_years, "source": "yahoo_financials"}
+        return {"rev_cagr": None, "years": None, "source": "none"}
     except Exception:
         return {"rev_cagr": None, "years": None, "source": "none"}
 
-# -------------------------
-# Finnhub (valfritt) – EPS-estimat 1–2 år (fallback)
-# -------------------------
+# --------- Finnhub (valfritt) – EPS-estimat 1–2 år (fallback) ----------
 def _get_finnhub_key() -> Optional[str]:
     return (_env_or_secret("FINNHUB_API_KEY")
             or _env_or_secret("FINNHUB_TOKEN")
@@ -847,7 +891,7 @@ def forecast_dividends_net_sek(
     return {"y1": net(1), "y2": net(2), "y3": net(3)}
 
 # -------------------------
-# Huvudmotor per rad
+# Huvudmotor per rad (med robusta fallbacks och lätt throttling)
 # -------------------------
 def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float]) -> Tuple[pd.DataFrame, str, Dict[str, Any]]:
     """
@@ -856,16 +900,18 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     meta innehåller: currency, price, shares_out, net_debt, pe_anchor, decay, sources{}
     """
     ticker = str(row.get("Ticker", "")).strip()
-    # 1) Live-data
-    snap = fetch_yahoo_snapshot(ticker)
-    time.sleep(0.25)  # mild throttling för att undvika 429
-    yh_eps = fetch_yahoo_eps_estimates(ticker)
-    time.sleep(0.15)
-    revcg_yh = fetch_yahoo_rev_cagr(ticker)
-    # Finnhub (fallback)
-    fh = fetch_finnhub_estimates(ticker)
+    if not ticker:
+        return pd.DataFrame(columns=["Metod","Idag","1 år","2 år","3 år"]), "saknar ticker", {}
 
-    # 2) Inputs (med fallback från Data-bladet)
+    # --- Hämtningar (mild throttling för att undvika 429 och säkerställa separata calls per bolag) ---
+    snap   = fetch_yahoo_snapshot(ticker)
+    time.sleep(0.20 + 0.05 * float(np.random.rand()))
+    yh_eps = fetch_yahoo_eps_estimates(ticker)
+    time.sleep(0.12 + 0.05 * float(np.random.rand()))
+    revcg  = fetch_yahoo_rev_cagr(ticker)
+    fh     = fetch_finnhub_estimates(ticker)
+
+    # --- Inputs (med fallback från Data-bladet) ---
     price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
     currency = str(_nz(snap.get("currency"), row.get("Valuta") or "USD")).upper()
     shares   = _pos(_nz(snap.get("shares"), row.get("Utestående aktier")))
@@ -899,10 +945,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     if eps_2y_est is None and _pos(eps_1y_est) and eps_cagr is not None:
         eps_2y_est = float(eps_1y_est) * (1.0 + float(eps_cagr))
 
-    # Rev CAGR – Data → Yahoo financials → None
+    # Rev CAGR – Data → Yahoo (annual→quarterly fallback) → None
     rev_cagr   = _f(row.get("Rev CAGR"))
-    if rev_cagr is None and revcg_yh.get("rev_cagr") is not None:
-        rev_cagr = _f(revcg_yh.get("rev_cagr"))
+    if rev_cagr is None and revcg.get("rev_cagr") is not None:
+        rev_cagr = _f(revcg.get("rev_cagr"))
 
     # 3) Härled EPS om saknas men PE+price finns
     eps_ttm, src_eps_ttm, eps_1y_est, src_eps_1y = _derive_eps_from_pe_if_missing(
@@ -977,22 +1023,21 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
         "3 år": _price_from_pb(pb3, bvps),
     })
 
-    # Platshållare för metoder som kräver per-aktie-tal vi ofta inte kan hämta automatiskt
+    # Platshållare (behöver per-aktie-tal vi sällan har auto)
     for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
         methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
     # 7) Sanity + META
-    src = snap.get("sources", {})
-    # märk upp vilka EPS/Rev-källor som faktiskt användes
-    eps1_src = "yahoo_trend" if _pos(yh_eps.get("eps_1y")) else ("finnhub" if _pos(fh.get("eps_1y")) else (src.get("eps_1y","") or "sheet/derived" if _pos(row.get("EPS 1Y")) else src_eps_1y or "sheet/derived"))
+    src = snap.get("sources", {}) or {}
+    eps1_src = "yahoo_trend" if _pos(yh_eps.get("eps_1y")) else ("finnhub" if _pos(fh.get("eps_1y")) else (src.get("eps_1y","") or "sheet/derived" if _pos(row.get("EPS 1Y")) else "derived"))
     eps2_src = "yahoo_trend" if _pos(yh_eps.get("eps_2y")) else ("finnhub" if _pos(fh.get("eps_2y")) else ("sheet/derived" if _pos(row.get("EPS 2Y")) or _pos(eps_2y_est) else "none"))
-    revc_src = "yahoo_financials" if revcg_yh.get("rev_cagr") is not None else ("sheet" if _f(row.get("Rev CAGR")) is not None else "none")
+    revc_src = "yahoo_fin_annual" if (revcg.get("source") == "yahoo_fin_annual") else ("yahoo_fin_quarterly_ttm" if revcg.get("source") == "yahoo_fin_quarterly_ttm" else ("sheet" if _f(row.get("Rev CAGR")) is not None else "none"))
 
     sanity = (
         f"price={'ok' if price else '—'}({src.get('price','?')}), "
-        f"eps_ttm={'ok' if e0 else '—'}({src.get('eps_ttm','?') or src_eps_ttm}), "
+        f"eps_ttm={'ok' if e0 else '—'}({src.get('eps_ttm','?') or 'derived' if src_eps_ttm else '—'}), "
         f"eps_1y={'ok' if e1 else '—'}({eps1_src}), "
         f"eps_2y={'ok' if e2 else '—'}({eps2_src}), "
         f"rev_ttm={'ok' if r0 else '—'}({src.get('revenue_ttm','?')}), "
@@ -1096,7 +1141,7 @@ def _save_primary_method_to_data(ticker: str, method: str):
         return
     if "Primär metod" not in df.columns:
         df["Primär metod"] = np.nan
-    mask = df["Ticker"].astype(str).str.upper() == str(ticker).upper()
+    mask = df["Ticker"].astype(str).str.strip().str.upper() == str(ticker).strip().upper()
     if not mask.any():
         st.warning(f"{ticker}: fanns inte i Data-bladet.")
         return
@@ -1104,7 +1149,7 @@ def _save_primary_method_to_data(ticker: str, method: str):
     write_data_df(df)
 
 # ---------- Spara riktkurser till Resultat ----------
-def _save_targets_to_result(ticker: str, currency: str, method: Optional[str],
+def _save_targets_to_result(ticker: str, currency: str, method: Optional[float],
                             t0: Optional[float], t1: Optional[float], t2: Optional[float], t3: Optional[float]):
     res = _read_df(RESULT_TITLE)
     row = {
@@ -1126,7 +1171,7 @@ def _save_targets_to_result(ticker: str, currency: str, method: Optional[str],
             cols.append(k)
             res[k] = np.nan
     # skriv över senaste rad för ticker om den finns, annars append
-    mask = res["Ticker"].astype(str).str.upper() == str(ticker).upper()
+    mask = res["Ticker"].astype(str).str.strip().str.upper() == str(ticker).strip().upper()
     if mask.any():
         idx = res.index[mask][-1]
         for k, v in row.items():
@@ -1156,7 +1201,12 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
     # UI: välj metod
     st.caption("Välj värderingssätt (primär metod). Tabellen visar alla metoder under.")
     method_choices = list(met_df["Metod"].astype(str))
-    method_sel = st.selectbox("Primär metod", method_choices, index=method_choices.index(default_method) if default_method in method_choices else 0, key=f"method_{tkr}")
+    method_sel = st.selectbox(
+        "Primär metod",
+        method_choices,
+        index=method_choices.index(default_method) if default_method in method_choices else 0,
+        key=f"method_{tkr}"
+    )
 
     # Targets för vald metod
     row_sel = met_df[met_df["Metod"] == method_sel].iloc[0]
@@ -1230,7 +1280,7 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
     if c3.button("♻️ Uppdatera EPS 1Y/CAGR i Data", key=f"upd_est_{tkr}"):
         # Enkel uppdatering: räkna om EPS CAGR om ttm + 1y finns (och skriv in eps 1y)
         df = read_data_df()
-        mask = df["Ticker"].astype(str).str.upper() == tkr
+        mask = df["Ticker"].astype(str).str.strip().str.upper() == tkr
         if mask.any():
             e0 = meta.get("eps_path", {}).get("ttm")
             e1 = meta.get("eps_path", {}).get("y1")
@@ -1295,10 +1345,11 @@ def page_analysis():
             up = None
             if _pos(price) and _pos(t0):
                 up = float(t0)/float(price) - 1.0
-            scored.append((r.get("Ticker"), up if up is not None else -9e9, {"method": method, "t0": t0, "price": price}, r))
+            scored.append((str(r.get("Ticker")).strip().upper(), up if up is not None else -9e9, {"method": method, "t0": t0, "price": price}, r))
         except Exception:
-            scored.append((r.get("Ticker"), -9e9, {"method": None, "t0": None, "price": None}, r))
+            scored.append((str(r.get("Ticker")).strip().upper(), -9e9, {"method": None, "t0": None, "price": None}, r))
         progress.progress((i+1)/len(q))
+        time.sleep(0.03)  # liten jitter för stabila externa anrop
     progress.empty()
 
     # Sortera: störst uppsida först
@@ -1335,7 +1386,7 @@ def page_analysis():
 
 # app.py — Del 4/4
 # ============================================================
-# Sidor: Editor / Ranking / Settings / Batch
+# Sidor: Editor / Ranking / Inställningar / Batch
 # Snapshot-funktion och main()
 # ============================================================
 
@@ -1420,21 +1471,21 @@ def page_editor():
 
         e1, e2, e3, e4 = st.columns(4)
         rev_ttm   = e1.number_input("Rev TTM", step=1000.0, value=float(_nz(_f(merged.get("Rev TTM")), 0.0)))
-        ebitda_t  = e2.number_input("EBITDA TTM (kan vara negativ)", value=float(_nz(_f(merged.get("EBITDA TTM")), 0.0)))
-        eps_ttm   = e3.number_input("EPS TTM (kan vara negativ)", value=float(_nz(_f(merged.get("EPS TTM")), 0.0)))
-        net_debt  = e4.number_input("Net debt (kan vara negativ)", value=float(_nz(_f(merged.get("Net debt")), 0.0)))
+        ebitda_t  = e2.number_input("EBITDA TTM (kan vara negativ)", step=0.01, value=float(_nz(_f(merged.get("EBITDA TTM")), 0.0)))
+        eps_ttm   = e3.number_input("EPS TTM (kan vara negativ)", step=0.01, value=float(_nz(_f(merged.get("EPS TTM")), 0.0)))
+        net_debt  = e4.number_input("Net debt (kan vara negativ)", step=1000.0, value=float(_nz(_f(merged.get("Net debt")), 0.0)))
 
         f1, f2, f3, f4 = st.columns(4)
         pe_ttm   = f1.number_input("PE TTM", min_value=0.0, step=0.01, value=float(_nz(_f(merged.get("PE TTM")), 0.0)))
         pe_fwd   = f2.number_input("PE FWD", min_value=0.0, step=0.01, value=float(_nz(_f(merged.get("PE FWD")), 0.0)))
         ev_rev   = f3.number_input("EV/Revenue", min_value=0.0, step=0.01, value=float(_nz(_f(merged.get("EV/Revenue")), 0.0)))
-        ev_ebit  = f4.number_input("EV/EBITDA", step=0.01, value=float(_nz(_f(merged.get("EV/EBITDA")), 0.0)))
+        ev_ebit  = f4.number_input("EV/EBITDA (kan vara negativ)", step=0.01, value=float(_nz(_f(merged.get("EV/EBITDA")), 0.0)))
 
         g1, g2, g3, g4 = st.columns(4)
         pb      = g1.number_input("P/B", min_value=0.0, step=0.01, value=float(_nz(_f(merged.get("P/B")), 0.0)))
         bvps    = g2.number_input("BVPS", step=0.01, value=float(_nz(_f(merged.get("BVPS")), 0.0)))
-        eps1y   = g3.number_input("EPS 1Y (estimat)", value=float(_nz(_f(merged.get("EPS 1Y")), 0.0)))
-        eps2y   = g4.number_input("EPS 2Y (estimat)", value=float(_nz(_f(merged.get("EPS 2Y")), 0.0)))
+        eps1y   = g3.number_input("EPS 1Y (estimat)", step=0.01, value=float(_nz(_f(merged.get("EPS 1Y")), 0.0)))
+        eps2y   = g4.number_input("EPS 2Y (estimat)", step=0.01, value=float(_nz(_f(merged.get("EPS 2Y")), 0.0)))
 
         h1, h2, h3, h4 = st.columns(4)
         revcg   = h1.number_input("Rev CAGR", step=0.001, value=float(_nz(_f(merged.get("Rev CAGR")), 0.0)))
@@ -1578,7 +1629,7 @@ def page_ranking():
                 "Fair value (Idag)": fair_today,
                 "Uppsida %": upside,
             })
-            time.sleep(0.15)
+            time.sleep(0.10)
         except Exception:
             rows.append({
                 "Ticker": r.get("Ticker"),
@@ -1596,7 +1647,7 @@ def page_ranking():
     st.dataframe(out, use_container_width=True)
 
 # ============================================================
-#                     SIDA: Settings
+#                     SIDA: Inställningar
 # ============================================================
 def page_settings():
     st.header("⚙️ Inställningar")
