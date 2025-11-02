@@ -52,7 +52,7 @@ def now_stamp() -> str:
 
 def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
-    if v: 
+    if v:
         return v
     try:
         return st.secrets.get(key, default)
@@ -86,18 +86,18 @@ def _with_backoff(callable_fn, *args, **kwargs):
                 continue
             raise
         except Exception:
-            if i == 5: 
+            if i == 5:
                 raise
             time.sleep(delay)
             delay *= 1.6
 
 def _f(x) -> Optional[float]:
     try:
-        if x is None: 
+        if x is None:
             return None
         if isinstance(x, str):
             s = x.strip().replace(" ", "").replace(",", ".")
-            if s == "": 
+            if s == "":
                 return None
             v = float(s)
         else:
@@ -297,7 +297,7 @@ FX_PAIRS = {"USD":"USDSEK=X","EUR":"EURSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X",
 def _fetch_fx_from_yahoo() -> Dict[str, float]:
     out = {"SEK":1.0}
     for code, pair in FX_PAIRS.items():
-        if pair is None: 
+        if pair is None:
             continue
         try:
             t = yf.Ticker(pair)
@@ -500,7 +500,7 @@ def _clamp(val: Optional[float], lo: float, hi: float) -> Optional[float]:
     except Exception:
         return None
 
-# Rimlighets-spärrar (kan flyttas till Settings senare om du vill styra från UI)
+# Rimlighets-spärrar (kan styras via Settings i framtiden)
 REV_CAGR_MIN = -0.10   # -10 %
 REV_CAGR_MAX =  0.35   # +35 %
 EPS_CAGR_MIN = -0.20   # -20 %
@@ -608,7 +608,7 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
     """
     Plockar EPS currentYear/nextYear från Yahoo earnings trend (earningsEstimate.avg).
     Försöker härleda 2Y via långsiktig EPS-growth ('next5Years') om den finns.
-    Returnerar: {"eps_1y": float|None, "eps_2y": float|None, "eps_cagr_long": float|None, "source": "yahoo_trend"|"none"}
+    Returnerar: {"eps_1y": float|None, "eps_2y": float|None, "eps_cagr_long": float|None, "source": "..."}
     """
     try:
         tk = yf.Ticker(ticker)
@@ -630,8 +630,10 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
             if sub.empty:
                 return None
             row = sub.iloc[0]
-            # Vanliga fält-namn (yfinance varierar mellan versioner)
-            for k in ["earningsestimate.avg","earningsestimate_average","earningsestimate.avg.0","earningsestimate_avg","epsestimate.avg","epsestimate_average","epstrend.current","epstrend.mean"]:
+            # Vanliga fältnamn (yfinance varierar mellan versioner)
+            for k in ["earningsestimate.avg","earningsestimate_average","earningsestimate.avg.0",
+                      "earningsestimate_avg","epsestimate.avg","epsestimate_average",
+                      "epstrend.current","epstrend.mean"]:
                 if k in df.columns:
                     return _safe_float(row.get(k))
             return None
@@ -649,9 +651,10 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
             return None
 
         eps_1y = get_eps_avg("nextyear")
-        eps_cy = get_eps_avg("currentyear")  # ibland användbart för derivat
+        eps_cy = get_eps_avg("currentyear")  # ibland användbart
         eps_cagr_long = get_growth("next5years")
 
+        # Härled 2Y via långsiktig CAGR om möjligt
         eps_2y = None
         if _pos(eps_1y) and eps_cagr_long is not None:
             eps_2y = float(eps_1y) * (1.0 + float(eps_cagr_long))
@@ -666,8 +669,8 @@ def fetch_yahoo_eps_estimates(ticker: str) -> Dict[str, Optional[float]]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_yahoo_rev_cagr(ticker: str, min_years: int = 3, max_years: int = 5) -> Dict[str, Optional[float]]:
     """
-    Försöker hämta annual income statement och beräkna Rev CAGR över 3–5 år (så långt det går).
-    Returnerar {"rev_cagr": float|None, "years": int|None, "source": "yahoo_financials"|"none"}.
+    Hämtar annual income statement och beräknar Rev CAGR över 3–5 år (så långt det går).
+    Returnerar {"rev_cagr": float|None, "years": int|None, "source": "..."}.
     """
     try:
         tk = yf.Ticker(ticker)
@@ -739,7 +742,7 @@ def _get_finnhub_key() -> Optional[str]:
 def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
     """
     Fallback: EPS-estimat 1–2 år framåt från Finnhub om nyckel finns.
-    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "finnhub"|"none"}
+    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "..."}
     """
     key = _get_finnhub_key()
     if not key:
@@ -843,6 +846,12 @@ def _derive_eps_from_pe_if_missing(price: Optional[float], pe_ttm: Optional[floa
     return eps_ttm, src_ttm, eps_1y, src_1y
 
 def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optional[float], eps_cagr: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Återinsatt EPS-beräkning:
+      • Saknas 1Y men vi har TTM + CAGR → räkna fram 1Y
+      • Saknas 2Y men vi har 1Y + CAGR   → räkna fram 2Y
+      • 3Y = 2Y * (1 + CAGR) om möjligt
+    """
     e0 = _pos(eps_ttm)
     e1 = _pos(eps_1y)
     e2 = _pos(eps_2y)
@@ -872,7 +881,7 @@ def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optio
     if rev0 is None or rev1 is None:
         # ok – lås EBITDA oförändrat om vi saknar intäkts-bana
         return e0, e0, e0, e0
-    def scale(r): 
+    def scale(r):
         try:
             return (e0 * (r / rev0)) if (r and rev0) else e0
         except Exception:
@@ -901,7 +910,7 @@ def forecast_dividends_net_sek(
     return {"y1": net(1), "y2": net(2), "y3": net(3)}
 
 # -------------------------
-# Huvudmotor per rad (inkl. rimlighets-spärrar på CAGR)
+# Huvudmotor per rad (inkl. clamps)
 # -------------------------
 def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float]) -> Tuple[pd.DataFrame, str, Dict[str, Any]]:
     """
@@ -912,14 +921,14 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     ticker = str(row.get("Ticker", "")).strip()
     # 1) Live-data
     snap = fetch_yahoo_snapshot(ticker)
-    time.sleep(0.25)  # mild throttling för att undvika 429
+    time.sleep(0.25)  # mild throttling
     yh_eps = fetch_yahoo_eps_estimates(ticker)
     time.sleep(0.15)
     revcg_yh = fetch_yahoo_rev_cagr(ticker)
     # Finnhub (fallback)
     fh = fetch_finnhub_estimates(ticker)
 
-    # 2) Inputs (med fallback från Data-bladet)
+    # 2) Inputs (fallback från Data-bladet)
     price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
     currency = str(_nz(snap.get("currency"), row.get("Valuta") or "USD")).upper()
     shares   = _pos(_nz(snap.get("shares"), row.get("Utestående aktier")))
@@ -939,7 +948,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     eps_1y_est = _pos(_nz(yh_eps.get("eps_1y"), _nz(fh.get("eps_1y"), row.get("EPS 1Y"))))
     eps_2y_est = _pos(_nz(yh_eps.get("eps_2y"), _nz(fh.get("eps_2y"), row.get("EPS 2Y"))))
 
-    # EPS CAGR – Data → Yahoo long-term → härledd från TTM→1Y → None
+    # EPS CAGR – Data → Yahoo long-term → härledd TTM→1Y → None
     eps_cagr_raw   = _f(row.get("EPS CAGR"))
     if eps_cagr_raw is None and yh_eps.get("eps_cagr_long") is not None:
         eps_cagr_raw = _f(yh_eps.get("eps_cagr_long"))
@@ -950,7 +959,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
             eps_cagr_raw = None
     eps_cagr = _clamp(eps_cagr_raw, EPS_CAGR_MIN, EPS_CAGR_MAX)
 
-    # Om eps_2y fortfarande saknas men vi har en (clampad) CAGR → extrapolera
+    # Om eps_2y saknas men vi har 1Y + (clampad) CAGR → extrapolera (återinsatt)
     if eps_2y_est is None and _pos(eps_1y_est) and eps_cagr is not None:
         eps_2y_est = float(eps_1y_est) * (1.0 + float(eps_cagr))
 
@@ -1262,7 +1271,7 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
                 delta_pct = (tgt/price_now - 1.0)
                 up_cols[i].metric(f"Uppsida {lbl}", _fmt_pct(delta_pct))
 
-    # Innehav/anskaffning/PNL i SEK
+    # Innehav/anskaffning/PNL i SEK (portföljdelen)
     try:
         shares_own = _f(row.get("Antal aktier")) or 0.0
         gav_sek    = _f(row.get("GAV (SEK)"))
@@ -1279,7 +1288,7 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
     with st.expander("📊 Metoder & målpriser (alla)", expanded=False):
         st.dataframe(met_df, use_container_width=True)
 
-    # Källor & beräkningsväg
+    # Källor & beräkningsväg (inkl. EPS/REV/EBITDA-paths)
     with st.expander("🔎 Källor & beräkningsväg", expanded=True):
         sources = meta.get("sources", {}) or {}
         paths = {
@@ -1327,7 +1336,6 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
         st.success("Riktkurser sparade till fliken Resultat.")
 
     if c3.button("♻️ Uppdatera EPS 1Y/CAGR i Data", key=f"upd_est_{tkr}"):
-        # Enkel uppdatering: räkna om EPS CAGR om ttm + 1y finns (och skriv in eps 1y)
         df = read_data_df()
         mask = df["Ticker"].astype(str).str.upper() == tkr
         if mask.any():
@@ -1574,9 +1582,6 @@ def page_editor():
             except Exception:
                 inf = {}
             comp_name = inf.get("longName") or inf.get("shortName") or None
-            if not comp_name:
-                # Fallback via calendar/events? Om inget: lämna None
-                pass
         except Exception:
             comp_name = None
 
@@ -1876,13 +1881,13 @@ def page_batch():
 def run_main_ui():
     st.title(APP_TITLE)
 
-    # Auto-init: uppdatera FX en gång per session
-    if "fx_inited" not in st.session_state:
+    # Bootstrap: uppdatera FX och ev. auto-refresh av Data (styrt via Settings)
+    if "bootstrapped" not in st.session_state:
         try:
-            _load_fx_and_update_sheet()
+            _startup_refresh()
         except Exception:
             pass
-        st.session_state["fx_inited"] = True
+        st.session_state["bootstrapped"] = True
 
     # Snabbstatus (valfritt)
     with st.expander("📊 Status (FX & inställningar)", expanded=False):
