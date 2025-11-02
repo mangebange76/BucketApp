@@ -114,6 +114,32 @@ def _pos(x) -> Optional[float]:
 def _nz(x, fallback=None):
     return x if (x is not None and x == x) else fallback
 
+# ---------- NYTT: lista + helper för att aldrig spara "0" i auto-fält ----------
+# Dessa fält ska ALDRIG defaulta till 0 om användaren inte hämtat data (prefill).
+AUTO_FIELDS_NO_DEFAULT_ZERO = [
+    "Aktuell kurs","Utestående aktier","Net debt",
+    "Rev TTM","EBITDA TTM","EPS TTM",
+    "PE TTM","PE FWD","EV/Revenue","EV/EBITDA",
+    "P/B","BVPS","EPS 1Y","EPS 2Y",
+    "Rev CAGR","Årlig utdelning","Utdelning CAGR"
+]
+def _nan_if_unfilled(val, field_name: str, prefill: Dict[str, Any], keep_zero: bool = False):
+    """
+    Om fältet inte finns i prefill (dvs ej hämtat) och värdet är 0/blankt → returnera NaN.
+    Undantag: keep_zero=True (t.ex. 'Antal aktier', 'GAV (SEK)').
+    """
+    if keep_zero:
+        return val
+    if field_name in prefill and prefill.get(field_name) is not None:
+        return val
+    # Tomt → NaN
+    if val is None:
+        return np.nan
+    # 0 → NaN (gäller endast auto-fält)
+    if isinstance(val, (int, float)) and float(val) == 0.0 and field_name in AUTO_FIELDS_NO_DEFAULT_ZERO:
+        return np.nan
+    return val
+
 # =========================
 # Google Sheets Auth
 # =========================
@@ -1533,6 +1559,11 @@ def page_portfolio():
 # Snapshot-funktion och main()
 # ============================================================
 
+# ---------- (valfri) start-hook: gör inget om ej använd ----------
+def _startup_refresh():
+    """Hook vid uppstart. Lämnas tom (ingen auto-körning)."""
+    return
+
 # ---------- Snapshot → fliken "Snapshot" ----------
 def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: Dict[str, Any]) -> None:
     snap = _read_df(SNAPSHOT_TITLE)
@@ -1994,9 +2025,9 @@ def run_main_ui():
     if page == "Editor":
         page_editor()
     elif page == "Portfölj":
-        page_portfolio()  # från Del 3/4
+        page_portfolio()  # Del 3/4
     elif page == "Analys":
-        page_analysis()   # från Del 3/4
+        page_analysis()   # Del 3/4
     elif page == "Ranking":
         page_ranking()
     elif page == "Inställningar":
