@@ -2,11 +2,10 @@
 # ============================================================
 # Bas: Streamlit-app för fair value / riktkurser / portfölj
 # Lagring: Google Sheets (Data, Resultat, Valutakurser, Settings, Snapshot)
-# Hämtning: Yahoo (yfinance) + valfri Finnhub (EPS 1Y/2Y)
+# Hämtning: Yahoo (yfinance) + valfri Finnhub
 # ============================================================
 
 from __future__ import annotations
-
 import os, json, math, time, random
 from typing import Any, Dict, List, Optional, Tuple
 from collections.abc import Mapping
@@ -40,18 +39,10 @@ DEFAULT_BUCKETS = [
     "Bucket A utdelning","Bucket B utdelning","Bucket C utdelning"
 ]
 
-# Standard-metoder (håll ordning konsekvent)
-METHOD_LIST = [
-    "ev_ebitda","ev_sales","pe_hist_vs_eps","p_b",
-    "ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"
-]
-PREFER_ORDER = METHOD_LIST[:]  # preferensordning vid auto-val
-
 # =========================
 # Små hjälpare
 # =========================
 def now_stamp() -> str:
-    """Svensk lokal tid om möjligt."""
     try:
         import pytz
         tz = pytz.timezone("Europe/Stockholm")
@@ -61,10 +52,9 @@ def now_stamp() -> str:
 
 def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(key)
-    if v: 
-        return v
+    if v: return v
     try:
-        return st.secrets.get(key, default)  # type: ignore[attr-defined]
+        return st.secrets.get(key, default)
     except Exception:
         return default
 
@@ -75,7 +65,6 @@ def _normalize_private_key(creds: Dict[str, Any]) -> Dict[str, Any]:
     return creds
 
 def guard(fn, label: str = ""):
-    """Kör en funktion och bubblar upp fel med vänlig text."""
     try:
         return fn()
     except Exception as e:
@@ -96,20 +85,16 @@ def _with_backoff(callable_fn, *args, **kwargs):
                 continue
             raise
         except Exception:
-            if i == 5: 
-                raise
+            if i == 5: raise
             time.sleep(delay)
             delay *= 1.6
 
 def _f(x) -> Optional[float]:
-    """Robust float-parser (svenskt format tillåtet)."""
     try:
-        if x is None: 
-            return None
+        if x is None: return None
         if isinstance(x, str):
             s = x.strip().replace(" ", "").replace(",", ".")
-            if s == "": 
-                return None
+            if s == "": return None
             v = float(s)
         else:
             v = float(x)
@@ -123,9 +108,15 @@ def _pos(x) -> Optional[float]:
     v = _f(x)
     return v if (v is not None and v > 0) else None
 
-def _nz(x, fallback=None):
-    """Returnera x om det är ett giltigt tal/objekt, annars fallback."""
-    return x if (x is not None and x == x) else fallback
+# ===== Hotfix-guard: säkerställ primärlistor finns tidigt =====
+if 'METHOD_LIST' not in globals():
+    METHOD_LIST = [
+        "ev_ebitda","ev_sales","pe_hist_vs_eps","p_b",
+        "ev_dacf","p_fcf","ev_fcf","p_nav","p_affo","p_tbv","p_nii"
+    ]
+if 'PREFER_ORDER' not in globals():
+    PREFER_ORDER = METHOD_LIST
+# =============================================================
 
 # =========================
 # Google Sheets Auth
@@ -142,7 +133,7 @@ def _build_gspread_client() -> gspread.Client:
     # normalisera
     if isinstance(raw, Mapping):
         try:
-            creds_dict = dict(raw)  # typ: ignore[arg-type]
+            creds_dict = dict(raw)
         except Exception:
             creds_dict = json.loads(json.dumps(raw))
     elif isinstance(raw, (bytes, bytearray)):
@@ -151,7 +142,7 @@ def _build_gspread_client() -> gspread.Client:
         creds_dict = json.loads(raw)
     else:
         try:
-            creds_dict = raw.to_dict()  # type: ignore[attr-defined]
+            creds_dict = raw.to_dict()
         except Exception as e:
             raise TypeError(f"GOOGLE_CREDENTIALS oväntad typ: {type(raw)}") from e
 
@@ -308,8 +299,7 @@ FX_PAIRS = {"USD":"USDSEK=X","EUR":"EURSEK=X","NOK":"NOKSEK=X","CAD":"CADSEK=X",
 def _fetch_fx_from_yahoo() -> Dict[str, float]:
     out = {"SEK":1.0}
     for code, pair in FX_PAIRS.items():
-        if pair is None: 
-            continue
+        if pair is None: continue
         try:
             t = yf.Ticker(pair)
             px = None
@@ -421,8 +411,12 @@ import requests
 # -------------------------
 # Hjälpare
 # -------------------------
+def _nz(x, fallback=None):
+    """Returnera x om det är ett giltigt tal/objekt, annars fallback."""
+    return x if (x is not None and x == x) else fallback
+
 def _safe_float(x) -> Optional[float]:
-    """Snäll float-cast som använder _f men accepterar int/str/None."""
+    """Som _f men snällare när strängar innehåller tusentals- eller decimaltecken."""
     return _f(x)
 
 # -------------------------
@@ -520,6 +514,46 @@ def fetch_yahoo_snapshot(ticker: str) -> Dict[str, Any]:
     return out
 
 # -------------------------
+# Yahoo – försök läsa analyst EPS (1–2 år) om Finnhub saknas
+# -------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_eps_forward_from_yahoo(ticker: str) -> Dict[str, Optional[float]]:
+    """
+    Försöker få fram eps_1y/eps_2y från Yahoos earnings trend (om tillgänglig i yfinance).
+    Returnerar {"eps_1y": float|None, "eps_2y": float|None, "source": "yahoo_trend"|"none"}
+    """
+    eps_1y, eps_2y = None, None
+    try:
+        tk = yf.Ticker(ticker)
+        # yfinance 0.2.x: försök båda vägarna
+        trend = None
+        try:
+            trend = tk.get_earnings_trend()
+        except Exception:
+            try:
+                trend = tk.earnings_trend
+            except Exception:
+                trend = None
+        if trend is not None and hasattr(trend, "empty") and not trend.empty:
+            df = trend.copy()
+            # Försök hitta rader för "currentYear" och "nextYear"
+            if "period" in df.columns:
+                df["period"] = df["period"].astype(str)
+                def _pick(colname):
+                    try:
+                        v = df.loc[df["period"].str.contains(colname, case=False), "epsTrend.avg"].dropna()
+                        if v.empty:
+                            v = df.loc[df["period"].str.contains(colname, case=False), "epsAvg"].dropna()
+                        return _safe_float(v.iloc[-1]) if not v.empty else None
+                    except Exception:
+                        return None
+                eps_1y = _pick("currentYear")
+                eps_2y = _pick("nextYear")
+    except Exception:
+        pass
+    return {"eps_1y": eps_1y, "eps_2y": eps_2y, "source": "yahoo_trend" if (eps_1y or eps_2y) else "none"}
+
+# -------------------------
 # Finnhub (valfritt) – EPS-estimat 1–2 år
 # -------------------------
 def _get_finnhub_key() -> Optional[str]:
@@ -550,8 +584,8 @@ def fetch_finnhub_estimates(ticker: str) -> Dict[str, Optional[float]]:
                 rows = sorted(rows or [], key=lambda x: str(x.get("period", "")))
             except Exception:
                 rows = rows or []
+            # Plocka ut upp till två senaste EPS-avg
             vals = [_safe_float(x.get("epsAvg")) for x in rows if _safe_float(x.get("epsAvg")) is not None]
-            # Ta de två senaste (senaste = y1, näst = y2)
             if len(vals) >= 1:
                 eps_1y = vals[-1]
             if len(vals) >= 2:
@@ -648,7 +682,10 @@ def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optiona
     """
     Returnerar (eps_0, eps_1, eps_2, eps_3).
     • Om eps_1y saknas men eps_cagr finns: extrapolera från ttm.
-    • Om eps_2y saknas men eps_1y+eps_cagr finns: extrapolera ett år till.
+    • Om eps_2y saknas:
+        – använd Finnhub/Yahoo om finns,
+        – annars extrapolera från eps_1y med eps_cagr,
+        – eller från ttm två steg med eps_cagr.
     • eps_3y extrapoleras vidare om eps_cagr finns.
     """
     e0 = _pos(eps_ttm)
@@ -660,6 +697,9 @@ def _eps_path(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optiona
         e1 = e0 * (1.0 + cg)
     if e2 is None and e1 is not None and cg is not None:
         e2 = e1 * (1.0 + cg)
+    if e2 is None and e0 is not None and cg is not None:
+        e2 = e0 * (1.0 + cg) * (1.0 + cg)
+
     e3 = e2 * (1.0 + cg) if (e2 is not None and cg is not None) else None
     return e0, e1, e2, e3
 
@@ -714,13 +754,16 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     """
     Beräknar metodtabell (Idag, 1,2,3 år) för raden.
     Returnerar (methods_df, sanity_text, meta)
-    meta innehåller: currency, price, shares_out, net_debt, pe_anchor, decay, sources{}, paths
+    meta innehåller: currency, price, shares_out, net_debt, pe_anchor, decay, sources{}
     """
     ticker = str(row.get("Ticker", "")).strip()
     # 1) Live-data
     snap = fetch_yahoo_snapshot(ticker)
-    time.sleep(0.35)  # mild throttling
-    est  = fetch_finnhub_estimates(ticker)
+    time.sleep(0.35)  # mild throttling för att undvika 429
+
+    # EPS-estimat: Finnhub -> Yahoo-trend -> None
+    est_fh  = fetch_finnhub_estimates(ticker)
+    est_yh  = fetch_eps_forward_from_yahoo(ticker) if est_fh.get("source") == "none" else {"eps_1y": None, "eps_2y": None, "source": "none"}
 
     # 2) Inputs (med fallback från Data-bladet)
     price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
@@ -738,9 +781,9 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     p_b        = _pos(_nz(snap.get("p_to_book"), row.get("P/B")))
     bvps       = _pos(_nz(snap.get("bvps"), row.get("BVPS")))
 
-    # Estimat / tillväxt
-    eps_1y_est = _pos(_nz(est.get("eps_1y"), row.get("EPS 1Y")))
-    eps_2y_est = _pos(_nz(est.get("eps_2y"), row.get("EPS 2Y")))
+    # Estimat / tillväxt (prioritet: Finnhub > Yahoo-trend > Data)
+    eps_1y_est = _pos(_nz(est_fh.get("eps_1y"), _nz(est_yh.get("eps_1y"), row.get("EPS 1Y"))))
+    eps_2y_est = _pos(_nz(est_fh.get("eps_2y"), _nz(est_yh.get("eps_2y"), row.get("EPS 2Y"))))
     eps_cagr   = _f(row.get("EPS CAGR"))
     rev_cagr   = _f(row.get("Rev CAGR"))
 
@@ -767,7 +810,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     b0, b1, b2, b3 = _ebitda_path(ebitda_ttm, r0, r1, r2, r3)
 
     # Multiplar med decay
-    pe0 = pe_anchor
+    pe0  = pe_anchor
     pe1m = _decay_multiple(pe_anchor, 1, decay)
     pe2m = _decay_multiple(pe_anchor, 2, decay)
     pe3m = _decay_multiple(pe_anchor, 3, decay)
@@ -832,13 +875,16 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
     # 7) Sanity + META
-    # Bygg tydlig sanity-sträng + källor
     src = snap.get("sources", {})
+    # bygg källtagg för EPS 1Y/2Y
+    eps1_src = "finnhub" if est_fh.get("source") == "finnhub" and _pos(est_fh.get("eps_1y")) else ("yahoo_trend" if est_yh.get("source") == "yahoo_trend" and _pos(est_yh.get("eps_1y")) else "sheet/derived")
+    eps2_src = "finnhub" if est_fh.get("source") == "finnhub" and _pos(est_fh.get("eps_2y")) else ("yahoo_trend" if est_yh.get("source") == "yahoo_trend" and _pos(est_yh.get("eps_2y")) else "sheet/derived")
+
     sanity = (
         f"price={'ok' if price else '—'}({src.get('price','?')}), "
         f"eps_ttm={'ok' if e0 else '—'}({src.get('eps_ttm','?') or 'derived'}), "
-        f"eps_1y={'ok' if e1 else '—'}({ 'finnhub' if est.get('source')=='finnhub' and _pos(est.get('eps_1y')) else 'derived/sheet' }), "
-        f"eps_2y={'ok' if e2 else '—'}({ 'finnhub' if est.get('source')=='finnhub' and _pos(est.get('eps_2y')) else 'derived/sheet' }), "
+        f"eps_1y={'ok' if e1 else '—'}({eps1_src}), "
+        f"eps_2y={'ok' if e2 else '—'}({eps2_src}), "
         f"rev_ttm={'ok' if r0 else '—'}({src.get('revenue_ttm','?')}), "
         f"ebitda_ttm={'ok' if b0 else '—'}({src.get('ebitda_ttm','?')}), "
         f"shares={'ok' if shares else '—'}({src.get('shares','?')}), "
@@ -854,8 +900,8 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Di
         "decay": decay,
         "sources": {
             **src,
-            "eps_1y_source": "finnhub" if est.get("source") == "finnhub" and _pos(est.get("eps_1y")) else "sheet/derived",
-            "eps_2y_source": "finnhub" if est.get("source") == "finnhub" and _pos(est.get("eps_2y")) else "sheet/derived",
+            "eps_1y_source": eps1_src,
+            "eps_2y_source": eps2_src,
         },
         "eps_path": {"ttm": e0, "y1": e1, "y2": e2, "y3": e3},
         "rev_path": {"ttm": r0, "y1": r1, "y2": r2, "y3": r3},
@@ -1073,7 +1119,6 @@ def _company_card(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, fl
         df = read_data_df()
         mask = df["Ticker"].astype(str).str.upper() == tkr
         if mask.any():
-            # använd senaste meta paths
             e0 = meta.get("eps_path", {}).get("ttm")
             e1 = meta.get("eps_path", {}).get("y1")
             new_cagr = None
@@ -1125,7 +1170,7 @@ def page_analysis():
         st.warning("Inget att visa efter filter.")
         return
 
-    # Beräkna fair value (Idag) för varje rad utifrån aktuell primär metod (preset) för sortering
+    # Beräkna fair value (Idag) för varje rad utifrån aktuell primär metod för sortering
     progress = st.progress(0.0)
     scored: List[Tuple[str, float, Dict[str, Any], pd.Series]] = []
     for i, (_, r) in enumerate(q.iterrows()):
