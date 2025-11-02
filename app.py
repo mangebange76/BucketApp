@@ -1874,13 +1874,12 @@ def page_ranking():
 # ============================================================
 
 # ============================================================
-# app.py — Del 4/4
-# Inställningar • Editor • Batch • Main
-# • Alla formulär har form_submit_button() (fix för "Missing Submit Button")
-# • Datumhantering använder datetime som dt och isinstance(..., dt.date)
+# Del 4/4 — Inställningar, Editor, Batch & Main
+#  • Editor: "Hämta & fyll från Yahoo" inkluderar EPS/REV-estimat
+#  • Batch: massuppdatering med fördröjning
+#  • Main: robusta felmeddelanden per sida
 # ============================================================
 
-from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple, List
 import datetime as dt
 import time
@@ -1888,7 +1887,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------- Små hjälpare ----------
+# ---------- Hjälpare ----------
 def _nan_if_zero(v):
     try:
         f = float(v)
@@ -1929,9 +1928,12 @@ def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: Dict[str,
 
 # ---------- Startup-refresh (valfritt via Settings) ----------
 def _startup_refresh():
-    """Lätt auto-uppdatering vid uppstart om Settings['auto_refresh_on_start']=='1'."""
+    """Lätt auto-uppdatering av pris/valuta/antal aktier på uppstart om Settings->auto_refresh_on_start='1'."""
     s = get_settings_map()
-    flag = str(s.get("auto_refresh_on_start", "0")).strip()
+    try:
+        flag = str(s.get("auto_refresh_on_start","0")).strip()
+    except Exception:
+        flag = "0"
     if flag != "1":
         return
     df = read_data_df()
@@ -1939,7 +1941,7 @@ def _startup_refresh():
         return
     df2 = df.copy()
     for idx, r in df2.iterrows():
-        tkr = str(r.get("Ticker", "")).strip().upper()
+        tkr = str(r.get("Ticker","")).strip().upper()
         if not tkr:
             continue
         try:
@@ -1955,7 +1957,7 @@ def _startup_refresh():
     write_data_df(df2)
 
 # ============================================================
-#                       SIDA: Editor
+#                        SIDA: Editor
 # ============================================================
 def page_editor():
     st.header("📝 Lägg till / Uppdatera bolag")
@@ -1982,7 +1984,7 @@ def page_editor():
     merged = dict(init)
     merged.update({k: v for k, v in st.session_state["editor_prefill"].items() if v is not None})
 
-    st.caption("Tips: Använd **Hämta & fyll från Yahoo** för att auto-populera (inkl. EPS/REV-estimat). Spara sedan.")
+    st.caption("Tip: Använd **Hämta & fyll från Yahoo** för att auto-populera formuläret (inkl. EPS/REV-estimat). Spara sedan.")
 
     with st.form("edit_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
@@ -2028,20 +2030,22 @@ def page_editor():
         prim_idx = prim_choices.index(prim_default) if prim_default in prim_choices else 0
         prim    = h4.selectbox("Primär metod", prim_choices, index=prim_idx)
 
-        # Manuell möjlighet att sätta frekvens/DPS nästa/datum
+        # Manuell möjlighet att sätta frekvens/DPS nästa/datum om auto misslyckas
         j1, j2, j3 = st.columns(3)
-        freq_in = j1.selectbox("Utdelningsfrekvens (M/Q/S/A)", ["", "M","Q","S","A"],
-                               index=["","M","Q","S","A"].index(str(_nz(merged.get("Utdelningsfrekvens"), "")).upper()))
-        next_dps = j2.number_input("Nästa utdelning (per aktie)", step=0.0001,
-                                   value=float(_nz(_f(merged.get("Nästa utdelning (per aktie)")), 0.0)))
+        freq_in = j1.selectbox("Utdelningsfrekvens (M/Q/S/A)", ["", "M","Q","S","A"], index=["","M","Q","S","A"].index(str(_nz(merged.get("Utdelningsfrekvens"), "")).upper()))
+        next_dps = j2.number_input("Nästa utdelning (per aktie)", step=0.0001, value=float(_nz(_f(merged.get("Nästa utdelning (per aktie)")), 0.0)))
+
         next_dt_default = merged.get("Nästa utdelningsdatum")
         if isinstance(next_dt_default, str):
             try:
                 next_dt_default = pd.to_datetime(next_dt_default, errors="coerce").date()
             except Exception:
                 next_dt_default = None
-        next_dt = j3.date_input("Nästa utdelningsdatum",
-                                value=next_dt_default if isinstance(next_dt_default, dt.date) else None)
+        # date_input: passera value bara om vi har ett giltigt datum
+        if isinstance(next_dt_default, dt.date):
+            next_dt = j3.date_input("Nästa utdelningsdatum", value=next_dt_default)
+        else:
+            next_dt = j3.date_input("Nästa utdelningsdatum")
 
         c_left, c_right = st.columns(2)
         fetch_btn = c_left.form_submit_button("🔎 Hämta & fyll från Yahoo")
@@ -2053,7 +2057,7 @@ def page_editor():
             st.warning("Ange en ticker först.")
             st.stop()
 
-        # 1) Snapshot (pris, valuta, TTM-nycklar, EV, shares …)
+        # 1) Snapshot (pris, valuta, TTM-nycklar, EV, shares, P/B, BVPS …)
         snap = fetch_yahoo_snapshot(ticker)
 
         # 2) EPS-estimat (current/next year) + long-term EPS CAGR (trend)
@@ -2066,11 +2070,14 @@ def page_editor():
         comp_name, comp_sector = None, None
         try:
             tk = yf.Ticker(ticker)
-            inf = tk.info or {}
+            try:
+                inf = tk.info or {}
+            except Exception:
+                inf = {}
             comp_name   = inf.get("longName") or inf.get("shortName") or None
             comp_sector = inf.get("sector") or inf.get("industry") or None
         except Exception:
-            pass
+            comp_name, comp_sector = None, None
 
         # 5) Prisfallback via historik
         px = snap.get("price")
@@ -2140,7 +2147,7 @@ def page_editor():
             "EPS 1Y": _n(eps1y),
             "EPS 2Y": _n(eps2y),
             "Rev CAGR": _n(revcg),
-            "EPS CAGR": np.nan,  # beräknas i analys/knapp vid behov
+            "EPS CAGR": np.nan,  # beräknas i analysknappen vid behov
             "Årlig utdelning": _n(dps),
             "Utdelning CAGR": _n(dpscg),
             "Utdelningsfrekvens": (freq_in if freq_in else np.nan),
@@ -2203,14 +2210,10 @@ def page_settings():
         st.success("Källskatt uppdaterad.")
 
     st.subheader("Modellparametrar")
-    with st.form("model_form"):
-        p1, p2 = st.columns(2)
-        pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05,
-                                value=float(settings.get("pe_anchor_weight_ttm","0.5")))
-        decay = p2.number_input("Multipel-decay per år (0..1)", min_value=0.0, max_value=1.0, step=0.01,
-                                value=float(settings.get("multiple_decay","0.10")))
-        p_submit = st.form_submit_button("💾 Spara modellparametrar")
-    if p_submit:
+    p1, p2 = st.columns(2)
+    pe_w  = p1.number_input("PE-ankare, vikt TTM (0..1)", min_value=0.0, max_value=1.0, step=0.05, value=float(settings.get("pe_anchor_weight_ttm","0.5")))
+    decay = p2.number_input("Multipel-decay per år (0..1)", min_value=0.0, max_value=1.0, step=0.01, value=float(settings.get("multiple_decay","0.10")))
+    if st.button("💾 Spara modellparametrar"):
         s = _read_df(SETTINGS_TITLE)
         if s.empty: s = pd.DataFrame(columns=SETTINGS_COLUMNS)
         def setv(sdf, k, v):
@@ -2333,7 +2336,7 @@ def run_main_ui():
     except KeyError as e:
         st.error(f"💥 Nyckelfel (saknad kolumn eller fält): {e}. Kontrollera att bladet **Data** har alla kolumner enligt schema.")
     except Exception as e:
-        st.error(f"💥 Oväntat fel i sidan '{page}': {e}")
+        st.error(f"💥 Ov\u00e4ntat fel i sidan '{page}': {e}")
 
 def main():
     run_main_ui()
