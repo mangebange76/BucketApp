@@ -428,7 +428,7 @@ def read_data_df() -> pd.DataFrame:
     ]
     for c in IGNORE_ZERO_COLS:
         if c in df.columns:
-            df.loc[(df[c].notna()) & (df[c] == 0), c = np.nan
+            df.loc[(df[c].notna()) & (df[c] == 0), c] = np.nan
 
     for c in IGNORE_ZERO_COLS:
         if c in df.columns:
