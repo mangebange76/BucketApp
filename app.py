@@ -1513,9 +1513,11 @@ def page_ranking(df_data: pd.DataFrame, settings: dict | None = None):
 # ===== Slut på Del 3/4 =====
 
 # ============================================================
+
+# ============================================================
 # app.py — Del 4/4
-# Settings, Editor (sökbar rullista + "äldsta estimat"), Batch,
-# Snapshot och Main (med smart sid-anropare)
+# Settings, Editor (sökbar rullista + manuella fält + "äldsta estimat"),
+# Batch, Snapshot och Main (smart sid-anropare)
 # ============================================================
 
 import pandas as pd
@@ -1523,6 +1525,16 @@ import numpy as np
 import streamlit as st
 import time
 import inspect
+
+# ---------- Säker rerun (kompat mellan olika Streamlit-versioner) ----------
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()  # äldre versioner
+        except Exception:
+            pass
 
 # ------------------------------------------------------------
 # Fält för estimat & hjälpare
@@ -1553,7 +1565,7 @@ def _should_stamp_estimates(updates: dict) -> bool:
     return False
 
 # ------------------------------------------------------------
-# Snapshot-logg
+# Snapshot-logg (oförändrad logik)
 # ------------------------------------------------------------
 def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: dict) -> None:
     snap = _read_df(SNAPSHOT_TITLE)
@@ -1640,7 +1652,7 @@ def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None
     return clean, meta, methods_df
 
 # ------------------------------------------------------------
-# Editor (sökbar rullista + "10 äldsta estimat")
+# Editor – sökbar rullista + MANUELLA FÄLT + "10 äldsta estimat"
 # ------------------------------------------------------------
 def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
     if df.empty:
@@ -1666,7 +1678,7 @@ def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
         if tkr and st.session_state.get("ticker_input") != tkr:
             st.session_state["ticker_input"] = tkr
             st.session_state["editor_ticker"] = tkr
-            st.rerun()
+            _safe_rerun()
     return st.session_state.get("ticker_input", "")
 
 def _render_oldest_estimates_table(df: pd.DataFrame):
@@ -1684,7 +1696,6 @@ def _render_oldest_estimates_table(df: pd.DataFrame):
     used_ts = est_ts.fillna(auto_ts)
 
     now_ts = pd.Timestamp.now()
-    # Säkerställ Timestamp - Timestamp
     used_ts = pd.to_datetime(used_ts, errors="coerce")
     age_days = (now_ts - used_ts).dt.days
     work["_age"] = age_days
@@ -1733,6 +1744,7 @@ def page_editor():
         if mask.any():
             existing_row = df[mask].iloc[0]
 
+    # --- Hämta från Yahoo ---
     upd_col, save_col = st.columns([1,1])
     if upd_col.button("🔎 Hämta & fyll från Yahoo (inkl. EPS/Rev-estimat)"):
         try:
@@ -1748,15 +1760,49 @@ def page_editor():
     meta    = st.session_state.get("editor_meta", {})
     methods = st.session_state.get("editor_methods", pd.DataFrame())
 
-    if updates:
-        st.subheader("Föreslagna uppdateringar")
-        def _old_val(k):
-            if existing_row is None or k not in existing_row.index:
-                return None
-            return existing_row.get(k)
-        preview = [{"Fält": k, "Gammalt": _old_val(k), "Nytt": updates[k]} for k in sorted(updates.keys())]
-        st.dataframe(pd.DataFrame(preview), use_container_width=True)
+    # --- MANUELLA FÄLT (ALLTID REDIGERBARA) ---
+    st.subheader("✏️ Manuella fält")
+    with st.container(border=True):
+        m1, m2, m3 = st.columns(3)
+        m4, m5, m6 = st.columns(3)
 
+        def _pref(name, default=None):
+            # förifyll med (updates -> befintlig rad -> default)
+            if name in updates and updates[name] is not None:
+                return _f(updates[name])
+            if existing_row is not None and name in existing_row.index:
+                return _f(existing_row.get(name))
+            return _f(default)
+
+        antal_aktier = m1.number_input("Antal aktier", min_value=0.0, step=1.0, value=float(_pref("Antal aktier", 0) or 0))
+        gav_sek      = m2.number_input("GAV (SEK)", min_value=0.0, step=0.01, value=float(_pref("GAV (SEK)", 0) or 0))
+        eps_1y_m     = m3.number_input("EPS 1Y", step=0.01, value=float(_pref("EPS 1Y", 0) or 0))
+        eps_2y_m     = m4.number_input("EPS 2Y", step=0.01, value=float(_pref("EPS 2Y", 0) or 0))
+        rev_1y_m     = m5.number_input("Rev 1Y", step=1.0, value=float(_pref("Rev 1Y", 0) or 0))
+        rev_2y_m     = m6.number_input("Rev 2Y", step=1.0, value=float(_pref("Rev 2Y", 0) or 0))
+
+    # Visa skillnader gammalt → nytt (inkl. manuella)
+    def _old_val(k):
+        if existing_row is None or k not in existing_row.index:
+            return None
+        return existing_row.get(k)
+
+    preview = []
+    for k in sorted(updates.keys()):
+        preview.append({"Fält": k, "Gammalt": _old_val(k), "Nytt": updates[k]})
+    # lägg manuella “fält som alltid sparas”
+    preview += [
+        {"Fält": "Antal aktier", "Gammalt": _old_val("Antal aktier"), "Nytt": antal_aktier},
+        {"Fält": "GAV (SEK)", "Gammalt": _old_val("GAV (SEK)"), "Nytt": gav_sek},
+        {"Fält": "EPS 1Y", "Gammalt": _old_val("EPS 1Y"), "Nytt": eps_1y_m},
+        {"Fält": "EPS 2Y", "Gammalt": _old_val("EPS 2Y"), "Nytt": eps_2y_m},
+        {"Fält": "Rev 1Y", "Gammalt": _old_val("Rev 1Y"), "Nytt": rev_1y_m},
+        {"Fält": "Rev 2Y", "Gammalt": _old_val("Rev 2Y"), "Nytt": rev_2y_m},
+    ]
+    st.subheader("Förhandsgranskning av uppdateringar")
+    st.dataframe(pd.DataFrame(preview), use_container_width=True, height=280)
+
+    # --- Spara ---
     if save_col.button("💾 Spara till Data"):
         if not ticker:
             st.warning("Ange ticker först.")
@@ -1765,18 +1811,33 @@ def page_editor():
             cur = _ensure_columns(cur, DATA_COLUMNS)
             cur = _ensure_estimate_columns(cur)
 
+            # bygg skriv-uppdateringar
+            to_save = dict(updates) if isinstance(updates, dict) else {}
+            to_save["Antal aktier"] = antal_aktier
+            to_save["GAV (SEK)"]    = gav_sek
+            # EPS/REV manuellt (överskriv auto om ifyllda)
+            to_save["EPS 1Y"] = eps_1y_m
+            to_save["EPS 2Y"] = eps_2y_m
+            to_save["Rev 1Y"] = rev_1y_m
+            to_save["Rev 2Y"] = rev_2y_m
+            # estimat-stämpel om något av ovan är > 0
+            if any((_f(eps_1y_m), _f(eps_2y_m), _f(rev_1y_m), _f(rev_2y_m))):
+                to_save["Estimat senast uppdaterad"] = now_stamp()
+
             mask = cur["Ticker"].astype(str).str.upper() == ticker
             if not mask.any():
                 base = {c: np.nan for c in list(cur.columns)}
                 base.update({"Timestamp": now_stamp(), "Ticker": ticker, "Bucket": bucket})
-                for k, v in (updates or {}).items():
-                    if v is not None and not (isinstance(v, float) and v != v):
-                        base[k] = v
-                cur = pd.concat([cur, pd.DataFrame([base])], ignore_index=True)
+                for k, v in to_save.items():
+                    if v is None or (isinstance(v, float) and v != v):
+                        continue
+                    base[k] = v
+                cur = pd.DataFrame([base])
+                cur = pd.concat([read_data_df(), cur], ignore_index=True)
             else:
                 idx = cur.index[mask][0]
                 cur.at[idx, "Bucket"] = bucket
-                for k, v in (updates or {}).items():
+                for k, v in to_save.items():
                     if v is None or (isinstance(v, float) and v != v):
                         continue
                     cur.at[idx, k] = v
@@ -1789,6 +1850,7 @@ def page_editor():
                 except Exception:
                     pass
 
+    # Visa methods från senaste hämtning
     if isinstance(methods, pd.DataFrame) and not methods.empty:
         with st.expander("📊 Metoder & målpriser (senaste hämtning)"):
             st.dataframe(methods, use_container_width=True)
@@ -1860,7 +1922,7 @@ def page_batch():
         st.balloons()
 
 # ------------------------------------------------------------
-# Settings
+# Settings (oförändrat i sak)
 # ------------------------------------------------------------
 def page_settings():
     st.header("⚙️ Inställningar")
@@ -1923,7 +1985,7 @@ def page_settings():
         st.success("Valutakurser uppdaterade.")
 
 # ------------------------------------------------------------
-# Snapshot-visning
+# Snapshot-visning (oförändrat)
 # ------------------------------------------------------------
 def page_snapshot():
     st.header("🕒 Snapshot-logg")
@@ -1934,7 +1996,7 @@ def page_snapshot():
     st.dataframe(snap, use_container_width=True)
 
 # ------------------------------------------------------------
-# Fallback för _startup_refresh (om den saknas)
+# Fallback _startup_refresh (om saknas från tidigare delar)
 # ------------------------------------------------------------
 if "_startup_refresh" not in globals():
     def _startup_refresh():
@@ -1942,11 +2004,9 @@ if "_startup_refresh" not in globals():
             s = get_settings_map()
             if str(s.get("auto_refresh_on_start", "0")).strip() != "1":
                 return
-
             df = read_data_df()
             if df.empty:
                 return
-
             changed = 0
             for i, idx in enumerate(df.index):
                 tkr = str(df.at[idx, "Ticker"]).strip()
@@ -1955,8 +2015,7 @@ if "_startup_refresh" not in globals():
                 try:
                     tk = yf.Ticker(tkr)
                     fi = getattr(tk, "fast_info", None)
-                    px = None
-                    ccy = None
+                    px, ccy = None, None
                     if fi:
                         px = _f(getattr(fi, "last_price", None))
                         ccy = str(getattr(fi, "currency", None) or "").upper() or None
@@ -1978,22 +2037,13 @@ if "_startup_refresh" not in globals():
             pass
 
 # ------------------------------------------------------------
-# CHANGED: Smart sid-anropare som matchar båda signaturerna
+# Smart sid-anropare (stödjer båda signaturerna)
 # ------------------------------------------------------------
 def _invoke_page(fn, df_data: pd.DataFrame, settings: dict, fx_map: dict):
-    """
-    Kollar funktionssignaturen och skickar in endast de parametrar som efterfrågas.
-    Stöder t.ex.:
-      page_analysis()
-      page_analysis(df_data, settings, fx_map)
-      page_portfolio(df_data)
-      page_ranking(df_data)
-    """
     try:
         sig = inspect.signature(fn)
         params = sig.parameters
         kwargs = {}
-        # namn som ofta används
         env = {
             "df_data": df_data,
             "df": df_data,
@@ -2007,11 +2057,10 @@ def _invoke_page(fn, df_data: pd.DataFrame, settings: dict, fx_map: dict):
                 kwargs[name] = env[name]
         return fn(**kwargs) if kwargs else fn()
     except TypeError:
-        # Om något strular, försök utan argument
         return fn()
 
 # ------------------------------------------------------------
-# CHANGED: Main — använder _invoke_page
+# Main — använder _invoke_page
 # ------------------------------------------------------------
 def main():
     _startup_refresh()
@@ -2019,7 +2068,6 @@ def main():
     st.sidebar.title("Navigering")
     page = st.sidebar.radio("Gå till:", ["Analys","Portfölj","Ranking","Editor","Batch","Settings","Snapshot"], index=0)
 
-    # Förse ev. sidfunktioner som kräver argument
     df_data = read_data_df()
     settings = get_settings_map()
     fx_map = get_fx_map()
