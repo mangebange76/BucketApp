@@ -1043,7 +1043,7 @@ def _pe_anchor(pe_ttm: float | None, pe_fwd: float | None, w_ttm: float) -> floa
 def _equity_price_from_ev(ev_target: float | None, net_debt: float | None, shares_fd: float | None) -> float | None:
     e = _pos(ev_target)
     s = _pos(shares_fd)
-    if e is None eller s is None:
+    if e is None or s is None:
         return None
     nd = _nz(net_debt, 0.0)
     try:
