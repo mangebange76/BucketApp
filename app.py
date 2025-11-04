@@ -1514,17 +1514,18 @@ def page_ranking(df_data: pd.DataFrame, settings: dict | None = None):
 
 # ============================================================
 # app.py — Del 4/4
-# Settings, Editor (med sökbar rullista + "äldsta estimat"-tabell),
-# Batch, Snapshot och Main
+# Settings, Editor (sökbar rullista + "äldsta estimat"), Batch,
+# Snapshot och Main (med smart sid-anropare)
 # ============================================================
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 import time
+import inspect
 
 # ------------------------------------------------------------
-# Hjälpare för Editor: säkra/bygg estimatfält och tidsstämplar
+# Fält för estimat & hjälpare
 # ------------------------------------------------------------
 _EST_COLS = ["EPS 1Y", "EPS 2Y", "Rev 1Y", "Rev 2Y", "Estimat senast uppdaterad"]
 
@@ -1546,7 +1547,8 @@ def _compute_rev_1y_2y_from_meta(meta: dict) -> tuple[float | None, float | None
 
 def _should_stamp_estimates(updates: dict) -> bool:
     for k in ("EPS 1Y","EPS 2Y","Rev 1Y","Rev 2Y"):
-        if k in updates and updates[k] is not None and not (isinstance(updates[k], float) and updates[k] != updates[k]):
+        v = updates.get(k)
+        if v is not None and not (isinstance(v, float) and v != v):
             return True
     return False
 
@@ -1584,29 +1586,21 @@ def save_quarter_snapshot(ticker: str, methods_df: pd.DataFrame, meta: dict) -> 
         _write_df(SNAPSHOT_TITLE, snap)
 
 # ------------------------------------------------------------
-# Yahoo-hämtning → bygg uppdateringar (med Rev 1Y/2Y + tidsstämpel)
+# Yahoo-hämtning → bygg uppdateringar (inkl. Rev 1Y/2Y + tidsstämpel)
 # ------------------------------------------------------------
 def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None) -> tuple[dict, dict, pd.DataFrame]:
-    """
-    Returnerar:
-      updates: nycklar/kolumnvärden att skriva till Data
-      meta:    metadata från compute_methods_for_row
-      methods: metoder-tabell (för snapshot/visning)
-    """
     fake_row = pd.Series({"Ticker": ticker}) if existing_row is None else existing_row
     settings = get_settings_map()
     fx_map   = get_fx_map()
 
     methods_df, _, meta = compute_methods_for_row(fake_row, settings, fx_map)
 
-    # Grundfält från meta/snapshot
     updates: dict = {}
     updates["Aktuell kurs"]       = meta.get("price")
     updates["Valuta"]             = meta.get("currency")
     updates["Utestående aktier"]  = meta.get("shares_out")
     updates["Net debt"]           = meta.get("net_debt")
 
-    # Nyckeltal från fetch_yahoo_snapshot (körs redan i compute_methods)
     snap = fetch_yahoo_snapshot(ticker)
     updates.update({
         "Rev TTM":      snap.get("revenue_ttm"),
@@ -1622,7 +1616,6 @@ def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None
         "Sektor":       snap.get("sector"),
     })
 
-    # EPS-estimat + härledd Rev 1Y/2Y
     yh_eps  = fetch_yahoo_eps_estimates(ticker)
     updates["EPS 1Y"] = _pos(yh_eps.get("eps_1y"))
     updates["EPS 2Y"] = _pos(yh_eps.get("eps_2y"))
@@ -1631,31 +1624,25 @@ def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None
     updates["Rev 1Y"] = rev1
     updates["Rev 2Y"] = rev2
 
-    # Stämpla uppdateringstider
     updates["Senast auto uppdaterad"] = now_stamp()
     updates["Auto källa"] = "Yahoo"
     if _should_stamp_estimates(updates):
         updates["Estimat senast uppdaterad"] = updates["Senast auto uppdaterad"]
 
-    # Rensa None/NaN
     clean = {}
     for k, v in updates.items():
         if v is None:
             continue
-        if isinstance(v, float) and v != v:  # NaN
+        if isinstance(v, float) and v != v:
             continue
         clean[k] = v
 
     return clean, meta, methods_df
 
 # ------------------------------------------------------------
-# Editor (med sökbar rullista + "10 äldsta estimat")
+# Editor (sökbar rullista + "10 äldsta estimat")
 # ------------------------------------------------------------
 def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
-    """
-    Bygger en sökbar rullista (alfabetisk) över 'Bolagsnamn (TICKER)'.
-    Returnerar vald ticker (eller nuvarande från fältet om ingen ändring).
-    """
     if df.empty:
         return st.session_state.get("ticker_input", "")
 
@@ -1672,7 +1659,8 @@ def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
     labels = [lbl for (lbl, _) in options]
     pick_map = {lbl: t for (lbl, t) in options}
 
-    sel = st.selectbox("Sök bolag/ticker (alfabetisk)", labels, index=None, placeholder="Sök på namn eller ticker …", key="editor_picker")
+    sel = st.selectbox("Sök bolag/ticker (alfabetisk)", labels, index=None,
+                       placeholder="Sök på namn eller ticker …", key="editor_picker")
     if sel:
         tkr = pick_map.get(sel, "")
         if tkr and st.session_state.get("ticker_input") != tkr:
@@ -1682,11 +1670,6 @@ def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
     return st.session_state.get("ticker_input", "")
 
 def _render_oldest_estimates_table(df: pd.DataFrame):
-    """
-    Visar de 10 äldsta posterna baserat på 'Estimat senast uppdaterad'
-    (fallback 'Senast auto uppdaterad' om estimat-stämpel saknas).
-    Tar sikte på fälten: EPS 1Y, EPS 2Y, Rev 1Y, Rev 2Y.
-    """
     if df.empty:
         st.info("Inga data för att visa äldsta estimat.")
         return
@@ -1701,6 +1684,8 @@ def _render_oldest_estimates_table(df: pd.DataFrame):
     used_ts = est_ts.fillna(auto_ts)
 
     now_ts = pd.Timestamp.now()
+    # Säkerställ Timestamp - Timestamp
+    used_ts = pd.to_datetime(used_ts, errors="coerce")
     age_days = (now_ts - used_ts).dt.days
     work["_age"] = age_days
 
@@ -1713,11 +1698,6 @@ def _render_oldest_estimates_table(df: pd.DataFrame):
     if work.empty:
         st.info("Det finns ännu inga sparade estimat (EPS/Rev 1–2 år).")
         return
-
-    cols = ["Ticker","Bolagsnamn","EPS 1Y","EPS 2Y","Rev 1Y","Rev 2Y"]
-    for c in cols:
-        if c not in work.columns:
-            work[c] = np.nan
 
     view = work.copy()
     view["Estimat senast uppdaterad"] = used_ts.dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -1734,12 +1714,10 @@ def page_editor():
     df = read_data_df()
     df = _ensure_estimate_columns(df)
 
-    # Sökbar rullista
     with st.container(border=True):
         st.markdown("#### Sök bolag")
         _ = _render_searchable_ticker_picker(df)
 
-    # Manuell ticker + bucket
     c1, c2 = st.columns([2,1])
     with c1:
         ticker = st.text_input("Ticker (t.ex. NVDA, 2020.OL)", value=st.session_state.get("ticker_input",""), key="ticker_input").strip().upper()
@@ -1755,7 +1733,6 @@ def page_editor():
         if mask.any():
             existing_row = df[mask].iloc[0]
 
-    # Hämta från Yahoo
     upd_col, save_col = st.columns([1,1])
     if upd_col.button("🔎 Hämta & fyll från Yahoo (inkl. EPS/Rev-estimat)"):
         try:
@@ -1777,12 +1754,9 @@ def page_editor():
             if existing_row is None or k not in existing_row.index:
                 return None
             return existing_row.get(k)
-        preview = []
-        for k in sorted(updates.keys()):
-            preview.append({"Fält": k, "Gammalt": _old_val(k), "Nytt": updates[k]})
+        preview = [{"Fält": k, "Gammalt": _old_val(k), "Nytt": updates[k]} for k in sorted(updates.keys())]
         st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
-    # Spara
     if save_col.button("💾 Spara till Data"):
         if not ticker:
             st.warning("Ange ticker först.")
@@ -1795,8 +1769,8 @@ def page_editor():
             if not mask.any():
                 base = {c: np.nan for c in list(cur.columns)}
                 base.update({"Timestamp": now_stamp(), "Ticker": ticker, "Bucket": bucket})
-                if updates:
-                    for k, v in updates.items():
+                for k, v in (updates or {}).items():
+                    if v is not None and not (isinstance(v, float) and v != v):
                         base[k] = v
                 cur = pd.concat([cur, pd.DataFrame([base])], ignore_index=True)
             else:
@@ -1815,7 +1789,6 @@ def page_editor():
                 except Exception:
                     pass
 
-    # Visa metoder
     if isinstance(methods, pd.DataFrame) and not methods.empty:
         with st.expander("📊 Metoder & målpriser (senaste hämtning)"):
             st.dataframe(methods, use_container_width=True)
@@ -1961,7 +1934,7 @@ def page_snapshot():
     st.dataframe(snap, use_container_width=True)
 
 # ------------------------------------------------------------
-# CHANGED: Fallback för _startup_refresh om den saknas
+# Fallback för _startup_refresh (om den saknas)
 # ------------------------------------------------------------
 if "_startup_refresh" not in globals():
     def _startup_refresh():
@@ -2005,7 +1978,40 @@ if "_startup_refresh" not in globals():
             pass
 
 # ------------------------------------------------------------
-# CHANGED: Main — anropa sidfunktioner utan argument (matchar basen)
+# CHANGED: Smart sid-anropare som matchar båda signaturerna
+# ------------------------------------------------------------
+def _invoke_page(fn, df_data: pd.DataFrame, settings: dict, fx_map: dict):
+    """
+    Kollar funktionssignaturen och skickar in endast de parametrar som efterfrågas.
+    Stöder t.ex.:
+      page_analysis()
+      page_analysis(df_data, settings, fx_map)
+      page_portfolio(df_data)
+      page_ranking(df_data)
+    """
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        kwargs = {}
+        # namn som ofta används
+        env = {
+            "df_data": df_data,
+            "df": df_data,
+            "settings": settings,
+            "s": settings,
+            "fx_map": fx_map,
+            "fx": fx_map,
+        }
+        for name in params.keys():
+            if name in env:
+                kwargs[name] = env[name]
+        return fn(**kwargs) if kwargs else fn()
+    except TypeError:
+        # Om något strular, försök utan argument
+        return fn()
+
+# ------------------------------------------------------------
+# CHANGED: Main — använder _invoke_page
 # ------------------------------------------------------------
 def main():
     _startup_refresh()
@@ -2013,12 +2019,17 @@ def main():
     st.sidebar.title("Navigering")
     page = st.sidebar.radio("Gå till:", ["Analys","Portfölj","Ranking","Editor","Batch","Settings","Snapshot"], index=0)
 
+    # Förse ev. sidfunktioner som kräver argument
+    df_data = read_data_df()
+    settings = get_settings_map()
+    fx_map = get_fx_map()
+
     if page == "Analys":
-        page_analysis()
+        _invoke_page(page_analysis, df_data, settings, fx_map)
     elif page == "Portfölj":
-        page_portfolio()
+        _invoke_page(page_portfolio, df_data, settings, fx_map)
     elif page == "Ranking":
-        page_ranking()
+        _invoke_page(page_ranking, df_data, settings, fx_map)
     elif page == "Editor":
         page_editor()
     elif page == "Batch":
