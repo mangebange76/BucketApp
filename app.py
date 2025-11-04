@@ -1622,7 +1622,7 @@ def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None
         "Sektor":       snap.get("sector"),
     })
 
-    # EPS-estimat (Del 2/4) + härleda Rev 1Y/2Y från meta-path
+    # EPS-estimat + härledd Rev 1Y/2Y
     yh_eps  = fetch_yahoo_eps_estimates(ticker)
     updates["EPS 1Y"] = _pos(yh_eps.get("eps_1y"))
     updates["EPS 2Y"] = _pos(yh_eps.get("eps_2y"))
@@ -1637,7 +1637,7 @@ def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series | None = None
     if _should_stamp_estimates(updates):
         updates["Estimat senast uppdaterad"] = updates["Senast auto uppdaterad"]
 
-    # Rensa bort None/NaN
+    # Rensa None/NaN
     clean = {}
     for k, v in updates.items():
         if v is None:
@@ -1659,7 +1659,6 @@ def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
     if df.empty:
         return st.session_state.get("ticker_input", "")
 
-    # Label = "Bolagsnamn (TICKER)" så att sök funkar på båda
     options = []
     for _, r in df.iterrows():
         t = str(r.get("Ticker") or "").strip().upper()
@@ -1670,7 +1669,6 @@ def _render_searchable_ticker_picker(df: pd.DataFrame) -> str:
         options.append((label, t))
 
     options.sort(key=lambda x: x[0].lower())
-
     labels = [lbl for (lbl, _) in options]
     pick_map = {lbl: t for (lbl, t) in options}
 
@@ -1698,7 +1696,6 @@ def _render_oldest_estimates_table(df: pd.DataFrame):
         if c not in work.columns:
             work[c] = np.nan
 
-    # timestamp att använda
     est_ts = pd.to_datetime(work["Estimat senast uppdaterad"], errors="coerce")
     auto_ts = pd.to_datetime(work["Senast auto uppdaterad"], errors="coerce")
     used_ts = est_ts.fillna(auto_ts)
@@ -1707,7 +1704,6 @@ def _render_oldest_estimates_table(df: pd.DataFrame):
     age_days = (now_ts - used_ts).dt.days
     work["_age"] = age_days
 
-    # Filtrera bolag där minst ett av de fyra fälten faktiskt finns
     mask_has_any = (
         work["EPS 1Y"].notna() | work["EPS 2Y"].notna() |
         work["Rev 1Y"].notna() | work["Rev 2Y"].notna()
@@ -1738,12 +1734,12 @@ def page_editor():
     df = read_data_df()
     df = _ensure_estimate_columns(df)
 
-    # --- Sökbar rullista i alfabetisk ordning (namn/ticker) ---
+    # Sökbar rullista
     with st.container(border=True):
         st.markdown("#### Sök bolag")
         _ = _render_searchable_ticker_picker(df)
 
-    # --- Manuell ticker-inmatning + bucket ---
+    # Manuell ticker + bucket
     c1, c2 = st.columns([2,1])
     with c1:
         ticker = st.text_input("Ticker (t.ex. NVDA, 2020.OL)", value=st.session_state.get("ticker_input",""), key="ticker_input").strip().upper()
@@ -1753,14 +1749,13 @@ def page_editor():
     if ticker:
         st.session_state["editor_ticker"] = ticker
 
-    # Hitta ev. befintlig rad
     existing_row = None
     if ticker and not df.empty:
         mask = df["Ticker"].astype(str).str.upper() == ticker
         if mask.any():
             existing_row = df[mask].iloc[0]
 
-    # --- Hämta från Yahoo & förhandsvisa ---
+    # Hämta från Yahoo
     upd_col, save_col = st.columns([1,1])
     if upd_col.button("🔎 Hämta & fyll från Yahoo (inkl. EPS/Rev-estimat)"):
         try:
@@ -1778,7 +1773,6 @@ def page_editor():
 
     if updates:
         st.subheader("Föreslagna uppdateringar")
-        # visa diff
         def _old_val(k):
             if existing_row is None or k not in existing_row.index:
                 return None
@@ -1788,7 +1782,7 @@ def page_editor():
             preview.append({"Fält": k, "Gammalt": _old_val(k), "Nytt": updates[k]})
         st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
-    # --- Spara till Data (+ snapshot) ---
+    # Spara
     if save_col.button("💾 Spara till Data"):
         if not ticker:
             st.warning("Ange ticker först.")
@@ -1821,7 +1815,7 @@ def page_editor():
                 except Exception:
                     pass
 
-    # Visa metoder från senaste hämtning
+    # Visa metoder
     if isinstance(methods, pd.DataFrame) and not methods.empty:
         with st.expander("📊 Metoder & målpriser (senaste hämtning)"):
             st.dataframe(methods, use_container_width=True)
@@ -1851,7 +1845,6 @@ def page_batch():
 
     tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
     sel = st.multiselect("Välj tickers att uppdatera (tom = alla)", options=tickers, default=[])
-
     target = tickers if len(sel) == 0 else sel
 
     c1, c2 = st.columns([1,1])
@@ -1968,26 +1961,64 @@ def page_snapshot():
     st.dataframe(snap, use_container_width=True)
 
 # ------------------------------------------------------------
-# Main — samlar resurser och kallar sidor
+# CHANGED: Fallback för _startup_refresh om den saknas
+# ------------------------------------------------------------
+if "_startup_refresh" not in globals():
+    def _startup_refresh():
+        try:
+            s = get_settings_map()
+            if str(s.get("auto_refresh_on_start", "0")).strip() != "1":
+                return
+
+            df = read_data_df()
+            if df.empty:
+                return
+
+            changed = 0
+            for i, idx in enumerate(df.index):
+                tkr = str(df.at[idx, "Ticker"]).strip()
+                if not tkr:
+                    continue
+                try:
+                    tk = yf.Ticker(tkr)
+                    fi = getattr(tk, "fast_info", None)
+                    px = None
+                    ccy = None
+                    if fi:
+                        px = _f(getattr(fi, "last_price", None))
+                        ccy = str(getattr(fi, "currency", None) or "").upper() or None
+                    if px is None:
+                        hist = tk.history(period="5d")
+                        if not hist.empty:
+                            px = float(hist["Close"].dropna().iloc[-1])
+                    if px is not None:
+                        df.at[idx, "Aktuell kurs"] = px
+                        changed += 1
+                    if ccy:
+                        df.at[idx, "Valuta"] = ccy
+                except Exception:
+                    pass
+            if changed > 0:
+                df["Senast auto uppdaterad"] = df["Senast auto uppdaterad"].where(df["Senast auto uppdaterad"].notna(), "")
+                write_data_df(df)
+        except Exception:
+            pass
+
+# ------------------------------------------------------------
+# CHANGED: Main — anropa sidfunktioner utan argument (matchar basen)
 # ------------------------------------------------------------
 def main():
-    # Lätt uppstartsrefresh av pris/valuta
     _startup_refresh()
 
     st.sidebar.title("Navigering")
     page = st.sidebar.radio("Gå till:", ["Analys","Portfölj","Ranking","Editor","Batch","Settings","Snapshot"], index=0)
 
-    # Gemensamma resurser
-    settings = get_settings_map()
-    fx_map   = get_fx_map()
-    df_data  = read_data_df()
-
     if page == "Analys":
-        page_analysis(df_data, settings, fx_map)
+        page_analysis()
     elif page == "Portfölj":
-        page_portfolio(df_data, settings, fx_map)
+        page_portfolio()
     elif page == "Ranking":
-        page_ranking(df_data, settings)
+        page_ranking()
     elif page == "Editor":
         page_editor()
     elif page == "Batch":
