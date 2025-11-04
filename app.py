@@ -1797,8 +1797,6 @@ def page_editor():
         st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
     # [CHANGED] — Tabell: vilka av (EPS 1Y, EPS 2Y, REV 1Y, REV 2Y) är äldst (10 äldsta bolag)
-    # Not: Vi använder "Senast auto uppdaterad" (eller "Timestamp" fallback) som ålder för respektive fält.
-    # REV 1Y/2Y bedöms som "tillgänglig" om Rev TTM + Rev CAGR finns (de kan härledas); annars "saknas".
     with st.expander("⏱️ Uppdateringsstatus för EPS/REV – 10 äldsta", expanded=True):
         if df.empty:
             st.info("Ingen data att visa ännu.")
@@ -1808,17 +1806,12 @@ def page_editor():
                 if c not in work.columns:
                     work[c] = np.nan
 
-            # Tidsstämpel per rad
-            def _parse_dt(x):
-                try:
-                    return pd.to_datetime(x, errors="coerce")
-                except Exception:
-                    return pd.NaT
-            ts_auto = work["Senast auto uppdaterad"].apply(_parse_dt)
-            ts_fallback = work["Timestamp"].apply(_parse_dt)
-            ts_final = ts_auto.fillna(ts_fallback)
-            today = pd.Timestamp(today_date())
-            age_days = (today - ts_final.dt.date).dt.days.replace({pd.NaT: np.nan})
+            # [CHANGED-FIX] Säker datumhantering: använd Timestamp på båda sidor
+            ts_auto     = pd.to_datetime(work["Senast auto uppdaterad"], errors="coerce")  # [CHANGED-FIX]
+            ts_fallback = pd.to_datetime(work["Timestamp"], errors="coerce")               # [CHANGED-FIX]
+            ts_final    = ts_auto.fillna(ts_fallback)                                      # [CHANGED-FIX]
+            today       = pd.Timestamp(today_date())                                       # [CHANGED-FIX]
+            age_days    = (today - ts_final).dt.days                                       # [CHANGED-FIX]
 
             # Fält-tillgänglighet
             has_eps1 = pd.to_numeric(work["EPS 1Y"], errors="coerce").notna()
@@ -1827,9 +1820,7 @@ def page_editor():
                         pd.to_numeric(work["Rev CAGR"], errors="coerce").notna())
             has_rev2 = has_rev1  # samma krav för att kunna härleda 2 år
 
-            # "Äldst fält" logik:
-            # 1) Om något av fälten saknas → dessa listade som äldst (prioritera saknade).
-            # 2) Annars alla har samma ålder (styrs av ts_final) → markera "Alla".
+            # "Äldst fält" logik
             def _eldst_row(i):
                 missing = []
                 if not bool(has_eps1.iloc[i]): missing.append("EPS 1Y")
@@ -1845,8 +1836,8 @@ def page_editor():
                 rows.append({
                     "Ticker": work["Ticker"].iloc[i],
                     "Bolagsnamn": work["Bolagsnamn"].iloc[i],
-                    "Senast uppd.": ts_final.iloc[i].date() if pd.notna(ts_final.iloc[i]) else None,
-                    "Ålder (dagar)": int(age_days.iloc[i]) if pd.notna(age_days.iloc[i]) else None,
+                    "Senast uppd.": (ts_final.iloc[i].date() if pd.notna(ts_final.iloc[i]) else None),
+                    "Ålder (dagar)": (int(age_days.iloc[i]) if pd.notna(age_days.iloc[i]) else None),
                     "EPS 1Y": "✓" if bool(has_eps1.iloc[i]) else "—",
                     "EPS 2Y": "✓" if bool(has_eps2.iloc[i]) else "—",
                     "REV 1Y": "✓" if bool(has_rev1.iloc[i]) else "—",
@@ -1860,7 +1851,6 @@ def page_editor():
                     ])
                 })
             status_df = pd.DataFrame(rows)
-            # Sortera: flest saknade först, därefter längst ålder
             status_df = status_df.sort_values(by=["_missing_count","Ålder (dagar)"],
                                               ascending=[False, False], na_position="last")
             show_cols = ["Ticker","Bolagsnamn","Senast uppd.","Ålder (dagar)","EPS 1Y","EPS 2Y","REV 1Y","REV 2Y","Äldst fält"]
