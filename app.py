@@ -953,7 +953,7 @@ def fetch_yahoo_eps_cagr_hist(ticker: str, min_years: int = 3, max_years: int = 
         except Exception:
             inc = getattr(tk, "income_stmt", None)
 
-        if inc is None eller (hasattr(inc, "empty") and inc.empty):
+        if inc is None or (hasattr(inc, "empty") and inc.empty):
             return {"eps_cagr": None, "years": None, "source": "none"}
 
         df = inc.copy()
