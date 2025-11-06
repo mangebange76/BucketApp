@@ -1739,10 +1739,10 @@ def render_portfolio_view(data_df: pd.DataFrame, fx_map: dict[str, float]):
         st.dataframe(nd, use_container_width=True)
 
 # ============================================================
-# app.py — Del 5/6 — Main & vyer  🔧 UPPDATERAD
+# app.py — Del 5/6 — Main & vyer  ✅ KOMPLETT
 #  • Settings, Snapshot
-#  • Editor (skriv bolagsnamn i sökfältet + Föregående/Nästa)
-#  • Lägg till ticker (oförändrad)
+#  • Editor (skriv bolagsnamn/ticker + Föregående/Nästa)
+#  • Lägg till ticker
 #  • Portfölj, Analys, Ranking, Batch
 #  • Boot & main
 # ============================================================
@@ -1787,7 +1787,7 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------------------
-# NYTT: gemensam sök + bläddrare
+# Gemensam sök + bläddrare
 # -------------------------------
 def _names_map_from_df(df: pd.DataFrame) -> dict[str, str]:
     mp: dict[str, str] = {}
@@ -1812,8 +1812,7 @@ def _select_with_search_nav(label: str,
     Renderar:
       • Sökfält (matchar ticker eller bolagsnamn)
       • Föregående / Nästa-knappar (uppdaterar index i session state)
-      • Selectbox UTAN key (index styrs av vårt egna idx_state)
-
+      • Selectbox UTAN key (index styrs av vår egen idx-state)
     Returnerar vald ticker (str) eller None.
     """
     ss = st.session_state
@@ -1822,8 +1821,7 @@ def _select_with_search_nav(label: str,
     if query_key not in ss:
         ss[query_key] = ""
 
-    # Sökfält (användaren kan skriva BOLAGSNAMN eller ticker)
-    q = st.text_input(f"Sök (ticker/bolagsnamn)", value=ss[query_key], key=query_key)
+    q = st.text_input("Sök (ticker/bolagsnamn)", value=ss[query_key], key=query_key)
 
     def _match(t: str) -> bool:
         if not q:
@@ -1837,8 +1835,7 @@ def _select_with_search_nav(label: str,
         st.info("Inget matchande resultat – visar alla bolag.")
         filtered = options[:]
 
-    # Navigering före widget-render
-    col_prev, col_cur, col_next = st.columns([1, 6, 1])
+    col_prev, col_mid, col_next = st.columns([1, 6, 1])
     with col_prev:
         if st.button("◀︎", key=f"{idx_key}_prev") and filtered:
             ss[idx_key] = (ss[idx_key] - 1) % len(filtered)
@@ -1847,20 +1844,17 @@ def _select_with_search_nav(label: str,
         if st.button("▶︎", key=f"{idx_key}_next") and filtered:
             ss[idx_key] = (ss[idx_key] + 1) % len(filtered)
             st.rerun()
-    with col_cur:
-        # visa aktuell
+    with col_mid:
         if filtered:
             cur_t = filtered[ss[idx_key] % len(filtered)]
             disp = names_map.get(cur_t, "")
             st.caption(f"Aktuell: **{cur_t}**" + (f" — {disp}" if disp else ""))
 
-    # Selectbox utan key (vi styr val via index)
     idx = ss[idx_key] % len(filtered) if filtered else 0
     labels = [f"{t} — {names_map.get(t,'')}" if names_map.get(t) else t for t in filtered]
     sel_label = st.selectbox(label, labels, index=idx)
-    # mappa tillbaka
     sel_idx = labels.index(sel_label) if sel_label in labels else idx
-    ss[idx_key] = sel_idx  # låt index följa användarens val
+    ss[idx_key] = sel_idx
     return filtered[sel_idx] if filtered else None
 
 # ============================================================
@@ -1869,8 +1863,6 @@ def _select_with_search_nav(label: str,
 def page_settings():
     st.header("⚙️ Settings")
     s = get_settings_map()
-
-    # Läs/visa valutakurser
     fx = get_fx_map()
 
     c1,c2,c3 = st.columns(3)
@@ -1948,7 +1940,7 @@ def page_snapshot():
     st.dataframe(snap, use_container_width=True)
 
 # ============================================================
-# Editor (manuella fält) — UPPDATERAD: sök + bläddra
+# Editor (manuella fält) — sök + bläddra
 # ============================================================
 def page_editor():
     st.header("Editor (manuella fält)")
@@ -1965,7 +1957,6 @@ def page_editor():
     tickers = df["Ticker"].dropna().astype(str).unique().tolist()
     names_map = _names_map_from_df(df)
 
-    # 🔄 NY VAL: sökbart + Föregående/Nästa, utan widget-key-konflikter
     sel = _select_with_search_nav("Välj rad (Ticker)", tickers, names_map, "editor_idx", "editor_q")
     if not sel:
         st.info("Välj ett bolag.")
@@ -2043,12 +2034,147 @@ def page_editor():
     st.dataframe(df.loc[[idx]], use_container_width=True)
 
 # ============================================================
-# ➕ Lägg till ticker — (oförändrad)
+# ➕ Lägg till ticker — (som tidigare)
 # ============================================================
-# ... (oförändrat, samma som tidigare del) ...
+def _build_updates_from_yahoo(ticker: str, existing_row: pd.Series):
+    """Bygger uppdateringsdict från Yahoo (återanvänds i Editor/Batch)."""
+    snap = fetch_yahoo_snapshot(ticker)
+    est  = fetch_yahoo_eps_estimates(ticker)
+    rc   = fetch_yahoo_rev_cagr(ticker)
+    ec   = fetch_yahoo_eps_cagr_hist(ticker)
+
+    updates = {
+        "Timestamp": _now(),
+        "Bolagsnamn": _maybe(snap.get("company_name")),
+        "Sektor": _maybe(snap.get("sector")),
+        "Aktuell kurs": _round2_or_none(snap.get("price")),
+        "Valuta": (snap.get("currency") or existing_row.get("Valuta")),
+        "Utestående aktier": _maybe(snap.get("shares")),
+        "Net debt": _maybe(snap.get("net_debt")),
+        "Rev TTM": _maybe(snap.get("revenue_ttm")),
+        "EBITDA TTM": _maybe(snap.get("ebitda_ttm")),
+        "EPS TTM": _maybe(snap.get("eps_ttm")),
+        "PE TTM": _maybe(snap.get("pe_ttm")),
+        "PE FWD": _maybe(snap.get("pe_fwd")),
+        "EV/Revenue": _maybe(snap.get("ev_to_sales")),
+        "EV/EBITDA": _maybe(snap.get("ev_to_ebitda")),
+        "P/B": _maybe(snap.get("p_to_book")),
+        "BVPS": _maybe(snap.get("bvps")),
+        "EPS 1Y": _maybe(est.get("eps_1y")) if pd.isna(existing_row.get("EPS 1Y")) else existing_row.get("EPS 1Y"),
+        "EPS 2Y": _maybe(est.get("eps_2y")) if pd.isna(existing_row.get("EPS 2Y")) else existing_row.get("EPS 2Y"),
+        "Rev CAGR": _maybe(rc.get("rev_cagr")),
+        "EPS CAGR": _maybe(ec.get("eps_cagr")),
+        "Årlig utdelning": _maybe(snap.get("annual_dividend")),
+        "Utdelningsfrekvens": _maybe(snap.get("dividend_frequency")),
+        "Senast auto uppdaterad": _now(),
+        "Auto källa": "Yahoo",
+    }
+    # Rensa
+    out = {}
+    for k, v in updates.items():
+        if v is None: 
+            continue
+        if isinstance(v, float) and pd.isna(v):
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        out[k] = v
+    return out
+
+def page_add_ticker():
+    st.header("➕ Lägg till ticker")
+
+    tkr = st.text_input("Ticker", key="add_ticker").upper().strip()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        bolagsnamn = st.text_input("Bolagsnamn", key="add_name")
+        sektor     = st.text_input("Sektor", key="add_sector")
+    with c2:
+        bucket = st.selectbox("Bucket", DEFAULT_BUCKETS, index=0, key="add_bucket")
+        valuta = st.text_input("Valuta (t.ex. USD)", value="USD", key="add_ccy").upper()
+    with c3:
+        antal = st.text_input("Antal aktier", value="", key="add_qty")
+        gav   = st.text_input("GAV (SEK)", value="", key="add_gav")
+
+    st.markdown("**Prognos-/manuella fält (frivilliga):**")
+    c4, c5 = st.columns(2)
+    with c4:
+        eps1_in = st.text_input("EPS 1Y (estimat)", key="add_eps1")
+        rev1_in = st.text_input("Rev 1Y (miljoner, 8.81B skrivs 8810)", key="add_rev1")
+    with c5:
+        eps2_in = st.text_input("EPS 2Y (estimat)", key="add_eps2")
+        rev2_in = st.text_input("Rev 2Y (miljoner)", key="add_rev2")
+
+    colA, colB = st.columns(2)
+    with colA:
+        do_prefill = st.checkbox("Hämta & fyll på fält från Yahoo", value=True, key="add_prefill")
+        if st.button("🔍 Hämta från Yahoo nu"):
+            if not tkr:
+                st.warning("Ange en ticker först.")
+            else:
+                try:
+                    snap = fetch_yahoo_snapshot(tkr)
+                    st.session_state["add_name"]   = snap.get("company_name") or st.session_state.get("add_name","")
+                    st.session_state["add_sector"] = snap.get("sector") or st.session_state.get("add_sector","")
+                    st.session_state["add_ccy"]    = (snap.get("currency") or st.session_state.get("add_ccy","USD")).upper()
+                    st.success("Fält uppdaterade från Yahoo.")
+                except Exception as e:
+                    st.error(f"Kunde inte hämta från Yahoo: {e}")
+
+    with colB:
+        st.caption("Tips: lämna Antal/GAV tomt om du ännu inte äger aktien.")
+
+    st.markdown("---")
+    if st.button("💾 Lägg till i DATA (spara till Google Sheets)"):
+        if not tkr:
+            st.warning("Ticker krävs.")
+            return
+        try:
+            base_df = read_data_df()
+            if not base_df.empty and (base_df["Ticker"].astype(str).str.upper() == tkr.upper()).any():
+                st.error("Ticker finns redan i DATA. Använd Editor för att uppdatera befintlig rad.")
+                return
+
+            new_row = {c: np.nan for c in DATA_COLUMNS}
+            new_row.update({
+                "Timestamp": _now(),
+                "Ticker": tkr,
+                "Bolagsnamn": bolagsnamn if bolagsnamn else np.nan,
+                "Sektor": sektor if sektor else np.nan,
+                "Bucket": bucket,
+                "Valuta": valuta or "USD",
+            })
+
+            qty_v = _parse_float(antal) or 0.0
+            gav_v = _parse_float(gav)
+            new_row["Antal aktier"] = qty_v
+            if gav_v is not None:
+                new_row["GAV (SEK)"] = gav_v
+
+            eps1_v  = _parse_float(eps1_in)
+            eps2_v  = _parse_float(eps2_in)
+            rev1_vm = (_parse_float(rev1_in) or 0.0) * 1_000_000.0 if rev1_in not in (None,"") else None
+            rev2_vm = (_parse_float(rev2_in) or 0.0) * 1_000_000.0 if rev2_in not in (None,"") else None
+            if eps1_v is not None: new_row["EPS 1Y"] = eps1_v
+            if eps2_v is not None: new_row["EPS 2Y"] = eps2_v
+            if rev1_vm is not None: new_row["Rev 1Y"] = rev1_vm
+            if rev2_vm is not None: new_row["Rev 2Y"] = rev2_vm
+            new_row["Senast manuellt uppdaterad"] = _now()
+
+            if do_prefill:
+                updates = _build_updates_from_yahoo(tkr, pd.Series(new_row))
+                new_row.update(updates)
+                time.sleep(0.15)
+
+            out_df = pd.concat([base_df, pd.DataFrame([new_row])], ignore_index=True)
+            write_data_df(out_df)
+            st.session_state["DATA"] = out_df
+            st.success(f"{tkr} tillagd i DATA och sparad till Google Sheets.")
+        except Exception as e:
+            st.error(f"Kunde inte lägga till: {e}")
 
 # ============================================================
-# Portfölj (wire till Del 4)
+# Portfölj (kopplar till Del 4)
 # ============================================================
 def page_portfolio():
     st.header("Portfölj")
@@ -2063,7 +2189,7 @@ def page_portfolio():
         st.error(f"Kunde inte rendera portföljen: {e}")
 
 # ============================================================
-# Analys – huvudvy  🔧 UPPDATERAD: sök + bläddra, ingen widget-key
+# Analys – huvudvy (sök + bläddra)
 # ============================================================
 def _pick_primary_method(row: pd.Series, methods_df: pd.DataFrame) -> str:
     existing = str(row.get("Primär metod") or "").strip()
@@ -2096,7 +2222,6 @@ def page_analysis():
     tickers = df["Ticker"].dropna().astype(str).unique().tolist()
     names_map = _names_map_from_df(df)
 
-    # 🔄 NY VAL: sökbart + Föregående/Nästa (utan key-krockar)
     tkr = _select_with_search_nav("Välj bolag", tickers, names_map, "analysis_idx", "analysis_q")
     if not tkr:
         st.info("Välj ett bolag.")
@@ -2170,12 +2295,79 @@ def page_analysis():
     st.dataframe(st.session_state["DATA"], use_container_width=True)
 
 # ============================================================
-# Ranking – (oförändrad)
+# Ranking – uppsida
 # ============================================================
-# ... (oförändrat, samma som tidigare del) ...
+def _ensure_price_for_row(row: pd.Series) -> float | None:
+    p = _pos(row.get("Aktuell kurs"))
+    if _pos(p):
+        return float(p)
+    snap = fetch_yahoo_snapshot(str(row.get("Ticker")))
+    return _pos(snap.get("price"))
+
+def page_ranking():
+    st.header("🏆 Ranking – Uppsida per horisont")
+    df: pd.DataFrame | None = st.session_state.get("DATA")
+    if df is None or df.empty:
+        st.warning("Ingen data laddad.")
+        return
+
+    only_owned = st.checkbox("Visa endast innehav (Antal aktier > 0)", value=False)
+    horizon = st.selectbox("Horisont", ["Idag","1 år","2 år","3 år"], index=1)
+
+    base = df.copy()
+    if only_owned:
+        base = base[(pd.to_numeric(base["Antal aktier"], errors="coerce") > 0)]
+
+    rows = []
+    settings = get_settings_map()
+    fx_map   = get_fx_map()
+
+    prog = st.progress(0.0)
+    total = len(base)
+    for i, (_, r) in enumerate(base.iterrows(), start=1):
+        try:
+            methods_df, sanity, meta = compute_methods_for_row(r, settings, fx_map)
+            meth = _pick_primary_method(r, methods_df)
+            tgts = _targets_from_methods(methods_df, meth)
+            price = _ensure_price_for_row(r) or np.nan
+            target = _f(tgts[horizon])
+            up = ((target - price) / price * 100.0) if (_pos(target) and _pos(price)) else np.nan
+
+            rows.append({
+                "Ticker": str(r.get("Ticker")),
+                "Valuta": str(_nz(meta.get("currency"), r.get("Valuta") or "USD")).upper(),
+                "Kurs": price,
+                f"Riktkurs {horizon}": target,
+                "Uppsida (%)": up,
+                "Metod": meth,
+            })
+        except Exception:
+            pass
+        prog.progress(i/total if total else 1.0)
+
+    prog.empty()
+    if not rows:
+        st.info("Inget att visa.")
+        return
+
+    rank = pd.DataFrame(rows)
+    rank = rank.sort_values("Uppsida (%)", ascending=False, na_position="last").reset_index(drop=True)
+    st.caption(f"{len(rank)} bolag")
+    st.dataframe(rank, use_container_width=True)
+
+    st.markdown("---")
+    if st.checkbox("Visa ett bolag i taget"):
+        idx = st.number_input("Index", min_value=1, max_value=len(rank), value=1, step=1)
+        item = rank.iloc[int(idx)-1]
+        st.metric("Ticker", item["Ticker"])
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Kurs", _format_num(item["Kurs"]))
+        c2.metric(f"Riktkurs {horizon}", _format_num(item[f"Riktkurs {horizon}"]))
+        c3.metric("Uppsida (%)", "—" if pd.isna(item["Uppsida (%)"]) else f"{item['Uppsida (%)']:.1f}%")
+        st.caption(f"Metod: {item['Metod']}  ·  Valuta: {item['Valuta']}")
 
 # ============================================================
-# Batch (Massuppdatering Yahoo) — UPPDATERAD: sök + bläddra + toggle
+# Batch (Massuppdatering Yahoo) — sök + bläddra + toggle
 # ============================================================
 def _clean_non_empty(d: dict) -> dict:
     out = {}
@@ -2212,7 +2404,6 @@ def page_batch():
     tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
     names_map = _names_map_from_df(df)
 
-    # Sökfält (ticker eller bolagsnamn)
     q = st.text_input("Sök (ticker/bolagsnamn) för urval", value=st.session_state.get("batch_q", ""), key="batch_q")
 
     def _match(t: str) -> bool:
@@ -2227,7 +2418,6 @@ def page_batch():
         st.info("Inget matchande resultat – visar alla bolag.")
         filtered = tickers[:]
 
-    # Navigering & snabb-toggling av ett bolag i urvalet
     ss = st.session_state
     if "batch_idx" not in ss:
         ss["batch_idx"] = 0
@@ -2257,10 +2447,9 @@ def page_batch():
                 ss["batch_selected"] = ss["batch_selected"] + [cur]
             st.rerun()
 
-    # Multiselect utan key — default = session_state["batch_selected"], men intersection mot filtered
     default_sel = [x for x in ss["batch_selected"] if x in filtered]
     sel = st.multiselect("Välj tickers att uppdatera (tom = alla)", options=filtered, default=default_sel)
-    ss["batch_selected"] = sel  # spegla valet
+    ss["batch_selected"] = sel
 
     target = tickers if len(sel) == 0 else sel
 
@@ -2301,7 +2490,7 @@ def page_batch():
     st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
 
 # ============================================================
-# Session-boot & Main (oförändrat)
+# Session-boot & Main
 # ============================================================
 def _boot_session():
     # Data
