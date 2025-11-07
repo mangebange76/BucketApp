@@ -2651,12 +2651,9 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-    # Streamlit kör scriptet top-to-bottom vid varje interaktion.
-    # Att anropa main() här gör att appen även kan köras lokalt som:
-    #   streamlit run app.py
     try:
         main()
     except Exception as e:
-        # Fångar oväntade fel högst upp för att undvika råa tracebacks i UI
-        import streamlit as st
-        st.error(f"💥 Oväntat fel i entrypoint: {e}")
+        import streamlit as st, traceback
+        st.error(f"💥 Fel i huvudloopen: {e}")
+        st.code(traceback.format_exc())
