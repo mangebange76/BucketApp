@@ -1235,372 +1235,246 @@ def _rev_million_to_units(v: float | None) -> float | None:
 
 # ============================================================
 # app.py — Del 3/6 — Datainsamling & beräkningsmotor (2/2)
-#  • CHANGED: Värderingsmetoder (NAV/TBV/AFFO/FCF/EV/FCF/NII)
-#  • Bygger prisbanor (idag, 1y, 2y, 3y) med multipel-decay
-#  • Använder redan hämtade TTM-nyckeltal från Del 2/6
+#  • compute_methods_for_row: returnerar metodtabell + meta/sanity
+#  • Rev 1Y/2Y auto-detektas mot Rev TTM (miljoner vs enheter)
 # ============================================================
 
-# -------------------------
-# Små hjälpare för banor
-# -------------------------
-# CHANGED:
-def _growth_series(base: float | None, cagr: float | None, years: list[int]) -> list[float | None]:
-    """Returnerar [base*(1+cagr)^t] för t i years. Om base/cagr saknas → [None,...]."""
-    b = _f(base)
-    g = _f(cagr)
-    if b is None:
-        return [None for _ in years]
-    if g is None:
-        # Om vi saknar tillväxt → håll konstant
-        return [float(b) for _ in years]
-    out = []
-    for t in years:
+def _eps_path_fill(eps_ttm: float | None, eps_1y: float | None, eps_2y: float | None,
+                   eps_cagr_hist: float | None, eps_cagr_long: float | None,
+                   rev_cagr_hist: float | None) -> tuple[float, float, float, float]:
+    """
+    Fyll EPS-path (TTM, 1y, 2y, 3y). Prioritet:
+      1) Direktestimat (eps_1y/eps_2y) om finns
+      2) Vektor via historisk EPS CAGR (5y)
+      3) Vektor via long-term eps trend (Yahoo)
+      4) Fallback via Revenue CAGR (hist)
+    """
+    e0 = _pos(eps_ttm) or 0.0
+    e1 = _pos(eps_1y)
+    e2 = _pos(eps_2y)
+
+    g = None
+    for cand in (eps_cagr_hist, eps_cagr_long, rev_cagr_hist, 0.0):
+        if _f(cand) is not None:
+            g = float(_f(cand))
+            break
+
+    if e1 is None:
+        e1 = e0 * (1.0 + (g or 0.0))
+    if e2 is None:
+        e2 = (e1 or 0.0) * (1.0 + (g or 0.0))
+    e3 = (e2 or 0.0) * (1.0 + (g or 0.0))
+    return float(e0), float(e1), float(e2), float(e3)
+
+def _rev_path(rev_ttm: float | None, rev_cagr_hist: float | None,
+              rev1_manual_units: float | None, rev2_manual_units: float | None) -> tuple[float | None, float | None, float | None, float | None]:
+    """
+    Revenue-path. Prioritet:
+      1) Manuell Rev 1Y/2Y (värdena ska vara i ENHETER – vi auto-detekterar i compute-metoden)
+      2) Härledd från historisk Rev CAGR (5y) + TTM
+    """
+    r0 = _pos(rev_ttm)
+    if _pos(rev1_manual_units) and _pos(rev2_manual_units):
+        return r0, float(rev1_manual_units), float(rev2_manual_units), float(rev2_manual_units) * (1.0 + float(_f(rev_cagr_hist) or 0.0))
+    if _pos(rev1_manual_units) and (not _pos(rev2_manual_units)):
+        g = float(_f(rev_cagr_hist) or 0.0)
+        r1 = float(rev1_manual_units)
+        r2 = r1 * (1.0 + g)
+        r3 = r2 * (1.0 + g)
+        return r0, r1, r2, r3
+    g = float(_f(rev_cagr_hist) or 0.0)
+    if r0 is None:
+        return None, None, None, None
+    r1 = r0 * (1.0 + g)
+    r2 = r1 * (1.0 + g)
+    r3 = r2 * (1.0 + g)
+    return r0, r1, r2, r3
+
+def _ebitda_path(ebitda_ttm: float | None, rev0: float | None, rev1: float | None, rev2: float | None, rev3: float | None) -> tuple[float | None, float | None, float | None, float | None]:
+    e0 = _f(ebitda_ttm)  # kan vara negativt
+    if e0 is None:
+        return None, None, None, None
+    if rev0 is None or rev1 is None:
+        return e0, e0, e0, e0
+    def scale(r):
         try:
-            out.append(float(b) * ((1.0 + float(g)) ** int(t)))
+            return (e0 * (r / rev0)) if (r and rev0) else e0
         except Exception:
-            out.append(None)
-    return out
+            return e0
+    return e0, scale(rev1), scale(rev2), scale(rev3)
 
-# CHANGED:
-def _multiple_series(mult0: float | None, years: list[int], decay: float = 0.15, floor_frac: float = 0.60) -> list[float | None]:
-    """Multipel bana med linjär decay per år ner mot golv (floor_frac * mult0)."""
-    m0 = _pos(mult0)
-    if m0 is None:
-        return [None for _ in years]
-    out = []
-    for t in years:
-        out.append(_decay_multiple(m0, int(t), float(decay), float(floor_frac)))
-    return out
+def compute_methods_for_row(row: pd.Series, settings: dict[str, str], fx_map: dict[str, float]) -> tuple[pd.DataFrame, str, dict[str, any]]:
+    ticker = str(row.get("Ticker", "")).strip()
 
-# CHANGED:
-def _targets_from_metric_and_mult(metric_path: list[float | None], mult_path: list[float | None],
-                                  comb: str = "mul") -> dict[str, float | None]:
-    """
-    Kombinera metrik-bana och multipel-bana till pris/EV-bana.
-    comb = "mul" → metric * mult
-    comb = "div" → metric / mult  (om man skulle behöva)
-    Returnerar dict: {"today":..., "1y":..., "2y":..., "3y":...}
-    """
-    res = []
-    for m, k in zip(metric_path, mult_path):
-        if m is None or k is None:
-            res.append(None)
-        else:
-            try:
-                if comb == "mul":
-                    res.append(float(m) * float(k))
-                else:
-                    res.append(float(m) / float(k) if float(k) != 0 else None)
-            except Exception:
-                res.append(None)
-    keys = ["today", "1y", "2y", "3y"]
-    return dict(zip(keys, res + [None] * max(0, len(keys) - len(res))))
+    # 1) Live-data
+    snap   = fetch_yahoo_snapshot(ticker)
+    time.sleep(0.12)  # mild throttling
+    yh_eps = fetch_yahoo_eps_estimates(ticker)
+    time.sleep(0.05)
+    revcg_yh = fetch_yahoo_rev_cagr(ticker)         # 5y hist Revenue CAGR
+    epscg_yh = fetch_yahoo_eps_cagr_hist(ticker)    # 5y hist EPS CAGR
 
-# CHANGED:
-def _path_to_targets(vals: list[float | None]) -> dict[str, float | None]:
-    """Mappar lista (length 4) → target-nycklar."""
-    keys = ["today", "1y", "2y", "3y"]
-    return dict(zip(keys, vals + [None] * max(0, len(keys) - len(vals))))
+    # 2) Inputs (med fallback från Data-bladet)
+    price    = _pos(_nz(snap.get("price"), row.get("Aktuell kurs")))
+    currency = str(_nz(snap.get("currency"), row.get("Valuta") or "USD")).upper()
+    shares   = _pos(_nz(snap.get("shares"), row.get("Utestående aktier")))
+    net_debt = _nz(snap.get("net_debt"), row.get("Net debt"))
 
-# CHANGED:
-def _equity_price_series_from_ev(ev_series: list[float | None], net_debt: float | None, shares_fd: float | None) -> dict[str, float | None]:
-    """Konverterar EV-bana → prisbana (equity) via (EV - netDebt) / shares."""
-    prices = []
-    for ev in ev_series:
-        prices.append(_equity_price_from_ev(ev, net_debt, shares_fd))
-    return _path_to_targets(prices)
+    rev_ttm    = _nz(snap.get("revenue_ttm"), row.get("Rev TTM"))
+    ebitda_ttm = _nz(snap.get("ebitda_ttm"), row.get("EBITDA TTM"))
+    eps_ttm    = _nz(snap.get("eps_ttm"), row.get("EPS TTM"))
+    pe_ttm     = _pos(_nz(snap.get("pe_ttm"), row.get("PE TTM")))
+    pe_fwd     = _pos(_nz(snap.get("pe_fwd"), row.get("PE FWD")))
+    ev_sales   = _pos(_nz(snap.get("ev_to_sales"), row.get("EV/Revenue")))
+    ev_ebitda  = _pos(_nz(snap.get("ev_to_ebitda"), row.get("EV/EBITDA")))
+    p_b        = _pos(_nz(snap.get("p_to_book"), row.get("P/B")))
+    bvps       = _pos(_nz(snap.get("bvps"), row.get("BVPS")))
 
-# -------------------------
-# Tillväxtingångar (CAGR) från Del 2
-# -------------------------
-# CHANGED:
-def _infer_rev_cagr_for_paths(ticker: str, snap: dict) -> float | None:
-    """Plockar/estimerar intäktstillväxt (CAGR) med clamp enligt global limits."""
-    r = fetch_yahoo_rev_cagr(ticker)
-    c = _clamp(r.get("rev_cagr"), REV_CAGR_MIN, REV_CAGR_MAX) if isinstance(r, dict) else None
-    return c
+    # Estimat / tillväxt — OBS: inga valutakonverteringar, manuella EPS tas "som de är"
+    eps_1y_est = _pos(_nz(row.get("EPS 1Y"), _nz(yh_eps.get("eps_1y"), None)))
+    eps_2y_est = _pos(_nz(row.get("EPS 2Y"), _nz(yh_eps.get("eps_2y"), None)))
 
-# CHANGED:
-def _infer_eps_cagr_for_paths(ticker: str, snap: dict) -> float | None:
-    """Plockar EPS-CAGR (lång trend) från Yahoo trend, fallback mot rev-CAGR."""
-    e = fetch_yahoo_eps_estimates(ticker)
-    c = _clamp(e.get("eps_cagr_long"), EPS_CAGR_MIN, EPS_CAGR_MAX) if isinstance(e, dict) else None
-    if c is None:
-        # fallback: använd rev-cagr
-        c = _infer_rev_cagr_for_paths(ticker, snap)
-        if c is not None:
-            c = _clamp(c, EPS_CAGR_MIN, EPS_CAGR_MAX)
-    return c
+    # Historisk CAGR (5y) — clamp
+    rev_cagr_hist_raw = _f(_nz(row.get("Rev CAGR"), revcg_yh.get("rev_cagr")))
+    rev_cagr_hist     = _clamp(rev_cagr_hist_raw, REV_CAGR_MIN, REV_CAGR_MAX)
 
-# -------------------------
-# p_nav — P/B * BVPS (generisk NAV-ankare)
-# -------------------------
-# CHANGED:
-def p_nav(ticker: str, snap: dict,
-          pb_now: float | None = None,
-          decay: float = 0.12, floor_frac: float = 0.65) -> dict[str, float | None]:
-    """
-    Pris från NAV/BV:  Price = (P/B) * BVPS.
-    • pb_now: ankarmultipel (default = aktuell price/bvps eller 'p_to_book')
-    • BVPS hålls konservativt konstant (ingen tillväxt antas här).
-    """
-    price = _pos(snap.get("price"))
-    bvps  = _pos(snap.get("bvps"))
-    if pb_now is None:
-        # välj bästa ankare
-        pb_now = _pos(snap.get("p_to_book"))
-        if pb_now is None and _pos(price) and _pos(bvps):
-            try:
-                pb_now = float(price) / float(bvps)
-            except Exception:
-                pb_now = None
+    eps_cagr_hist_raw = _f(_nz(row.get("EPS CAGR"), epscg_yh.get("eps_cagr")))
+    eps_cagr_hist     = _clamp(eps_cagr_hist_raw, EPS_CAGR_MIN, EPS_CAGR_MAX)
 
-    if not _pos(bvps) or not _pos(pb_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
+    # EPS TTM härledning endast om saknas
+    eps_ttm, src_eps_ttm = _derive_eps_ttm_from_pe_only(price, pe_ttm, _f(eps_ttm))
 
-    years = [0, 1, 2, 3]
-    # BVPS-bana: konservativt konstant
-    bv_path = [float(bvps) for _ in years]
-    pb_path = _multiple_series(pb_now, years, decay=decay, floor_frac=floor_frac)
-    return _targets_from_metric_and_mult(bv_path, pb_path, comb="mul")
+    # 3) Anchors & decay
+    w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
+    decay = _f(settings.get("multiple_decay", 0.10)) or 0.10
+    pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
-# -------------------------
-# p_tbv — P/TBV * TBVPS (banker/kapitaltunga)
-# -------------------------
-# CHANGED:
-def p_tbv(ticker: str, snap: dict,
-          ptbv_now: float | None = None,
-          decay: float = 0.12, floor_frac: float = 0.65) -> dict[str, float | None]:
-    """
-    Pris från Tangible Book: Price = (P/TBV) * TBVPS.
-    • ptbv_now: ankarmultipel (default = price/tbvps)
-    • TBVPS hålls konservativt konstant (kan vid behov kopplas till EPS/ROTCE senare).
-    """
-    price = _pos(snap.get("price"))
-    tbvps = _pos(snap.get("tbvps"))
-    if ptbv_now is None:
-        if _pos(price) and _pos(tbvps):
-            try:
-                ptbv_now = float(price) / float(tbvps)
-            except Exception:
-                ptbv_now = None
+    # 4) Revenue: **auto-detekt** manuella 1Y/2Y mot TTM
+    rev1_manual_units = _rev_manual_to_units_autosense(_f(row.get("Rev 1Y")), _f(rev_ttm))
+    rev2_manual_units = _rev_manual_to_units_autosense(_f(row.get("Rev 2Y")), _f(rev_ttm))
+    r0, r1, r2, r3 = _rev_path(_f(rev_ttm), rev_cagr_hist, rev1_manual_units, rev2_manual_units)
 
-    if not _pos(tbvps) or not _pos(ptbv_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
+    # 5) EPS-path
+    eps_cagr_long = _clamp(_f(yh_eps.get("eps_cagr_long")), EPS_CAGR_MIN, EPS_CAGR_MAX)
+    e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est, eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
 
-    years = [0, 1, 2, 3]
-    tbv_path = [float(tbvps) for _ in years]
-    ptbv_path = _multiple_series(ptbv_now, years, decay=decay, floor_frac=floor_frac)
-    return _targets_from_metric_and_mult(tbv_path, ptbv_path, comb="mul")
+    # 6) EBITDA-path (skalar mot intäktsbana)
+    b0, b1, b2, b3 = _ebitda_path(_f(ebitda_ttm), r0, r1, r2, r3)
 
-# -------------------------
-# p_affo — (P/AFFO) * AFFO/sh (REITs)
-# -------------------------
-# CHANGED:
-def p_affo(ticker: str, snap: dict,
-           affops_now: float | None = None,        # AFFO per aktie, TTM eller senaste helår
-           cagr: float | None = None,              # AFFO-CAGR (kan approxeras med EPS-CAGR)
-           p_affo_now: float | None = None,        # ankarmultipel
-           decay: float = 0.10, floor_frac: float = 0.70) -> dict[str, float | None]:
-    """
-    REIT-värdering: Price = (P/AFFO) * AFFO/sh.
-    • affops_now: tas från snap["affops"] om finns; annars None.
-    • cagr: om None → använd EPS-CAGR som proxy.
-    • p_affo_now: om None → approximeras via price/affops_now om möjligt, annars konservativt 12–15x.
-    """
-    if affops_now is None:
-        affops_now = _pos(snap.get("affops"))
+    # Multiplar med decay
+    pe0  = pe_anchor
+    pe1m = _decay_multiple(pe_anchor, 1, decay)
+    pe2m = _decay_multiple(pe_anchor, 2, decay)
+    pe3m = _decay_multiple(pe_anchor, 3, decay)
 
-    if cagr is None:
-        cagr = _infer_eps_cagr_for_paths(ticker, snap)
+    evs0, evs1, evs2, evs3 = ev_sales, _decay_multiple(ev_sales, 1, decay), _decay_multiple(ev_sales, 2, decay), _decay_multiple(ev_sales, 3, decay)
+    eve0, eve1, eve2, eve3 = ev_ebitda, _decay_multiple(ev_ebitda, 1, decay), _decay_multiple(ev_ebitda, 2, decay), _decay_multiple(ev_ebitda, 3, decay)
+    pb0,  pb1,  pb2,  pb3  = p_b,     _decay_multiple(p_b,     1, decay), _decay_multiple(p_b,     2, decay), _decay_multiple(p_b,     3, decay)
 
-    if p_affo_now is None and _pos(snap.get("price")) and _pos(affops_now):
-        try:
-            p_affo_now = float(snap["price"]) / float(affops_now)
-        except Exception:
-            p_affo_now = None
-    if p_affo_now is None:
-        p_affo_now = 13.0  # konservativt ankare om data saknas
+    # 7) Priser per metod
+    methods = []
+    methods.append({
+        "Metod": "pe_hist_vs_eps",
+        "Idag": _price_from_pe(e0, pe0),
+        "1 år": _price_from_pe(e1, pe1m),
+        "2 år": _price_from_pe(e2, pe2m),
+        "3 år": _price_from_pe(e3, pe3m),
+    })
+    methods.append({
+        "Metod": "ev_sales",
+        "Idag": _equity_price_from_ev(_ev_from_sales(r0, evs0), net_debt, shares),
+        "1 år": _equity_price_from_ev(_ev_from_sales(r1, evs1), net_debt, shares),
+        "2 år": _equity_price_from_ev(_ev_from_sales(r2, evs2), net_debt, shares),
+        "3 år": _equity_price_from_ev(_ev_from_sales(r3, evs3), net_debt, shares),
+    })
+    methods.append({
+        "Metod": "ev_ebitda",
+        "Idag": _equity_price_from_ev(_ev_from_ebitda(b0, eve0), net_debt, shares),
+        "1 år": _equity_price_from_ev(_ev_from_ebitda(b1, eve1), net_debt, shares),
+        "2 år": _equity_price_from_ev(_ev_from_ebitda(b2, eve2), net_debt, shares),
+        "3 år": _equity_price_from_ev(_ev_from_ebitda(b3, eve3), net_debt, shares),
+    })
+    methods.append({
+        "Metod": "ev_dacf",
+        "Idag": _equity_price_from_ev(_ev_from_ebitda(b0, eve0), net_debt, shares),
+        "1 år": _equity_price_from_ev(_ev_from_ebitda(b1, eve1), net_debt, shares),
+        "2 år": _equity_price_from_ev(_ev_from_ebitda(b2, eve2), net_debt, shares),
+        "3 år": _equity_price_from_ev(_ev_from_ebitda(b3, eve3), net_debt, shares),
+    })
+    methods.append({
+        "Metod": "p_b",
+        "Idag": _price_from_pb(pb0, bvps),
+        "1 år": _price_from_pb(pb1, bvps),
+        "2 år": _price_from_pb(pb2, bvps),
+        "3 år": _price_from_pb(pb3, bvps),
+    })
+    for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
+        methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
-    if not _pos(affops_now) or not _pos(p_affo_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
+    methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
-    years = [0, 1, 2, 3]
-    affo_path = _growth_series(affops_now, cagr, years)
-    mult_path = _multiple_series(p_affo_now, years, decay=decay, floor_frac=floor_frac)
-    return _targets_from_metric_and_mult(affo_path, mult_path, comb="mul")
+    # 8) Sanity + META
+    src = snap.get("sources", {}) or {}
 
-# -------------------------
-# p_fcf — (P/FCF) * FCF/sh
-# -------------------------
-# CHANGED:
-def p_fcf(ticker: str, snap: dict,
-          fcfps_now: float | None = None,
-          cagr: float | None = None,              # prox: EPS-CAGR
-          p_fcf_now: float | None = None,         # ankarmultipel
-          decay: float = 0.15, floor_frac: float = 0.60) -> dict[str, float | None]:
-    """
-    Price = (P/FCF) * FCF per aktie.
-    • FCF/sh från snap["fcfps"] (Del 2) om tillgängligt.
-    • p/FCF-ankare: price/fcfps om möjligt, annars 15x (konservativt).
-    • Tillväxt: EPS-CAGR som proxy.
-    """
-    if fcfps_now is None:
-        fcfps_now = _pos(snap.get("fcfps"))
+    eps1_src = ("sheet" if _pos(row.get("EPS 1Y")) else
+                ("yahoo_trend" if _pos(yh_eps.get("eps_1y")) else "filled_by_rule"))
 
-    if cagr is None:
-        cagr = _infer_eps_cagr_for_paths(ticker, snap)
+    eps2_src = ("sheet" if _pos(row.get("EPS 2Y")) else
+                ("yahoo_trend" if _pos(yh_eps.get("eps_2y")) else "filled_by_rule"))
 
-    if p_fcf_now is None and _pos(snap.get("price")) and _pos(fcfps_now):
-        try:
-            p_fcf_now = float(snap["price"]) / float(fcfps_now)
-        except Exception:
-            p_fcf_now = None
-    if p_fcf_now is None:
-        p_fcf_now = 15.0
+    revc_src = ("sheet" if _f(row.get("Rev CAGR")) is not None else
+                ("yahoo_financials" if revcg_yh.get("rev_cagr") is not None else "none"))
 
-    if not _pos(fcfps_now) or not _pos(p_fcf_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
+    epsc_src = ("sheet" if _f(row.get("EPS CAGR")) is not None else
+                ("yahoo_financials" if epscg_yh.get("eps_cagr") is not None else "none"))
 
-    years = [0, 1, 2, 3]
-    fcfps_path = _growth_series(fcfps_now, cagr, years)
-    mult_path  = _multiple_series(p_fcf_now, years, decay=decay, floor_frac=floor_frac)
-    return _targets_from_metric_and_mult(fcfps_path, mult_path, comb="mul")
+    sanity = (
+        f"price={'ok' if price else '—'}({src.get('price','?')}), "
+        f"eps_ttm={'ok' if (e0 or e0==0) else '—'}({src.get('eps_ttm','?') or ('derived' if (isinstance(src_eps_ttm, str) and src_eps_ttm.startswith('derived')) else src_eps_ttm)}), "
+        f"eps_1y={'ok' if e1 else '—'}({eps1_src}), "
+        f"eps_2y={'ok' if e2 else '—'}({eps2_src}), "
+        f"rev_ttm={'ok' if r0 else '—'}({src.get('revenue_ttm','?')}), "
+        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '—'}({revc_src} ; clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
+        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '—'}({epsc_src} ; clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
+        f"ebitda_ttm={'ok' if (b0 or b0==0) else '—'}({src.get('ebitda_ttm','?')}), "
+        f"shares={'ok' if shares else '—'}({src.get('shares','?')}), "
+        f"pe_anchor={round(pe_anchor,2) if pe_anchor else '—'}, decay={decay}"
+    )
 
-# -------------------------
-# ev_fcf — EV = (EV/FCF) * FCF  → pris via (EV - netDebt) / shares
-# -------------------------
-# CHANGED:
-def ev_fcf(ticker: str, snap: dict,
-           fcf_ttm: float | None = None,
-           cagr: float | None = None,               # prox: EPS-CAGR
-           ev_fcf_now: float | None = None,         # ankarmultipel
-           decay: float = 0.15, floor_frac: float = 0.60) -> dict[str, float | None]:
-    """
-    EV-baserad FCF-värdering:
-      EV_target(t) = (EV/FCF)_t * FCF_t
-      Price_t = (EV_target(t) - netDebt) / shares
-    • ev_fcf_now: default = ev / fcf_ttm om >0, annars 12–16x konservativt.
-    • fcf_ttm: från snap["fcf_ttm"] (Del 2).
-    """
-    if fcf_ttm is None:
-        fcf_ttm = _pos(snap.get("fcf_ttm"))
-
-    if cagr is None:
-        cagr = _infer_eps_cagr_for_paths(ticker, snap)
-
-    # Ankar EV/FCF
-    if ev_fcf_now is None and _pos(snap.get("ev")) and _pos(fcf_ttm):
-        try:
-            ev_fcf_now = float(snap["ev"]) / float(fcf_ttm)
-            # Om extremt tal (negativ FCF etc), ignorera
-            if not math.isfinite(ev_fcf_now) or ev_fcf_now <= 0:
-                ev_fcf_now = None
-        except Exception:
-            ev_fcf_now = None
-    if ev_fcf_now is None:
-        ev_fcf_now = 14.0
-
-    if not _pos(fcf_ttm) or not _pos(ev_fcf_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
-
-    years      = [0, 1, 2, 3]
-    fcf_path   = _growth_series(fcf_ttm, cagr, years)
-    mult_path  = _multiple_series(ev_fcf_now, years, decay=decay, floor_frac=floor_frac)
-    # EV-bana:
-    ev_targets = []
-    for fcf, m in zip(fcf_path, mult_path):
-        ev_targets.append(None if (fcf is None or m is None) else float(fcf) * float(m))
-    # Konvertera till equity-pris:
-    return _equity_price_series_from_ev(ev_targets, snap.get("net_debt"), snap.get("shares"))
-
-# -------------------------
-# p_nii — (P/NII) * NII/sh (BDC/banker)
-# -------------------------
-# CHANGED:
-def p_nii(ticker: str, snap: dict,
-          niips_now: float | None = None,
-          cagr: float | None = None,               # prox: låg → min(revCAGR, 6%)
-          p_nii_now: float | None = None,          # ankarmultipel
-          decay: float = 0.10, floor_frac: float = 0.70) -> dict[str, float | None]:
-    """
-    Price = (P/NII) * NII/sh.
-    • niips_now: NII per aktie (Del 2: "niips" om NII kunde beräknas).
-    • p_nii_now: ankare = price/niips om möjligt; annars konservativt 8–10x.
-    • cagr: låg tillväxt default: min(rev-CAGR, 6%).
-    """
-    if niips_now is None:
-        niips_now = _pos(snap.get("niips"))
-
-    if cagr is None:
-        rev_c = _infer_rev_cagr_for_paths(ticker, snap)
-        if rev_c is not None:
-            cagr = min(0.06, max(-0.05, float(rev_c)))  # dämpad
-        else:
-            cagr = 0.02  # default 2%
-
-    if p_nii_now is None and _pos(snap.get("price")) and _pos(niips_now):
-        try:
-            p_nii_now = float(snap["price"]) / float(niips_now)
-        except Exception:
-            p_nii_now = None
-    if p_nii_now is None:
-        p_nii_now = 9.0
-
-    if not _pos(niips_now) or not _pos(p_nii_now):
-        return {"today": None, "1y": None, "2y": None, "3y": None}
-
-    years = [0, 1, 2, 3]
-    nii_path  = _growth_series(niips_now, cagr, years)
-    mult_path = _multiple_series(p_nii_now, years, decay=decay, floor_frac=floor_frac)
-    return _targets_from_metric_and_mult(nii_path, mult_path, comb="mul")
-
-# -------------------------
-# Metod-aggregator (kan användas av tabell/UI senare)
-# -------------------------
-# CHANGED:
-def build_method_targets(ticker: str, snap: dict) -> dict[str, dict[str, float | None]]:
-    """
-    Returnerar en dict med prisbanor per metod.
-    Nycklar:
-      "p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"
-    Värden: {"today": x, "1y": y, "2y": z, "3y": w}
-    """
-    out: dict[str, dict[str, float | None]] = {}
-
-    try:
-        out["p_nav"]  = p_nav(ticker, snap)
-    except Exception:
-        out["p_nav"]  = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    try:
-        out["p_tbv"]  = p_tbv(ticker, snap)
-    except Exception:
-        out["p_tbv"]  = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    try:
-        out["p_affo"] = p_affo(ticker, snap)
-    except Exception:
-        out["p_affo"] = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    try:
-        out["p_fcf"]  = p_fcf(ticker, snap)
-    except Exception:
-        out["p_fcf"]  = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    try:
-        out["ev_fcf"] = ev_fcf(ticker, snap)
-    except Exception:
-        out["ev_fcf"] = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    try:
-        out["p_nii"]  = p_nii(ticker, snap)
-    except Exception:
-        out["p_nii"]  = {"today": None, "1y": None, "2y": None, "3y": None}
-
-    return out
+    meta = {
+        "currency": currency,
+        "price": price,
+        "shares_out": shares,
+        "net_debt": net_debt,
+        "pe_anchor": pe_anchor,
+        "decay": decay,
+        "company_name": snap.get("company_name"),
+        "sector": snap.get("sector"),
+        "industry": snap.get("industry"),
+        "annual_dividend": snap.get("annual_dividend"),
+        "dividend_frequency": snap.get("dividend_frequency"),
+        "sources": {
+            **src,
+            "eps_1y_source": eps1_src,
+            "eps_2y_source": eps2_src,
+            "rev_cagr_source": revc_src,
+            "eps_cagr_source": epsc_src,
+        },
+        "cagr_clamped": {
+            "rev_cagr_raw": _f(rev_cagr_hist_raw),
+            "rev_cagr_used": _f(rev_cagr_hist),
+            "eps_cagr_raw": _f(eps_cagr_hist_raw),
+            "eps_cagr_used": _f(eps_cagr_hist),
+        },
+        "eps_path": {"ttm": e0, "y1": e1, "y2": e2, "y3": e3},
+        "rev_path": {"ttm": r0, "y1": r1, "y2": r2, "y3": r3},
+        "ebitda_path": {"ttm": b0, "y1": b1, "y2": b2, "y3": b3},
+    }
+    return methods_df, sanity, meta
 
 # ============================================================
+# (fortsätt i Del 4/6 — Portfölj, P/L & utdelningar)
+# # ============================================================
 # app.py — Del 4/6 — Portfölj, P/L & utdelningar
 #  • Portföljtabell (GAV i SEK, MV i SEK, P/L kr & %, Årlig utd. (SEK), /månad)
 #  • Källskatt: USD 15%, CAD 15%, NOK 25% (överskuggas av Settings i Del 5)
@@ -1946,7 +1820,7 @@ def render_portfolio_view(data_df: pd.DataFrame, fx_map: dict[str, float]):
     if nd.empty:
         st.info("Ingen prognos att visa. Antingen saknas utdelningshistorik eller innehav.")
     else:
-        st.dataframe(nd, use_container_width=True)
+        st.dataframe(nd, use_container_width=True) ============================================================
 
 # ============================================================
 # app.py — Del 5/6 — Main & vyer  ✅
