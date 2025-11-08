@@ -2549,22 +2549,13 @@ def page_batch():
 #  • Robust felhantering
 # ============================================================
 
-# Små hjälpare som behövs globalt (används i Del 5)
+# CHANGED: behåll bara now_stamp; ingen lokal _ensure_columns (vi använder originalet med signaturen (df, cols))
 def now_stamp() -> str:
     try:
         return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Säkerställ att alla DATA_COLUMNS finns."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=DATA_COLUMNS)
-    for c in DATA_COLUMNS:
-        if c not in df.columns:
-            df[c] = np.nan
-    return df[DATA_COLUMNS + [c for c in df.columns if c not in DATA_COLUMNS]]
 
 def _startup_load():
     """Läs Settings, FX och DATA till session_state."""
@@ -2588,7 +2579,8 @@ def _startup_load():
     # DATA
     try:
         df = read_data_df()
-        df = _ensure_columns(df)
+        # CHANGED: använd originalfunktionen med två argument
+        df = _ensure_columns(df, DATA_COLUMNS)
         st.session_state["DATA"] = df
     except Exception as e:
         st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
@@ -2600,7 +2592,8 @@ def _topbar():
         if st.button("↻ Läs DATA från Sheets"):
             try:
                 df = read_data_df()
-                df = _ensure_columns(df)
+                # CHANGED: använd originalfunktionen med två argument
+                df = _ensure_columns(df, DATA_COLUMNS)
                 st.session_state["DATA"] = df
                 st.success("DATA läst.")
             except Exception as e:
