@@ -1394,7 +1394,7 @@ def compute_methods_for_row(row: pd.Series, settings: dict[str, str], fx_map: di
 
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
-    # 8) Fair Value-rad (median)
+    # 8) Fair Value-rad (median) — läggs överst
     fv_row = _compute_fair_value_row(methods_df)
     methods_df = pd.concat([pd.DataFrame([fv_row]), methods_df], ignore_index=True)
 
@@ -2542,119 +2542,141 @@ def page_batch():
     st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
 
 # ============================================================
-# Del 6/6 — App-bootstrap & entrypoint
-#  • Init (DATA/FX/Settings)
-#  • Sidopanel & navigering
-#  • Säkra sidkörning med felhantering
-#  • main()
+# Del 6/6 — Main & Router
+#  • Startladdning (Settings/FX/DATA)
+#  • Topbar med snabbknappar (Läs/Spara/FX)
+#  • Sidopanel och vy-router
+#  • Robust felhantering
 # ============================================================
 
-def _boot_once():
-    """Ladda grunddata (DATA/FX) in i session_state och kör ev auto-FX."""
-    # DATA
-    if "DATA" not in st.session_state or st.session_state.get("_force_reload_data"):
-        try:
-            st.session_state["DATA"] = read_data_df()
-        finally:
-            st.session_state["_force_reload_data"] = False
-
-    # FX
-    if "FX" not in st.session_state:
-        try:
-            st.session_state["FX"] = get_fx_map()
-        except Exception:
-            st.session_state["FX"] = {}
-
-    # Auto-FX på start enligt Settings
+# Små hjälpare som behövs globalt (används i Del 5)
+def now_stamp() -> str:
     try:
-        s = get_settings_map()
-        if str(s.get("auto_refresh_on_start", "0")) == "1" and not st.session_state.get("_fx_autorefreshed"):
+        return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Säkerställ att alla DATA_COLUMNS finns."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=DATA_COLUMNS)
+    for c in DATA_COLUMNS:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[DATA_COLUMNS + [c for c in df.columns if c not in DATA_COLUMNS]]
+
+def _startup_load():
+    """Läs Settings, FX och DATA till session_state."""
+    # Settings
+    try:
+        st.session_state["SETTINGS"] = get_settings_map()
+    except Exception as e:
+        st.session_state["SETTINGS"] = {}
+        st.warning(f"Kunde inte läsa Settings: {e}")
+
+    # FX (respektera auto-refresh)
+    try:
+        auto = str(st.session_state["SETTINGS"].get("auto_refresh_on_start", "0")) == "1"
+        if auto:
             _load_fx_and_update_sheet()
-            st.session_state["FX"] = get_fx_map()
-            st.session_state["_fx_autorefreshed"] = True
-    except Exception:
-        pass
+        st.session_state["FX"] = get_fx_map()
+    except Exception as e:
+        st.session_state["FX"] = {}
+        st.warning(f"Kunde inte läsa valutakurser: {e}")
 
-def _sidebar_nav() -> str:
-    st.sidebar.title("📊 Aktieanalys & investeringsförslag")
-
-    # Snabbinfo
+    # DATA
     try:
-        s = get_settings_map()
-        prim = s.get("primary_currency", "SEK")
-    except Exception:
-        prim = "SEK"
-    data_rows = 0
-    df = st.session_state.get("DATA")
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        data_rows = len(df)
-    st.sidebar.caption(f"Primär valuta: **{prim}** · Rader i DATA: **{data_rows}**")
+        df = read_data_df()
+        df = _ensure_columns(df)
+        st.session_state["DATA"] = df
+    except Exception as e:
+        st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
+        st.error(f"Kunde inte läsa DATA från Google Sheets: {e}")
 
-    # Åtgärdsknappar
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.button("🔄 Ladda DATA"):
-            st.session_state["_force_reload_data"] = True
-            st.rerun()
-    with col2:
-        if st.button("🔁 FX nu"):
+def _topbar():
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 3])
+    with c1:
+        if st.button("↻ Läs DATA från Sheets"):
+            try:
+                df = read_data_df()
+                df = _ensure_columns(df)
+                st.session_state["DATA"] = df
+                st.success("DATA läst.")
+            except Exception as e:
+                st.error(f"Misslyckades att läsa DATA: {e}")
+    with c2:
+        if st.button("💾 Spara DATA till Sheets"):
+            try:
+                df = st.session_state.get("DATA", pd.DataFrame(columns=DATA_COLUMNS))
+                write_data_df(df)
+                st.success("DATA sparad.")
+            except Exception as e:
+                st.error(f"Misslyckades att spara DATA: {e}")
+    with c3:
+        if st.button("🔁 Uppdatera FX"):
             try:
                 _load_fx_and_update_sheet()
                 st.session_state["FX"] = get_fx_map()
                 st.success("Valutakurser uppdaterade.")
             except Exception as e:
-                st.error(f"FX-fel: {e}")
+                st.error(f"Misslyckades att uppdatera FX: {e}")
+    with c4:
+        s = get_settings_map()
+        prim = s.get("primary_currency", "SEK")
+        st.caption(f"Primär valuta: **{prim}** · Senast öppnad: {now_stamp()}")
 
-    st.sidebar.markdown("---")
-
+def _sidebar_nav() -> str:
+    st.sidebar.title("📚 Navigering")
     pages = {
-        "⚙️ Settings": "settings",
-        "🕒 Snapshot": "snapshot",
-        "📝 Editor": "editor",
-        "➕ Lägg till": "add",
-        "📦 Portfölj": "portfolio",
-        "🔬 Analys": "analysis",
-        "🏆 Ranking": "ranking",
-        "🧩 Batch": "batch",
+        "analysis": "🔬 Analys",
+        "ranking": "🏆 Ranking",
+        "portfolio": "📦 Portfölj",
+        "editor": "✏️ Editor",
+        "add": "➕ Lägg till",
+        "batch": "🧩 Batch (Yahoo)",
+        "snapshot": "🕒 Snapshot",
+        "settings": "⚙️ Settings",
     }
-    labels = list(pages.keys())
+    choice = st.sidebar.radio("Välj sida", list(pages.keys()),
+                              format_func=lambda k: pages[k], index=0)
+    return choice
 
-    # Behåll vald sida över omkörningar
-    if "nav_page" not in st.session_state:
-        st.session_state["nav_page"] = labels[5]  # default Analys
+def main():
+    st.title("Aktieanalys & investeringsförslag")
 
-    choice = st.sidebar.radio("Meny", labels, index=labels.index(st.session_state["nav_page"]))
-    st.session_state["nav_page"] = choice
-    return pages[choice]
+    # Första körningen?
+    if "FIRST_RUN_DONE" not in st.session_state:
+        _startup_load()
+        st.session_state["FIRST_RUN_DONE"] = True
 
-def _route(page_key: str):
-    """Kör vald vy med robust felhantering."""
+    # Alltid visa topbar
+    _topbar()
+
+    # Router
+    page = _sidebar_nav()
     try:
-        if page_key == "settings":
-            page_settings()
-        elif page_key == "snapshot":
-            page_snapshot()
-        elif page_key == "editor":
-            page_editor()
-        elif page_key == "add":
-            page_add_ticker()
-        elif page_key == "portfolio":
-            page_portfolio()
-        elif page_key == "analysis":
+        if page == "analysis":
             page_analysis()
-        elif page_key == "ranking":
+        elif page == "ranking":
             page_ranking()
-        elif page_key == "batch":
+        elif page == "portfolio":
+            page_portfolio()
+        elif page == "editor":
+            page_editor()
+        elif page == "add":
+            page_add_ticker()
+        elif page == "batch":
             page_batch()
+        elif page == "snapshot":
+            page_snapshot()
+        elif page == "settings":
+            page_settings()
         else:
-            st.error("Okänd sida.")
+            st.info("Okänd sida.")
     except Exception as e:
         st.error(f"💥 Fel i huvudloopen: {e}")
 
-def main():
-    _boot_once()
-    page_key = _sidebar_nav()
-    _route(page_key)
-
+# Entrypoint
 if __name__ == "__main__":
     main()
