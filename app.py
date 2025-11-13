@@ -802,6 +802,7 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
       • TTM (rev/ebitda/eps)
       • Multiplar (PE TTM/FWD, EV/S, EV/EBITDA, P/B, BVPS)
       • 5Y hist. CAGR för rev & eps (clampade intervall)
+      • Årlig utdelning (DPS)
     """
     t = _yf_ticker(ticker)
 
@@ -846,7 +847,7 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
         "p_b": snap.get("p_b"),
         "bvps": snap.get("bvps"),
 
-        # Utdelning
+        # Utdelning (års-DPS)
         "dps_annual": snap.get("dps_annual"),
 
         # Historik (clampad)
@@ -1376,7 +1377,7 @@ def compute_methods_for_row(row: pd.Series, settings: dict[str, str], fx_map: di
     return methods_df, sanity, meta
 
 # ============================================================
-# Del 4/6 — Portfölj & utdelningar
+# Del 4/6 — Portfölj & utdelningar (förenklad)
 #  • Ingen utdelningskalender.
 #  • Beräknar:
 #     – Portföljvärde (SEK)
@@ -1386,29 +1387,23 @@ def compute_methods_for_row(row: pd.Series, settings: dict[str, str], fx_map: di
 #     – Snitt per månad (SEK)
 #     – Bucket-summeringar (värde & utdelning)
 #  • Tabell per innehav med P/L, yield, utdelning m.m.
-#  • ✅ NYTT: Expander per Bucket med lista över bolag i respektive Bucket,
-#             sorterat på största värde; visar också andel av bucket, Kurs & FV idag.
+#  • ✅ Bucket-expander: lista bolag per bucket + andel av bucket
 # ============================================================
 
 # -------------------------
 # Hjälpare: källskatt & FX
 # -------------------------
 def _withholding_tax_from_settings(currency: str, settings: dict[str, str]) -> float:
-    """
-    Källskatt utifrån handelsvaluta.
-    Hämtas från Settings-bladet om satt, annars default enligt dina regler.
-    """
     code = (currency or "USD").upper().strip()
     key = f"withholding_{code}"
     try:
         v = settings.get(key, None)
         if v is not None and str(v).strip() != "":
-            val = float(_f(v))
+            val = _f(v)
             if val is not None:
-                return max(0.0, min(0.5, val))
+                return max(0.0, min(0.5, float(val)))
     except Exception:
         pass
-    # defaults
     if code == "USD": return 0.15
     if code == "CAD": return 0.15
     if code == "NOK": return 0.25
@@ -1501,74 +1496,40 @@ def _build_portfolio_table(data_df: pd.DataFrame, fx_map: dict[str, float], sett
         return pd.DataFrame(columns=cols_out)
 
     df = pd.DataFrame(rows)
+
+    # ✅ Tvångskonvertera numeriska kolumner till numeric (undviker object-dtype-fel)
+    num_cols = [
+        "Antal aktier","Aktuell kurs","Värde (SEK)","GAV (SEK)","Kostnad (SEK)",
+        "P/L (SEK)","P/L (%)","Årlig utd/aktie (brutto)","Årlig utd/aktie (netto)",
+        "Årlig utd (valuta, netto)","Årlig utd (SEK, netto)","Yield (netto)"
+    ]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     # Sortera största värde högst
     if "Värde (SEK)" in df.columns:
         df = df.sort_values("Värde (SEK)", ascending=False, na_position="last").reset_index(drop=True)
+
     return df[cols_out]
 
 # -------------------------
-# NYTT: Bucket-expander
-# -------------------------
-def _render_bucket_expanders(pf_df: pd.DataFrame, data_df: pd.DataFrame, bucket_order: list[str]) -> None:
-    """
-    Visar en expander per Bucket, i ordning efter högst total 'Värde (SEK)'.
-    Varje expander listar bolag i bucketen med:
-      • Ticker — Bolagsnamn — (Kurs / FV idag)
-      • Antal aktier, Värde (SEK), Andel av bucket (%)
-    """
-    # Hämta FV idag per ticker från Data-bladet (ingen extra beräkning här)
-    fv_map = {}
-    if not data_df.empty and "Ticker" in data_df.columns:
-        for _, r in data_df.iterrows():
-            t = str(r.get("Ticker") or "").strip()
-            fv_map[t] = _f(r.get("Riktkurs idag"))
-
-    # Summera per bucket för rubrikerna
-    bucket_sums = (
-        pf_df.groupby("Bucket", as_index=False)
-             .agg({"Värde (SEK)":"sum", "Årlig utd (SEK, netto)":"sum" if "Årlig utd (SEK, netto)" in pf_df.columns else "sum"})
-    )
-    sum_map_value = {row["Bucket"]: float(row["Värde (SEK)"]) for _, row in bucket_sums.iterrows()}
-    sum_map_div   = {row["Bucket"]: float(row.get("Årlig utd (SEK, netto)", 0.0)) for _, row in bucket_sums.iterrows()}
-
-    for b in bucket_order:
-        sub = pf_df[pf_df["Bucket"].astype(str) == b].copy()
-        if sub.empty:
-            continue
-
-        total_val = float(sub["Värde (SEK)"].sum())
-        total_div = float(sub["Årlig utd (SEK, netto)"].sum()) if "Årlig utd (SEK, netto)" in sub.columns else 0.0
-
-        # Andel per innehav och kompletterande kolumner
-        sub = sub.sort_values("Värde (SEK)", ascending=False)
-        sub["Andel av bucket (%)"] = (sub["Värde (SEK)"] / total_val * 100.0).round(2)
-        # Lägg till FV idag från data
-        sub["Riktkurs idag"] = sub["Ticker"].map(fv_map).round(4)
-
-        # Visa tabell med önskade kolumner
-        cols = ["Ticker","Bolagsnamn","Aktuell kurs","Riktkurs idag","Antal aktier","Värde (SEK)","Andel av bucket (%)"]
-        nice_title = f"{b} — värde {total_val:,.0f} SEK · utd. {total_div:,.0f} SEK/år".replace(",", " ")
-        with st.expander(nice_title, expanded=False):
-            st.dataframe(sub[cols], use_container_width=True, hide_index=True)
-
-# -------------------------
-# UI: Portföljvy
+# UI: Portföljvy (förenklad + expanders per bucket)
 # -------------------------
 def render_portfolio_view(data_df: pd.DataFrame, fx_map: dict[str, float]) -> None:
-    """
-    Visar portföljens nycklar:
-      – Totalt värde, kostnad, P/L
-      – Årlig utdelning (SEK, netto) + snitt/månad
-      – Bucket-summeringar (sorterade på värde, störst först)
-      – ✅ Expander per Bucket med innehav + andelar + (Kurs & FV idag)
-      – Detaljtabell per innehav
-    """
     st.subheader("📦 Portfölj")
 
     settings = get_settings_map()
-
-    # Bygg innehavstabell
     pf = _build_portfolio_table(data_df, fx_map, settings)
+
+    # Säker numerik innan summeringar
+    num_cols = [
+        "Värde (SEK)","Kostnad (SEK)","P/L (SEK)",
+        "Årlig utd (SEK, netto)","Aktuell kurs"
+    ]
+    for c in num_cols:
+        if c in pf.columns:
+            pf[c] = pd.to_numeric(pf[c], errors="coerce")
 
     total_value = float(pf["Värde (SEK)"].sum()) if not pf.empty else 0.0
     total_cost  = float(pf["Kostnad (SEK)"].sum()) if not pf.empty else 0.0
@@ -1590,29 +1551,78 @@ def render_portfolio_view(data_df: pd.DataFrame, fx_map: dict[str, float]) -> No
 
     st.metric("Snitt per månad (SEK, netto)", f"{avg_per_month:,.0f}".replace(",", " "))
 
-    # Bucket-summering (störst först)
+    # ---------- Bucket-summering (första tabellen) ----------
     st.markdown("### Bucket-summeringar")
-    if not pf.empty and "Bucket" in data_df.columns:
+    if not pf.empty and "Bucket" in pf.columns:
         bucket_tbl = (
             pf.groupby("Bucket", as_index=False)
               .agg({
                   "Värde (SEK)": "sum",
-                  "Årlig utd (SEK, netto)": "sum" if "Årlig utd (SEK, netto)" in pf.columns else "sum"
+                  "Årlig utd (SEK, netto)": "sum"
               })
               .rename(columns={
                   "Värde (SEK)": "Värde (SEK, sum)",
                   "Årlig utd (SEK, netto)": "Årlig utd (SEK, netto, sum)"
               })
-              .sort_values("Värde (SEK, sum)", ascending=False)
-              .reset_index(drop=True)
         )
+        # säkerställ numerik
+        bucket_tbl["Värde (SEK, sum)"] = pd.to_numeric(bucket_tbl["Värde (SEK, sum)"], errors="coerce")
+        bucket_tbl["Årlig utd (SEK, netto, sum)"] = pd.to_numeric(bucket_tbl["Årlig utd (SEK, netto, sum)"], errors="coerce")
+        bucket_tbl = bucket_tbl.sort_values("Värde (SEK, sum)", ascending=False, na_position="last")
         st.dataframe(bucket_tbl, use_container_width=True, hide_index=True)
-
-        # ✅ Expander per bucket – i samma sorteringsordning
-        bucket_order = bucket_tbl["Bucket"].tolist()
-        _render_bucket_expanders(pf, data_df, bucket_order)
     else:
         st.info("Inga Bucket-data att summera.")
+
+    # ---------- ✅ Expanders per bucket ----------
+    st.markdown("### Bucket-detaljer")
+    if not pf.empty and "Bucket" in pf.columns:
+        # Bygg mapp med riktkurs idag från original-Data (kan vara NaN)
+        rk_map = {}
+        if "Riktkurs idag" in data_df.columns and "Ticker" in data_df.columns:
+            for _, rr in data_df[["Ticker","Riktkurs idag"]].dropna(subset=["Ticker"]).iterrows():
+                rk_map[str(rr["Ticker"]).strip()] = _f(rr.get("Riktkurs idag"))
+
+        # Order: störst bucket-värde först
+        order = (
+            pf.groupby("Bucket", as_index=True)["Värde (SEK)"]
+              .sum()
+              .sort_values(ascending=False)
+        )
+        for bucket, bucket_total in order.items():
+            bucket_total = float(bucket_total) if pd.notna(bucket_total) else 0.0
+            sub = pf.loc[pf["Bucket"] == bucket].copy()
+
+            # Andel av bucket (säker numerik)
+            sub["Värde (SEK)"] = pd.to_numeric(sub["Värde (SEK)"], errors="coerce")
+            if bucket_total > 0:
+                sub["Andel av bucket (%)"] = (sub["Värde (SEK)"] / bucket_total) * 100.0
+            else:
+                sub["Andel av bucket (%)"] = np.nan
+
+            # Lägg till riktkurs idag via map
+            sub["Riktkurs idag"] = sub["Ticker"].map(rk_map)
+            sub["Riktkurs idag"] = pd.to_numeric(sub["Riktkurs idag"], errors="coerce")
+
+            # Visa snygg vy per bucket
+            sub = sub.sort_values("Värde (SEK)", ascending=False, na_position="last")
+
+            disp = sub[[
+                "Ticker","Bolagsnamn","Aktuell kurs","Riktkurs idag","Värde (SEK)",
+                "Årlig utd (SEK, netto)","Andel av bucket (%)"
+            ]].copy()
+
+            # Runda/format
+            for c in ["Aktuell kurs","Riktkurs idag"]:
+                if c in disp.columns:
+                    disp[c] = pd.to_numeric(disp[c], errors="coerce").round(2)
+            for c in ["Värde (SEK)","Årlig utd (SEK, netto)"]:
+                if c in disp.columns:
+                    disp[c] = pd.to_numeric(disp[c], errors="coerce").round(0)
+            if "Andel av bucket (%)" in disp.columns:
+                disp["Andel av bucket (%)"] = pd.to_numeric(disp["Andel av bucket (%)"], errors="coerce").round(2)
+
+            with st.expander(f"{bucket} — {int(bucket_total):,} SEK".replace(",", " ")):
+                st.dataframe(disp, use_container_width=True, hide_index=True)
 
     st.markdown("### Innehav (detaljer)")
     if pf.empty:
@@ -1628,7 +1638,7 @@ def render_portfolio_view(data_df: pd.DataFrame, fx_map: dict[str, float]) -> No
 #  • Lägg till ticker
 #  • Portfölj (använder render_portfolio_view från Del 4)
 #  • Analys (metodtabell + Fair Value som egen metodrad)
-#  • Ranking (uppsida)  ← Bucket-filter
+#  • Ranking (uppsida)  ← ✅ Bucket-filter
 #  • Batch (massuppdatering Yahoo)
 # ============================================================
 
@@ -2072,7 +2082,7 @@ def page_portfolio():
         return
     fx = st.session_state.get("FX", {}) or {}
     try:
-        render_portfolio_view(df, fx)  # definierad i Del 4/6 (med Bucket-expander)
+        render_portfolio_view(df, fx)  # definierad i Del 4/6
     except Exception as e:
         st.error(f"Kunde inte rendera portföljen: {e}")
 
@@ -2216,7 +2226,7 @@ def page_analysis():
     st.dataframe(st.session_state["DATA"], use_container_width=True)
 
 # ============================================================
-# 🏆 Ranking – Uppsida per horisont  (Bucket-filter)
+# 🏆 Ranking – Uppsida per horisont  ✅ Bucket-filter tillagt
 # ============================================================
 def page_ranking():
     st.header("🏆 Ranking – Uppsida per horisont")
@@ -2225,7 +2235,7 @@ def page_ranking():
         st.warning("Ingen data laddad.")
         return
 
-    # Bucket-filter (multiselect) – default alla
+    # ✅ Nytt: Bucket-filter (multiselect) – default alla
     all_buckets = [b for b in df["Bucket"].dropna().astype(str).unique().tolist() if b.strip()] or DEFAULT_BUCKETS
     sel_buckets = st.multiselect("Filtrera på Bucket", options=all_buckets, default=all_buckets)
 
@@ -2412,131 +2422,146 @@ def page_batch():
     st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
 
 # ============================================================
-# Del 6/6 — Main & routing
-#  • Init (DATA, FX, Settings)
-#  • Sidebar-navigering
-#  • Sid-rendering (Portfölj, Analys, Ranking, Editor, Lägg till, Batch, Snapshot, Settings)
+# Del 6/6 — Main/Router & bootstrap
+#  • Init av session (Settings, FX, DATA)
+#  • Sidopanel & sidnavigering
+#  • Robust huvudloop med felfångning
 # ============================================================
 
-def _init_session():
-    """Se till att sessionen har DATA, FX och Settings i minnet."""
-    if "DATA" not in st.session_state or st.session_state.get("force_reload_data"):
-        try:
-            st.session_state["DATA"] = read_data_df()
-        except Exception as e:
-            st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
-            st.sidebar.error(f"Kunde inte läsa DATA: {e}")
-        finally:
-            st.session_state["force_reload_data"] = False
+# ---------- Bootstrap helpers ----------
+def _bootstrap_settings():
+    try:
+        s = get_settings_map()
+        st.session_state["SETTINGS"] = s
+    except Exception as e:
+        st.session_state["SETTINGS"] = {}
+        st.warning(f"Kunde inte läsa Settings: {e}")
 
-    if "FX" not in st.session_state or st.session_state.get("force_reload_fx"):
-        try:
-            st.session_state["FX"] = get_fx_map()
-        except Exception as e:
-            st.session_state["FX"] = {}
-            st.sidebar.error(f"Kunde inte läsa valutakurser: {e}")
-        finally:
-            st.session_state["force_reload_fx"] = False
-
-    if "SETTINGS" not in st.session_state or st.session_state.get("force_reload_settings"):
-        try:
-            st.session_state["SETTINGS"] = get_settings_map()
-        except Exception as e:
-            st.session_state["SETTINGS"] = {}
-            st.sidebar.error(f"Kunde inte läsa Settings: {e}")
-        finally:
-            st.session_state["force_reload_settings"] = False
-
-def _maybe_auto_refresh_fx():
-    """Respektera settingsflaggan 'auto_refresh_on_start'."""
-    s = st.session_state.get("SETTINGS", {}) or {}
-    auto = str(s.get("auto_refresh_on_start", "0")) == "1"
-    if auto and not st.session_state.get("_fx_autorefreshed_once"):
-        try:
+def _bootstrap_fx():
+    try:
+        # Läs in befintliga kurser
+        fx_map = get_fx_map()
+        st.session_state["FX"] = fx_map
+        # Auto-refresh om satt i Settings
+        s = st.session_state.get("SETTINGS", {}) or {}
+        if str(s.get("auto_refresh_on_start","0")) == "1":
             _load_fx_and_update_sheet()
             st.session_state["FX"] = get_fx_map()
-            st.session_state["_fx_autorefreshed_once"] = True
-            st.sidebar.success("Valutakurser auto-uppdaterade.")
-        except Exception as e:
-            st.sidebar.warning(f"Auto-uppdatering av FX misslyckades: {e}")
+    except Exception as e:
+        st.session_state["FX"] = {}
+        st.warning(f"Kunde inte läsa Valutakurser: {e}")
 
-def _sidebar_header():
-    st.sidebar.markdown("### 📈 Aktieanalys & investeringsförslag")
-    st.sidebar.caption("Basvaluta visas per bolag (ingen EPS-konvertering).")
-
-def _sidebar_actions():
-    c1, c2 = st.sidebar.columns(2)
-    with c1:
-        if st.button("🔄 Ladda om DATA", key="reload_data"):
-            st.session_state["force_reload_data"] = True
-            st.rerun()
-    with c2:
-        if st.button("🔁 Uppd. FX", key="reload_fx"):
-            try:
-                _load_fx_and_update_sheet()
-                st.session_state["FX"] = get_fx_map()
-                st.success("Valutakurser uppdaterade.")
-            except Exception as e:
-                st.error(f"FX-fel: {e}")
-
-    if st.sidebar.button("💾 Skriv sessionens DATA → Google Sheets", key="save_session_to_sheet"):
-        try:
-            df = st.session_state.get("DATA")
+def _bootstrap_data(force_reload: bool = False):
+    try:
+        if force_reload or ("DATA" not in st.session_state) or st.session_state.get("DATA") is None:
+            df = read_data_df()
+            # Säkerställ minsta kolumnuppsättning
             if df is None or df.empty:
-                st.sidebar.warning("Inget att spara.")
-            else:
-                write_data_df(df)
-                st.sidebar.success("DATA sparad till Google Sheets.")
-        except Exception as e:
-            st.sidebar.error(f"Sparfel: {e}")
+                df = pd.DataFrame(columns=DATA_COLUMNS)
+            for c in DATA_COLUMNS:
+                if c not in df.columns:
+                    df[c] = np.nan
+            st.session_state["DATA"] = df
+    except Exception as e:
+        st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
+        st.error(f"Kunde inte läsa DATA-bladet: {e}")
+
+def _header_bar():
+    c1, c2, c3 = st.columns([6, 2, 2])
+    with c1:
+        st.markdown("### 📈 Aktieanalys & investeringsförslag")
+    with c2:
+        if st.button("↻ Ladda om DATA"):
+            _bootstrap_data(force_reload=True)
+            st.success("DATA omladdad från Google Sheets.")
+            st.rerun()
+    with c3:
+        if st.button("💾 Skriv DATA till Sheets"):
+            try:
+                write_data_df(st.session_state.get("DATA", pd.DataFrame(columns=DATA_COLUMNS)))
+                st.success("DATA skrivet till Google Sheets.")
+            except Exception as e:
+                st.error(f"Kunde inte skriva DATA: {e}")
 
 def _sidebar_menu() -> str:
+    st.sidebar.markdown("## Meny")
     pages = {
-        "Portfölj": "page_portfolio",
-        "Analys": "page_analysis",
-        "Ranking": "page_ranking",
-        "Editor": "page_editor",
-        "Lägg till": "page_add_ticker",
-        "Batch": "page_batch",
-        "Snapshot": "page_snapshot",
-        "Settings": "page_settings",
+        "Analys": page_analysis,
+        "Ranking": page_ranking,
+        "Portfölj": page_portfolio,
+        "Editor": page_editor,
+        "Lägg till": page_add_ticker,
+        "Batch": page_batch,
+        "Snapshot": page_snapshot,
+        "Settings": page_settings,
+        "Om": None,
     }
-    choice = st.sidebar.radio("Meny", list(pages.keys()), index=0)
-    return pages[choice]
+    choice = st.sidebar.radio(
+        "Gå till",
+        list(pages.keys()),
+        index=list(pages.keys()).index("Analys") if "Analys" in pages else 0,
+    )
 
-def _dispatch(page_key: str):
-    # Kör rätt sidfunktion
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Senast uppdaterad: {now_stamp()}")
+
+    return choice
+
+def _render_about():
+    st.header("ℹ️ Om appen")
+    st.markdown(
+        "- **Valuta:** All analys och riktkurser presenteras i bolagets handelsvaluta.\n"
+        "- **Fair Value:** Median över beräkningsmetoder (i Analys). *Detta är en beräkning, inte en rekommendation.*\n"
+        "- **EPS/Revenue manuellt:** Anges i bolagets egen valuta (ingen automatisk konvertering).\n"
+        "- **Massuppdatering:** Yahoo-hämtning med fördröjning per bolag enligt val i Batch-vyn.\n"
+        "- **Snapshots:** Lagrar metod + riktkurser vid tillfället för spårbarhet."
+    )
+
+# ---------- Main ----------
+def main():
     try:
-        if page_key == "page_portfolio":
-            page_portfolio()
-        elif page_key == "page_analysis":
+        # Bootstrap (körs en gång per session eller på omladdning)
+        if "BOOTSTRAPPED" not in st.session_state:
+            _bootstrap_settings()
+            _bootstrap_fx()
+            _bootstrap_data(force_reload=True)
+            st.session_state["BOOTSTRAPPED"] = True
+        else:
+            # Minimal check så att nödvändiga objekt finns
+            st.session_state.setdefault("SETTINGS", {})
+            st.session_state.setdefault("FX", {})
+            st.session_state.setdefault("DATA", pd.DataFrame(columns=DATA_COLUMNS))
+
+        _header_bar()
+        page = _sidebar_menu()
+
+        # Router
+        if page == "Analys":
             page_analysis()
-        elif page_key == "page_ranking":
+        elif page == "Ranking":
             page_ranking()
-        elif page_key == "page_editor":
+        elif page == "Portfölj":
+            page_portfolio()
+        elif page == "Editor":
             page_editor()
-        elif page_key == "page_add_ticker":
+        elif page == "Lägg till":
             page_add_ticker()
-        elif page_key == "page_batch":
+        elif page == "Batch":
             page_batch()
-        elif page_key == "page_snapshot":
+        elif page == "Snapshot":
             page_snapshot()
-        elif page_key == "page_settings":
+        elif page == "Settings":
             page_settings()
         else:
-            st.error("Okänd sida.")
+            _render_about()
+
+        # Footer
+        st.markdown("---")
+        st.caption("© Aktieanalys & investeringsförslag – körs i Streamlit. Data från Google Sheets & Yahoo.")
+
     except Exception as e:
-        st.error(f"💥 Fel i sidrendering: {e}")
+        st.error(f"💥 Fel i huvudloopen: {e}")
 
-def main():
-    _init_session()
-    _maybe_auto_refresh_fx()
-
-    _sidebar_header()
-    _sidebar_actions()
-    page_key = _sidebar_menu()
-    _dispatch(page_key)
-
-# Streamlit entrypoint
+# Entrypoint
 if __name__ == "__main__":
     main()
