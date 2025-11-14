@@ -2731,12 +2731,13 @@ def page_batch():
 # ============================================================
 
 # ============================================================
-# Del 6/6 — Main & routing
+# Del 6/6 — Main & routing (FIX)
 #  • Init (Settings, FX, DATA)
 #  • Sidopanel & navigation
-#  • Spara/Ladda-knappar
-#  • Felhantering runt sidvyer
+#  • Omladdning via cache_clear (ingen force_reload-param)
 # ============================================================
+
+from collections import OrderedDict
 
 # -----------------------------
 # Init helpers
@@ -2747,35 +2748,53 @@ def _init_state_once():
     ss.setdefault("FX", {})
     ss.setdefault("SETTINGS", {})
     ss.setdefault("boot_fx_refreshed", False)
+    ss.setdefault("nav_idx", 0)
 
-def _load_all_into_state(force_reload: bool = False):
-    """Läs Settings, FX och DATA → session_state."""
+def _clear_caches():
     try:
-        st.session_state["SETTINGS"] = get_settings_map(force_reload=force_reload)
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+def _load_all_into_state():
+    """Läs Settings, FX och DATA → session_state (utan extra args)."""
+    try:
+        st.session_state["SETTINGS"] = get_settings_map()
     except Exception as e:
         st.warning(f"Kunde inte läsa Settings: {e}")
+        st.session_state["SETTINGS"] = {}
 
     try:
-        # Läs in befintliga FX från bladet
-        st.session_state["FX"] = get_fx_map(force_reload=force_reload)
+        st.session_state["FX"] = get_fx_map()
     except Exception as e:
         st.warning(f"Kunde inte läsa Valutakurser: {e}")
+        st.session_state["FX"] = {}
 
     try:
-        st.session_state["DATA"] = read_data_df(force_reload=force_reload)
+        df_loaded = read_data_df()
+        if df_loaded is None or df_loaded.empty:
+            df_loaded = pd.DataFrame(columns=DATA_COLUMNS)
+        st.session_state["DATA"] = df_loaded
     except Exception as e:
         st.error(f"Kunde inte läsa DATA-bladet: {e}")
         st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
 
 def _maybe_auto_refresh_fx_on_boot():
-    """Respektera inställningen 'auto_refresh_on_start' (en gång per körning)."""
-    s = get_settings_map()
+    """Respektera 'auto_refresh_on_start' (körs en gång)."""
+    s = st.session_state.get("SETTINGS", {}) or {}
     if str(s.get("auto_refresh_on_start", "0")) == "1" and not st.session_state.get("boot_fx_refreshed", False):
         try:
             _load_fx_and_update_sheet()
-            st.session_state["FX"] = get_fx_map(force_reload=True)
+            st.session_state["FX"] = get_fx_map()
             st.session_state["boot_fx_refreshed"] = True
-            st.toast("Valutakurser auto-uppdaterade.", icon="🔁")
+            try:
+                st.toast("Valutakurser auto-uppdaterade.", icon="🔁")
+            except Exception:
+                pass
         except Exception as e:
             st.warning(f"Auto-uppdatering av FX misslyckades: {e}")
 
@@ -2783,17 +2802,15 @@ def _maybe_auto_refresh_fx_on_boot():
 # Routing-tabell
 # -----------------------------
 PAGES: dict[str, tuple[str, callable]] = {
-    "settings": ("⚙️ Settings", page_settings),
-    "snapshot": ("🕒 Snapshot", page_snapshot),
-    "editor":   ("✏️ Editor", page_editor),
-    "add":      ("➕ Lägg till ticker", page_add_ticker),
-    "portfolio":("📦 Portfölj", page_portfolio),
-    "analysis": ("🔬 Analys", page_analysis),
-    "ranking":  ("🏆 Ranking", page_ranking),
-    "batch":    ("🧩 Massuppdatering", page_batch),
+    "portfolio": ("📦 Portfölj", page_portfolio),
+    "analysis":  ("🔬 Analys", page_analysis),
+    "ranking":   ("🏆 Ranking", page_ranking),
+    "editor":    ("✏️ Editor", page_editor),
+    "add":       ("➕ Lägg till", page_add_ticker),
+    "batch":     ("🧩 Massuppdatering", page_batch),
+    "snapshot":  ("🕒 Snapshot", page_snapshot),
+    "settings":  ("⚙️ Settings", page_settings),
 }
-
-# Ordning i sidomenyn
 PAGE_ORDER = ["portfolio", "analysis", "ranking", "editor", "add", "batch", "snapshot", "settings"]
 
 # -----------------------------
@@ -2801,19 +2818,19 @@ PAGE_ORDER = ["portfolio", "analysis", "ranking", "editor", "add", "batch", "sna
 # -----------------------------
 def main():
     _init_state_once()
-    _load_all_into_state(force_reload=False)
+    _load_all_into_state()
     _maybe_auto_refresh_fx_on_boot()
 
     # -------- Sidopanel --------
     with st.sidebar:
         st.markdown("### Aktieanalys & investeringsförslag")
-        st.caption("Basvaluta visas per bolagets handelsvaluta. Ingen konvertering av EPS.")
+        st.caption("Basvaluta: bolagets handelsvaluta. EPS konverteras inte.")
 
-        # Snabbåtgärder
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("🔄 Ladda om DATA"):
-                _load_all_into_state(force_reload=True)
+                _clear_caches()          # <— rensa cache
+                _load_all_into_state()   # läs in igen
                 st.success("DATA/Settings/FX omladdat från Google Sheets.")
                 st.rerun()
         with col_b:
@@ -2829,37 +2846,32 @@ def main():
                     st.error(f"Kunde inte spara: {e}")
 
         st.markdown("---")
-
-        # Navigering
-        labels = [PAGES[key][0] for key in PAGE_ORDER]
+        labels = [PAGES[k][0] for k in PAGE_ORDER]
         keys   = PAGE_ORDER[:]
         default_idx = st.session_state.get("nav_idx", 0)
-        choice = st.radio("Navigation", labels, index=default_idx, key="nav_radio")
+        choice = st.radio("Meny", labels, index=default_idx, label_visibility="collapsed")
         page_key = keys[labels.index(choice)]
         st.session_state["nav_idx"] = keys.index(page_key)
 
         st.markdown("---")
-        # Liten status
         df = st.session_state.get("DATA")
         rows = 0 if df is None else len(df)
         st.caption(f"📄 Rader i DATA: **{rows}**")
-        s = get_settings_map()
+        s = st.session_state.get("SETTINGS", {})
         st.caption(f"🌐 Primär valuta: **{s.get('primary_currency','SEK')}**")
 
     # -------- Innehåll --------
     try:
-        # Kör vald sida
         PAGES[page_key][1]()
     except Exception as e:
         st.error(f"💥 Fel i huvudloopen: {e}")
 
-    # Footer
     st.markdown("---")
     st.caption(f"Senast uppdaterad: {now_stamp()}")
 
-# Kör appen (Streamlit kör filen topp-till-botten)
+# Kör app
 main()
 
 # ============================================================
-# (Slut Del 6/6)
+# (Slut Del 6/6 — FIX)
 # ============================================================
