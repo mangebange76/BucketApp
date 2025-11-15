@@ -2564,8 +2564,8 @@ def page_batch():
     st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
 
 # ============================================================
-# Del 6/6 — Analys & Ranking + main()  ✅ FIX
-#  • CHANGED: Riktkurser hämtas från Del 3: compute_methods_for_row()
+# Del 6/6 — Analys & Ranking + main()  ✅ FIX v2
+#  • Riktkurser hämtas från Del 3: compute_methods_for_row()
 #  • Skriver FV (Idag/1/2/3 år) till Data-bladet (oförändrade siffror)
 #  • Ranking på vald horisont
 #  • Main + enkel sidomeny
@@ -2582,7 +2582,25 @@ def _calc_upside(target: Optional[float], price: Optional[float]) -> Optional[fl
         return None
     return (t / p) - 1.0
 
-# ---------- CHANGED: använd Del 3:s fair value rakt av ----------
+def _fmt_num(v, digits: int = 2) -> Optional[str]:
+    vv = _f(v)
+    if vv is None:
+        return None
+    try:
+        return f"{float(vv):.{digits}f}"
+    except Exception:
+        return None
+
+def _fmt_val(v, curr: Optional[str] = None) -> str:
+    s = _fmt_num(v, 2)
+    s = s if s is not None else "—"
+    return f"{s}{(' ' + curr) if curr else ''}"
+
+def _fmt_delta_str(target, price) -> str:
+    up = _calc_upside(target, price)
+    return "" if up is None else f"{up*100:.1f}%"
+
+# ---------- Använd Del 3:s fair value rakt av ----------
 def _fv_from_row(row: pd.Series, settings: Dict[str, Any], fx_map: Dict[str, float]) -> Dict[str, Any]:
     """
     Returnerar fair value från compute_methods_for_row():
@@ -2603,7 +2621,7 @@ def _fv_from_row(row: pd.Series, settings: Dict[str, Any], fx_map: Dict[str, flo
 
 def _write_fv_into_df(df: pd.DataFrame, settings: Dict[str, Any], fx_map: Dict[str, float]) -> pd.DataFrame:
     """
-    CHANGED: Beräknar FV via Del 3 och skriver till:
+    Beräknar FV via Del 3 och skriver till:
       Riktkurs idag / 1 år / 2 år / 3 år
     """
     if df is None or df.empty:
@@ -2621,7 +2639,6 @@ def _write_fv_into_df(df: pd.DataFrame, settings: Dict[str, Any], fx_map: Dict[s
             out.at[i, "Riktkurs 2 år"]  = res["y2"]
             out.at[i, "Riktkurs 3 år"]  = res["y3"]
         except Exception:
-            # fortsätt även om en rad fallerar
             continue
     return out
 
@@ -2701,15 +2718,11 @@ def page_analysis_ranking():
         res = _fv_from_row(row, settings, fx_map)
         price = res["price"]; curr = _safe_currency(res["currency"])
         c1,c2,c3,c4,c5 = st.columns(5)
-        c1.metric("Kurs", f"{(price is not None and f'{price:.2f}') or '—'} {curr}")
-        c2.metric("FV idag", f"{(res['today'] is not None and f'{res['today']:.2f}') or '—'} {curr}",
-                  delta=f"{((_calc_upside(res['today'], price) or 0)*100):.1f}%")
-        c3.metric("FV 1 år", f"{(res['y1'] is not None and f'{res['y1']:.2f}') or '—'} {curr}",
-                  delta=f"{((_calc_upside(res['y1'], price) or 0)*100):.1f}%")
-        c4.metric("FV 2 år", f"{(res['y2'] is not None and f'{res['y2']:.2f}') or '—'} {curr}",
-                  delta=f"{((_calc_upside(res['y2'], price) or 0)*100):.1f}%")
-        c5.metric("FV 3 år", f"{(res['y3'] is not None and f'{res['y3']:.2f}') or '—'} {curr}",
-                  delta=f"{((_calc_upside(res['y3'], price) or 0)*100):.1f}%")
+        c1.metric("Kurs", _fmt_val(price, curr))
+        c2.metric("FV idag", _fmt_val(res["today"], curr), delta=_fmt_delta_str(res["today"], price))
+        c3.metric("FV 1 år", _fmt_val(res["y1"], curr), delta=_fmt_delta_str(res["y1"], price))
+        c4.metric("FV 2 år", _fmt_val(res["y2"], curr), delta=_fmt_delta_str(res["y2"], price))
+        c5.metric("FV 3 år", _fmt_val(res["y3"], curr), delta=_fmt_delta_str(res["y3"], price))
         st.caption(f"Sanity: {res['sanity']}")
         st.subheader("Metodtabell")
         st.dataframe(_fmt_methods_for_display(res["methods_df"]), use_container_width=True, hide_index=True)
