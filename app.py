@@ -2564,357 +2564,168 @@ def page_batch():
     st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
 
 # ============================================================
-# Del 6/6 — Analys & ranking + main()
-#  • Metodval per rad (respekterar ev. "Metod"-kolumn)
-#  • P/E-ankare (mogna/lönsamma)
-#  • EV/S-ankare (tidigt skede/förlust)
-#  • Riktkurs idag / 1 / 2 / 3 år (+ bull/bear 1 år)
-#  • Skriv tillbaka till Data-bladet
-#  • Ranking/uppsida och vy "Analys & Ranking"
-#  • main() + sidomeny
+# Del 6/6 — Analys & Ranking + main()  ✅ FIX
+#  • CHANGED: Riktkurser hämtas från Del 3: compute_methods_for_row()
+#  • Skriver FV (Idag/1/2/3 år) till Data-bladet (oförändrade siffror)
+#  • Ranking på vald horisont
+#  • Main + enkel sidomeny
 # ============================================================
 
-# ---------- Metodval ----------
-def _choose_method_for_row(row: pd.Series) -> str:
-    # Använd explicit metod om angiven
-    explicit = str(_nz(row.get("Metod"), "")).strip().lower()
-    if explicit in ("pe", "p/e", "pe_band", "pe_ttm", "pe_fwd"):
-        return "pe"
-    if explicit in ("evs", "ev/s", "ev_sales", "ev/revenue"):
-        return "evs"
+# ---------- Hjälpare ----------
+def _safe_currency(c):
+    return (str(c) if c else "USD").upper()
 
-    # Heuristik: om EPS TTM > 0 → P/E, annars EV/S
-    eps_ttm = _f(row.get("EPS TTM"))
-    if eps_ttm is not None and eps_ttm > 0:
-        return "pe"
-    return "evs"
+def _calc_upside(target: Optional[float], price: Optional[float]) -> Optional[float]:
+    t = _f(target)
+    p = _f(price)
+    if t is None or p is None or p <= 0:
+        return None
+    return (t / p) - 1.0
 
-# ---------- Hjälpare för tillväxt & clamps ----------
-def _clamp(v: float, lo: float, hi: float) -> float:
-    try:
-        return max(lo, min(hi, float(v)))
-    except Exception:
-        return v
-
-def _infer_eps_growth(row: pd.Series) -> float:
-    """Gissa EPS-tillväxt (per år, som decimal) utifrån historik/estimat."""
-    g = None
-    eps_ttm = _f(row.get("EPS TTM"))
-    eps1    = _f(row.get("EPS 1Y"))
-    eps2    = _f(row.get("EPS 2Y"))
-    eps_cagr_hist = _f(row.get("EPS CAGR"))
-
-    try:
-        if eps_ttm and eps1 and eps_ttm > 0:
-            g = (eps1/eps_ttm) - 1.0
-        elif eps_cagr_hist is not None:
-            g = eps_cagr_hist if abs(eps_cagr_hist) < 1.0 else eps_cagr_hist/100.0
-    except Exception:
-        pass
-
-    if g is None:
-        g = 0.08  # default 8 %
-
-    # Rimlig clamp för EPS-tillväxt
-    return _clamp(g, -0.10, 0.35)
-
-def _infer_rev_growth(row: pd.Series) -> float:
-    """Gissa omsättningstillväxt (per år, decimal) för 3Y extrapolering."""
-    g = None
-    rev_ttm = _f(row.get("Rev TTM"))
-    rev1    = _f(row.get("Rev 1Y"))
-    rev2    = _f(row.get("Rev 2Y"))
-    cagr_hist = _f(row.get("Rev CAGR"))
-
-    try:
-        if rev_ttm and rev1 and rev_ttm > 0:
-            g = (rev1/rev_ttm) - 1.0
-        elif cagr_hist is not None:
-            g = cagr_hist if abs(cagr_hist) < 1.0 else cagr_hist/100.0
-    except Exception:
-        pass
-
-    if g is None:
-        g = 0.10  # default 10 %
-
-    # Rimlig clamp för omsättning
-    return _clamp(g, -0.05, 0.40)
-
-# ---------- P/E-ankare ----------
-def _settings_pe_targets(settings: Dict[str, Any]) -> Tuple[float, float, float]:
+# ---------- CHANGED: använd Del 3:s fair value rakt av ----------
+def _fv_from_row(row: pd.Series, settings: Dict[str, Any], fx_map: Dict[str, float]) -> Dict[str, Any]:
     """
-    Hämtar P/E-band från Settings om de finns, annars (12, 15, 18).
-      • bear = lägre multipel
-      • base = mittmultipel
-      • bull = högre multipel
+    Returnerar fair value från compute_methods_for_row():
+      { 'today': x, 'y1': y, 'y2': z, 'y3': w, 'price': p, 'currency': c, 'sanity': str }
     """
-    try:
-        bear = _f(settings.get("pe_bear")) or 12.0
-        base = _f(settings.get("pe_base")) or 15.0
-        bull = _f(settings.get("pe_bull")) or 18.0
-    except Exception:
-        bear, base, bull = 12.0, 15.0, 18.0
-    return float(bear), float(base), float(bull)
-
-def _compute_targets_pe(row: pd.Series, settings: Dict[str, Any]) -> Dict[str, Any]:
-    bear, base, bull = _settings_pe_targets(settings)
-
-    eps_ttm = _f(row.get("EPS TTM"))
-    eps1    = _f(row.get("EPS 1Y"))
-    eps2    = _f(row.get("EPS 2Y"))
-
-    g = _infer_eps_growth(row)
-
-    # EPS för 3 år (om inte EPS2 finns)
-    eps3 = None
-    if eps2 is not None:
-        eps3 = eps2 * (1.0 + g)
-    elif eps1 is not None:
-        eps2 = eps1 * (1.0 + g)
-        eps3 = eps2 * (1.0 + g)
-    elif eps_ttm is not None:
-        eps1 = eps_ttm * (1.0 + g)
-        eps2 = eps1 * (1.0 + g)
-        eps3 = eps2 * (1.0 + g)
-
-    # Idag = EPS TTM * base (om negativ EPS → idags-target None)
-    target_today = eps_ttm * base if (eps_ttm is not None and eps_ttm > 0) else None
-    t1 = (eps1 * base) if (eps1 is not None and eps1 > 0) else None
-    t2 = (eps2 * base) if (eps2 is not None and eps2 > 0) else None
-    t3 = (eps3 * base) if (eps3 is not None and eps3 > 0) else None
-
-    bull_1y = (eps1 * bull) if (eps1 is not None and eps1 > 0) else None
-    bear_1y = (eps1 * bear) if (eps1 is not None and eps1 > 0) else None
-
+    methods_df, sanity, meta = compute_methods_for_row(row, settings, fx_map)
+    fv = meta.get("fair_value") or {}
     return {
-        "Metod": "pe",
-        "Riktkurs idag": target_today,
-        "Riktkurs 1 år": t1,
-        "Riktkurs 2 år": t2,
-        "Riktkurs 3 år": t3,
-        "Bull 1 år": bull_1y,
-        "Bear 1 år": bear_1y,
-        "Input-sammanfattning": f"PE base={base:.1f}, EPS(ttm/1y/2y)=({_nz(eps_ttm,'-')},{_nz(eps1,'-')},{_nz(eps2,'-')}), g≈{g*100:.1f}%"
+        "today": _f(fv.get("today")),
+        "y1": _f(fv.get("y1")),
+        "y2": _f(fv.get("y2")),
+        "y3": _f(fv.get("y3")),
+        "price": _f(meta.get("price")),
+        "currency": meta.get("currency") or row.get("Valuta") or "USD",
+        "sanity": sanity,
+        "methods_df": methods_df,
     }
 
-# ---------- EV/S-ankare ----------
-def _settings_evs_targets(settings: Dict[str, Any]) -> Tuple[float, float, float]:
+def _write_fv_into_df(df: pd.DataFrame, settings: Dict[str, Any], fx_map: Dict[str, float]) -> pd.DataFrame:
     """
-    EV/S band från Settings om de finns, annars (2.0, 3.0, 4.0)
+    CHANGED: Beräknar FV via Del 3 och skriver till:
+      Riktkurs idag / 1 år / 2 år / 3 år
     """
-    try:
-        bear = _f(settings.get("evs_bear")) or 2.0
-        base = _f(settings.get("evs_base")) or 3.0
-        bull = _f(settings.get("evs_bull")) or 4.0
-    except Exception:
-        bear, base, bull = 2.0, 3.0, 4.0
-    return float(bear), float(base), float(bull)
-
-def _ps_target_from_evs(ev_s: float, row: pd.Series) -> float:
-    """
-    Förenklat omvandla EV/S till pris per aktie:
-      Price = (EV - NetDebt) / Shares
-      EV    = EV/S * Revenue
-    Vi använder Rev (relevant år), Net debt och Utestående aktier från raden.
-    """
-    rev     = float(_f(row.get("_REV_FOR_TARGET")) or 0.0)
-    netdebt = float(_f(row.get("Net debt")) or 0.0)
-    shares  = float(_f(row.get("Utestående aktier")) or 0.0)
-    if rev <= 0 or shares <= 0:
-        return None
-    try:
-        ev = float(ev_s) * rev
-        eq = ev - netdebt  # equity value approx
-        return eq / shares
-    except Exception:
-        return None
-
-def _compute_targets_evs(row: pd.Series, settings: Dict[str, Any]) -> Dict[str, Any]:
-    bear, base, bull = _settings_evs_targets(settings)
-
-    # Förbered intäkter per år
-    rev_ttm = _f(row.get("Rev TTM"))
-    rev1    = _f(row.get("Rev 1Y"))
-    rev2    = _f(row.get("Rev 2Y"))
-    g = _infer_rev_growth(row)
-
-    # Extrapolera så vi har Rev för 1/2/3 år
-    if rev1 is None and rev_ttm is not None:
-        rev1 = rev_ttm * (1.0 + g)
-    if rev2 is None and rev1 is not None:
-        rev2 = rev1 * (1.0 + g)
-    rev3 = (rev2 * (1.0 + g)) if rev2 is not None else (rev1 * (1.0 + g) if rev1 is not None else None)
-
-    # Beräkna target per år via EV/S(base)
-    def _px_from_rev(rev_val):
-        if rev_val is None:
-            return None
-        tmp = row.copy()
-        tmp["_REV_FOR_TARGET"] = rev_val
-        return _ps_target_from_evs(base, tmp)
-
-    t0 = _px_from_rev(rev_ttm)
-    t1 = _px_from_rev(rev1)
-    t2 = _px_from_rev(rev2)
-    t3 = _px_from_rev(rev3)
-
-    # Bull/Bear (1Y) via band
-    def _px_from_rev_band(rev_val, band_mult):
-        if rev_val is None:
-            return None
-        tmp = row.copy()
-        tmp["_REV_FOR_TARGET"] = rev_val
-        return _ps_target_from_evs(band_mult, tmp)
-
-    bull_1y = _px_from_rev_band(rev1, bull)
-    bear_1y = _px_from_rev_band(rev1, bear)
-
-    return {
-        "Metod": "evs",
-        "Riktkurs idag": t0,
-        "Riktkurs 1 år": t1,
-        "Riktkurs 2 år": t2,
-        "Riktkurs 3 år": t3,
-        "Bull 1 år": bull_1y,
-        "Bear 1 år": bear_1y,
-        "Input-sammanfattning": f"EV/S base={base:.1f}, Rev(ttm/1y/2y)=({_nz(rev_ttm,'-')},{_nz(rev1,'-')},{_nz(rev2,'-')}), g≈{g*100:.1f}%"
-    }
-
-# ---------- En rad → riktkurser ----------
-def compute_targets_for_row(row: pd.Series, settings: Dict[str, Any]) -> Dict[str, Any]:
-    method = _choose_method_for_row(row)
-    if method == "pe":
-        res = _compute_targets_pe(row, settings)
-    else:
-        res = _compute_targets_evs(row, settings)
-
-    # Säkerställ float/None, 2-decimals precision vid skrivning till UI sker separat
-    out = {}
-    for k in ("Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"):
-        v = _f(res.get(k))
-        out[k] = float(v) if v is not None and math.isfinite(float(v)) else None
-    out["Metod"] = res.get("Metod")
-    out["Input-sammanfattning"] = res.get("Input-sammanfattning")
-    return out
-
-def compute_targets_for_df(df: pd.DataFrame, settings: Dict[str, Any]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+    out = df.copy()
+    for need in ["Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år"]:
+        if need not in out.columns:
+            out[need] = np.nan
 
-    df_out = df.copy()
-    cols = ["Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år","Metod","Input-sammanfattning"]
-    for c in cols:
-        if c not in df_out.columns:
-            df_out[c] = np.nan
-
-    for i, row in df_out.iterrows():
+    for i, r in out.iterrows():
         try:
-            res = compute_targets_for_row(row, settings)
-            for k, v in res.items():
-                df_out.at[i, k] = v
+            res = _fv_from_row(r, settings, fx_map)
+            out.at[i, "Riktkurs idag"] = res["today"]
+            out.at[i, "Riktkurs 1 år"]  = res["y1"]
+            out.at[i, "Riktkurs 2 år"]  = res["y2"]
+            out.at[i, "Riktkurs 3 år"]  = res["y3"]
         except Exception:
-            # Fortsätt även om en rad fallerar
+            # fortsätt även om en rad fallerar
             continue
-    return df_out
+    return out
 
-# ---------- Analys & Ranking-vy ----------
+# ---------- Analys & Ranking (FV från Del 3) ----------
 def page_analysis_ranking():
-    st.header("📊 Analys & Ranking (uppdaterar Data-bladet)")
+    st.header("📊 Analys & Ranking (FV från metodfamilj)")
 
     df = read_data_df()
     if df.empty:
-        st.info("Inga data i Data-bladet.")
+        st.info("Data-bladet är tomt.")
         return
 
     settings = get_settings_map()
+    fx_map   = get_fx_map()
 
-    col1, col2, col3 = st.columns([2,1,1])
+    col1, col2 = st.columns([1,1])
     with col1:
-        st.caption("Metoder väljs per rad: P/E för lönsamma bolag, EV/S för tidiga/förlust. "
-                   "Om 'Metod' är satt i Data respekteras den.")
+        horizon = st.selectbox("Ranking-horisont", ["Idag","1 år","2 år","3 år"], index=0)
     with col2:
-        run = st.button("🔁 Beräkna riktkurser")
-    with col3:
-        show_horizon = st.selectbox("Ranking på", ["Idag","1 år","2 år","3 år"], index=0)
+        run = st.button("🔁 Beräkna & skriv FV till Data")
 
     if run:
-        with st.spinner("Beräknar riktkurser…"):
-            new_df = compute_targets_for_df(df, settings)
+        with st.spinner("Beräknar fair value för alla rader…"):
+            new_df = _write_fv_into_df(df, settings, fx_map)
             write_data_df(new_df)
             st.session_state["DATA"] = new_df
-            st.success("Riktkurser uppdaterade i Data-bladet.")
             df = new_df
+            st.success("Klart – FV sparat till Data-bladet.")
 
-    # Visa ranking
-    horizon_col = {
-        "Idag": "Riktkurs idag",
-        "1 år": "Riktkurs 1 år",
-        "2 år": "Riktkurs 2 år",
-        "3 år": "Riktkurs 3 år",
-    }.get(show_horizon, "Riktkurs idag")
-
+    # Rankingvy (läser FV-kolumnerna i Data)
+    hcol = {"Idag":"Riktkurs idag", "1 år":"Riktkurs 1 år", "2 år":"Riktkurs 2 år", "3 år":"Riktkurs 3 år"}[horizon]
     base = df.copy()
-    for c in ("Aktuell kurs", horizon_col):
+    for c in ("Aktuell kurs", hcol):
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    show_cols = ["Ticker","Bolagsnamn","Bucket","Valuta","Aktuell kurs",horizon_col,"Uppsida (%)","Metod","Input-sammanfattning"]
     rows = []
     for _, r in base.iterrows():
         try:
             px = _f(r.get("Aktuell kurs"))
-            fv = _f(r.get(horizon_col))
-            if px is None or fv is None or px <= 0:
+            tgt = _f(r.get(hcol))
+            if px is None or tgt is None or px <= 0:
                 continue
-            up = (fv - px)/px*100.0
+            up = (tgt - px)/px*100.0
             rows.append({
-                "Ticker": str(r.get("Ticker") or ""),
+                "Ticker": str(r.get("Ticker") or "").upper(),
                 "Bolagsnamn": str(_nz(r.get("Bolagsnamn"), "")),
                 "Bucket": str(_nz(r.get("Bucket"), "")),
-                "Valuta": str(_nz(r.get("Valuta"), "")),
+                "Valuta": _safe_currency(r.get("Valuta")),
                 "Aktuell kurs": float(px),
-                horizon_col: float(fv),
+                hcol: float(tgt),
                 "Uppsida (%)": float(up),
-                "Metod": str(_nz(r.get("Metod"), "")),
-                "Input-sammanfattning": str(_nz(r.get("Input-sammanfattning"), ""))[:200],
             })
         except Exception:
             continue
 
     if not rows:
-        st.info("Inget att visa ännu. Kör beräkningen ovan först.")
+        st.info("Inget att visa ännu. Kör beräkningen ovan först eller kontrollera att 'Aktuell kurs' och FV finns.")
         return
 
-    tbl = pd.DataFrame(rows, columns=show_cols)
+    tbl = pd.DataFrame(rows, columns=["Ticker","Bolagsnamn","Bucket","Valuta","Aktuell kurs",hcol,"Uppsida (%)"])
     tbl = tbl.sort_values("Uppsida (%)", ascending=False).reset_index(drop=True)
 
-    # Formatering för visning
+    # Visning med 2 decimaler (endast UI)
     vis = tbl.copy()
-    if "Aktuell kurs" in vis.columns:
-        vis["Aktuell kurs"] = vis["Aktuell kurs"].map(lambda v: f"{v:.2f}")
-    if horizon_col in vis.columns:
-        vis[horizon_col] = vis[horizon_col].map(lambda v: f"{v:.2f}")
+    vis["Aktuell kurs"] = vis["Aktuell kurs"].map(lambda v: f"{v:.2f}")
+    vis[hcol] = vis[hcol].map(lambda v: f"{v:.2f}")
     vis["Uppsida (%)"] = vis["Uppsida (%)"].map(lambda v: f"{v:.1f}%")
-
     st.dataframe(vis, use_container_width=True, hide_index=True)
 
-# ============================================================
-# main() + sidomeny
-# ============================================================
+    st.markdown("---")
+    st.subheader("🔎 Enskild analys (samma FV-motor)")
+    opts = df["Ticker"].dropna().astype(str).unique().tolist()
+    tkr = st.selectbox("Välj bolag", sorted(opts))
+    if tkr:
+        row = df[df["Ticker"].astype(str) == tkr].iloc[0]
+        res = _fv_from_row(row, settings, fx_map)
+        price = res["price"]; curr = _safe_currency(res["currency"])
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Kurs", f"{(price is not None and f'{price:.2f}') or '—'} {curr}")
+        c2.metric("FV idag", f"{(res['today'] is not None and f'{res['today']:.2f}') or '—'} {curr}",
+                  delta=f"{((_calc_upside(res['today'], price) or 0)*100):.1f}%")
+        c3.metric("FV 1 år", f"{(res['y1'] is not None and f'{res['y1']:.2f}') or '—'} {curr}",
+                  delta=f"{((_calc_upside(res['y1'], price) or 0)*100):.1f}%")
+        c4.metric("FV 2 år", f"{(res['y2'] is not None and f'{res['y2']:.2f}') or '—'} {curr}",
+                  delta=f"{((_calc_upside(res['y2'], price) or 0)*100):.1f}%")
+        c5.metric("FV 3 år", f"{(res['y3'] is not None and f'{res['y3']:.2f}') or '—'} {curr}",
+                  delta=f"{((_calc_upside(res['y3'], price) or 0)*100):.1f}%")
+        st.caption(f"Sanity: {res['sanity']}")
+        st.subheader("Metodtabell")
+        st.dataframe(_fmt_methods_for_display(res["methods_df"]), use_container_width=True, hide_index=True)
+
+# ---------- Main & Routing ----------
 def _load_bootstrap_into_session():
-    # Ladda in Data + Settings + FX till session om inte redan
     if "DATA" not in st.session_state or st.session_state.get("DATA") is None:
         try:
             st.session_state["DATA"] = read_data_df()
         except Exception:
             st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
-
     if "SETTINGS_MAP" not in st.session_state:
         try:
             st.session_state["SETTINGS_MAP"] = get_settings_map()
         except Exception:
             st.session_state["SETTINGS_MAP"] = {}
-
     if "FX" not in st.session_state:
         try:
             st.session_state["FX"] = get_fx_map()
@@ -2938,15 +2749,12 @@ def main():
     with st.sidebar:
         st.header("📚 Navigering")
         choice = st.radio("Vyer", list(PAGES.keys()), index=0)
-        st.caption("Tips: Börja i **Analys & Ranking** för att uppdatera riktkurserna till Data-bladet.")
+        st.caption("Denna vy använder FV från Del 3 (familjemedian + decay).")
 
-    # Kör vald sida
-    page_fn = PAGES.get(choice)
-    if page_fn:
-        try:
-            page_fn()
-        except Exception as e:
-            st.error(f"💥 Fel i huvudloopen: {e}")
+    try:
+        PAGES[choice]()
+    except Exception as e:
+        st.error(f"💥 Fel i huvudloopen: {e}")
 
 # Kör appen
 if __name__ == "__main__":
