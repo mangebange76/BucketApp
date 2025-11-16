@@ -2505,240 +2505,194 @@ def page_buy_suggestions():
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
-# Del 6/6: 🏆 Ranking & Huvud-UI (FIXAD)
-#
-#  - Ranking: beräknar riktkurser (Idag/1/2/3 år) för valda/alla rader
-#  - Sparar tillbaka till Google Sheets (Data-bladet)
-#  - Huvudmeny + router till alla vyer
-#  - FIX: page_analysis-wrapper + korrekt anrop av compute_methods_for_row
+# Del 6/6: Meny, Ranking (fair value), Översikt och main()
+#  - Läser/skriv­er Data via read_data_df()/write_data_df()
+#  - Använder beräkningsmotor från Del 3 (compute_fair_values_for_row)
+#  - Riktkurser skrivs till: Riktkurs idag, 1 år, 2 år, 3 år
 # ============================================================
 
-# ------- Liten visningshjälpare (används nedan) -------
-def _show_df(df: pd.DataFrame, height: int = 420, use_container_width: bool = True):
-    st.dataframe(df, height=height, use_container_width=use_container_width, hide_index=True)
+# -------------------------
+# Hjälpare (kolumner/trygg körning)
+# -------------------------
+def _ensure_rank_cols(df: pd.DataFrame) -> pd.DataFrame:
+    need = [
+        "Primär metod",
+        "Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år",
+    ]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[*DATA_COLUMNS, *need])
+    for c in need:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df
 
-# ============================================================
-# 🏆 Ranking — beräkna riktkurser och spara till Data
-# ============================================================
-def _extract_fv_from_meta(meta: Mapping[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    Plockar fair value (idag/1y/2y/3y) samt bull/bear 1y ur meta-objektet,
-    oavsett nyckelnamn.
-    """
-    def g(*keys):
-        for k in keys:
-            if k in meta and _f(meta.get(k)) is not None:
-                return float(_f(meta.get(k)))
-        return None
-
-    fv0 = g("fv_today", "fair_value_today", "fair_value_idag", "target_today", "Riktkurs idag")
-    fv1 = g("fv_1y", "fair_value_1y", "target_1y", "Riktkurs 1 år")
-    fv2 = g("fv_2y", "fair_value_2y", "target_2y", "Riktkurs 2 år")
-    fv3 = g("fv_3y", "fair_value_3y", "target_3y", "Riktkurs 3 år")
-    bull1 = g("bull_1y", "Bull 1 år")
-    bear1 = g("bear_1y", "Bear 1 år")
-    return fv0, fv1, fv2, fv3, bull1, bear1
-
-def _compute_row_fair_values(row: pd.Series) -> dict:
-    """
-    Anropar compute_methods_for_row(row, settings, fx_map) från Del 3 och
-    returnerar FV-värden som kan skrivas till Data-bladet.
-    """
-    # FIX: hämta settings/fx_map och skicka in (rätt signatur)
-    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
-    fx_map   = st.session_state.get("FX") or get_fx_map()
-
-    try:
-        res = compute_methods_for_row(row, settings, fx_map)  # Del 3: (methods_df, sanity, meta)
-    except Exception as e:
-        raise RuntimeError(f"compute_methods_for_row fel: {e}")
-
-    # Stöd både (methods_df, sanity, meta) och (methods_df, meta) samt dict
-    meta: Mapping[str, Any] | None = None
-    if isinstance(res, tuple):
-        if len(res) >= 3:
-            meta = res[2]
-        elif len(res) == 2:
-            meta = res[1]
-    elif isinstance(res, Mapping):
-        meta = res
-    else:
-        meta = {}
-
-    fv0, fv1, fv2, fv3, bull1, bear1 = _extract_fv_from_meta(meta or {})
-    out = {}
-    if fv0 is not None:   out["Riktkurs idag"] = float(fv0)
-    if fv1 is not None:   out["Riktkurs 1 år"] = float(fv1)
-    if fv2 is not None:   out["Riktkurs 2 år"] = float(fv2)
-    if fv3 is not None:   out["Riktkurs 3 år"] = float(fv3)
-    if bull1 is not None: out["Bull 1 år"]     = float(bull1)
-    if bear1 is not None: out["Bear 1 år"]     = float(bear1)
-    return out
-
+# -------------------------
+# 🏆 Ranking (beräkna fair value & riktkurser)
+# -------------------------
 def page_ranking():
-    st.header("🏆 Ranking — beräkna riktkurser")
-    base_df = read_data_df()
-    if base_df.empty:
-        st.info("Data-bladet är tomt.")
+    st.header("🏆 Ranking (beräkna fair value & riktkurser)")
+    df = read_data_df()
+    if df.empty:
+        st.info("Inget att beräkna – Data-bladet är tomt.")
         return
 
-    # Välj tickers
-    tickers = sorted(base_df["Ticker"].dropna().astype(str).unique().tolist())
-    colA, colB = st.columns([2,1])
-    with colA:
+    df = _ensure_rank_cols(df)
+    tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
+
+    c1, c2 = st.columns([2,1])
+    with c1:
         sel = st.multiselect("Välj tickers att beräkna (tom = alla)", options=tickers, default=[])
-    with colB:
-        order_by = st.selectbox("Sortera efter", ["Ticker","Uppsida mot FV (Idag)"], index=0)
+    with c2:
+        calc_btn = st.button("🚀 Beräkna")
 
-    run = st.button("🚀 Beräkna & spara riktkurser")
-    if not run:
-        # Visa snabb status på befintliga riktkurser
-        preview_cols = ["Ticker","Bolagsnamn","Valuta","Aktuell kurs","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"]
-        view = base_df.copy()
-        for c in preview_cols:
-            if c not in view.columns:
-                view[c] = np.nan
-        if "Aktuell kurs" in view:
-            view["Aktuell kurs"] = pd.to_numeric(view["Aktuell kurs"], errors="coerce")
-        for c in ("Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år"):
-            if c in view.columns:
-                view[c] = pd.to_numeric(view[c], errors="coerce")
-        if order_by == "Uppsida mot FV (Idag)":
-            try:
-                price = view["Aktuell kurs"]
-                fv0   = view["Riktkurs idag"]
-                view["Uppsida %"] = (fv0 - price) / price * 100.0
-                view = view.sort_values("Uppsida %", ascending=False)
-            except Exception:
-                pass
-        _show_df(view[preview_cols].reset_index(drop=True), height=420, use_container_width=True)
+    st.caption("Obs: riktkurser beräknas i aktiens **handelsvaluta** (ingen valutakonvertering här).")
+
+    if not calc_btn:
+        st.dataframe(
+            df[["Ticker","Bolagsnamn","Valuta","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år"]],
+            use_container_width=True, hide_index=True
+        )
         return
 
+    settings = get_settings_map()
+    fx_map   = get_fx_map()
     target = tickers if len(sel) == 0 else sel
-    df_cur = base_df.copy()
-    progress = st.progress(0.0)
+
+    prog = st.progress(0.0)
     status = st.empty()
-    results = []
+    out = df.copy()
+    updated_idx = []
 
-    # Säkerställ att riktkurs-kolumnerna finns
-    for c in ("Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"):
-        if c not in df_cur.columns:
-            df_cur[c] = np.nan
-
-    errs = 0
     for i, tkr in enumerate(target, start=1):
-        status.write(f"Beräknar {i}/{len(target)} — {tkr}")
         try:
-            mask = df_cur["Ticker"].astype(str).str.upper() == str(tkr).upper()
+            status.write(f"Beräknar {i}/{len(target)} – {tkr}")
+            mask = out["Ticker"].astype(str).str.upper() == str(tkr).upper()
             if not mask.any():
-                raise RuntimeError("Ticker saknas i Data.")
-            idx = df_cur.index[mask][0]
-            row = df_cur.loc[idx]
+                continue
+            idx = out.index[mask][0]
 
-            fv_updates = _compute_row_fair_values(row)
-            for k, v in fv_updates.items():
-                df_cur.at[idx, k] = v
+            # Använd beräkningsmotorn från Del 3
+            res = compute_fair_values_for_row(out.loc[idx], settings, fx_map)
+            fv_today = _f(res.get("fv_today"))
+            fv_1y    = _f(res.get("fv_1y"))
+            fv_2y    = _f(res.get("fv_2y"))
+            fv_3y    = _f(res.get("fv_3y"))
 
-            price = _f(df_cur.at[idx, "Aktuell kurs"])
-            fv0   = _f(df_cur.at[idx, "Riktkurs idag"])
-            up0   = ((fv0 - price) / price * 100.0) if (_pos(price) and _pos(fv0)) else None
-            results.append({
-                "Ticker": tkr,
-                "Kurs": price if price is not None else np.nan,
-                "FV idag": fv0 if fv0 is not None else np.nan,
-                "FV 1y": _f(df_cur.at[idx, "Riktkurs 1 år"]),
-                "FV 2y": _f(df_cur.at[idx, "Riktkurs 2 år"]),
-                "FV 3y": _f(df_cur.at[idx, "Riktkurs 3 år"]),
-                "Uppsida idag (%)": up0
-            })
+            # Skriv endast om värde finns
+            if fv_today is not None: out.at[idx, "Riktkurs idag"] = fv_today
+            if fv_1y    is not None: out.at[idx, "Riktkurs 1 år"]  = fv_1y
+            if fv_2y    is not None: out.at[idx, "Riktkurs 2 år"]  = fv_2y
+            if fv_3y    is not None: out.at[idx, "Riktkurs 3 år"]  = fv_3y
+
+            # Primär metod = fair_value (familjemedian)
+            out.at[idx, "Primär metod"] = "fair_value"
+            updated_idx.append(idx)
         except Exception as e:
-            errs += 1
             st.error(f"{tkr}: {e}")
+        prog.progress(i/len(target))
 
-        progress.progress(i/len(target))
+    write_data_df(out)
+    st.session_state["DATA"] = out
+    prog.empty()
+    status.empty()
+    st.success(f"Klar. {len(updated_idx)} rader uppdaterade.")
 
-    # Spara tillbaka
-    try:
-        write_data_df(df_cur)
-        st.session_state["DATA"] = df_cur
-    except Exception as e:
-        st.error(f"Kunde inte spara till Google Sheets: {e}")
-        return
-    finally:
-        progress.empty()
-        status.empty()
+    if updated_idx:
+        show_cols = ["Ticker","Valuta","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Primär metod"]
+        st.dataframe(out.loc[updated_idx, [c for c in show_cols if c in out.columns]],
+                     use_container_width=True, hide_index=True)
 
-    st.success(f"Klar. {len(target)} tickers beräknade. Fel: {errs}.")
-    if results:
-        out = pd.DataFrame(results)
-        for c in ("Kurs","FV idag","FV 1y","FV 2y","FV 3y"):
-            if c in out.columns:
-                out[c] = out[c].map(lambda x: "" if _f(x) is None else f"{float(x):.2f}")
-        if "Uppsida idag (%)" in out.columns:
-            out["Uppsida idag (%)"] = out["Uppsida idag (%)"].map(lambda v: "" if v is None else f"{v:.1f}%")
-        _show_df(out, height=420, use_container_width=True)
-
-# ============================================================
-# 🔍 Analys — wrapper till render_analysis_view (Del 4)
-# ============================================================
-def page_analysis():
-    # FIX: enkel wrapper så menyns "🔍 Analys" fungerar
+# -------------------------
+# 🏠 Översikt (snabbstatus)
+# -------------------------
+def page_overview():
+    st.header("🏠 Översikt")
     df = st.session_state.get("DATA")
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         df = read_data_df()
         st.session_state["DATA"] = df
-    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
-    fx_map   = st.session_state.get("FX") or get_fx_map()
-    try:
-        render_analysis_view(df, settings, fx_map)  # definierad i Del 4
-    except Exception as e:
-        st.error(f"Fel i analysvyn: {e}")
 
-# ============================================================
-# 🧭 Huvud-UI (router)
-# ============================================================
-def _ensure_session_loaded():
-    if "DATA" not in st.session_state or st.session_state.get("DATA") is None:
-        try:
-            st.session_state["DATA"] = read_data_df()
-        except Exception:
-            st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
+    if df.empty:
+        st.info("Inget innehåll i Data-bladet ännu.")
+        return
+
+    # Nyckeltal
+    total_rows = len(df)
+    owned = 0
+    if "Antal aktier" in df.columns:
+        owned = int(pd.to_numeric(df["Antal aktier"], errors="coerce").fillna(0).gt(0).sum())
+    latest_auto = df.get("Senast auto uppdaterad")
+    latest_manual = df.get("Senast manuellt uppdaterad")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Antal rader (tickers)", f"{total_rows}")
+    with c2:
+        st.metric("Ägda innehav (antal)", f"{owned}")
+    with c3:
+        lm = _nz(latest_auto.dropna().max() if isinstance(latest_auto, pd.Series) else None,
+                 latest_manual.dropna().max() if isinstance(latest_manual, pd.Series) else None)
+        st.metric("Senaste uppdatering", str(lm) if lm else "—")
+
+    st.markdown("#### Snabblista (kurs & FV idag när tillgängligt)")
+    cols = ["Ticker","Bolagsnamn","Valuta","Aktuell kurs","Riktkurs idag","Riktkurs 1 år"]
+    view = (df[cols] if all(c in df.columns for c in cols) else df.head(50))
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+# -------------------------
+# Meny & main()
+# -------------------------
+_MENU = [
+    "🏠 Översikt",
+    "🏆 Ranking",
+    "✏️ Editor",
+    "➕ Lägg till",
+    "📦 Portfölj",
+    "🧩 Massuppdatering",
+    "🕒 Snapshot",
+    "⚙️ Settings",
+    "🛒 Köpförslag",
+]
+
+_PAGE_FUN = {
+    "🏠 Översikt": page_overview,
+    "🏆 Ranking": page_ranking,
+    "✏️ Editor": page_editor,
+    "➕ Lägg till": page_add_ticker,
+    "📦 Portfölj": page_portfolio,
+    "🧩 Massuppdatering": page_batch,
+    "🕒 Snapshot": page_snapshot,
+    "⚙️ Settings": page_settings,
+    "🛒 Köpförslag": page_buy_suggestions,
+}
+
+def _bootstrap_session():
+    # Ladda settings/FX/Data i session om saknas
+    if "SETTINGS_MAP" not in st.session_state:
+        st.session_state["SETTINGS_MAP"] = get_settings_map()
     if "FX" not in st.session_state or not st.session_state.get("FX"):
-        try:
-            st.session_state["FX"] = get_fx_map()
-        except Exception:
-            st.session_state["FX"] = {}
-    if "SETTINGS_MAP" not in st.session_state or not st.session_state.get("SETTINGS_MAP"):
-        try:
-            st.session_state["SETTINGS_MAP"] = get_settings_map()
-        except Exception:
-            st.session_state["SETTINGS_MAP"] = {}
+        st.session_state["FX"] = get_fx_map()
+    if "DATA" not in st.session_state or st.session_state.get("DATA") is None:
+        st.session_state["DATA"] = read_data_df()
 
 def main():
-    st.sidebar.title("📈 Aktieanalys & investeringsförslag")
-    _ensure_session_loaded()
+    _bootstrap_session()
+    with st.sidebar:
+        st.markdown("### 📚 Navigera")
+        choice = st.radio("Välj sida", _MENU, index=0, label_visibility="collapsed")
+        st.markdown("---")
+        st.caption("Bas 2025-11-16 • Ingen valutakonvertering av riktkurser • 1s fördröjning i massuppdatering")
 
-    # Meny i samma anda som basversionen
-    PAGES = {
-        "🏠 Översikt": page_overview,              # Del 6 (redan definierad tidigare i din kodbas)
-        "🏆 Ranking": page_ranking,                # (denna del)
-        "🔍 Analys": page_analysis,                # FIX: wrapper
-        "📦 Portfölj": page_portfolio,             # Del 5
-        "🛒 Köpförslag": page_buy_suggestions,     # Del 5
-        "✏️ Editor": page_editor,                  # Del 5
-        "➕ Lägg till": page_add_ticker,           # Del 5
-        "🧩 Massuppdatering": page_batch,          # Del 5
-        "🕒 Snapshot": page_snapshot,              # Del 5
-        "⚙️ Settings": page_settings,              # Del 5
-    }
-    choice = st.sidebar.radio("Meny", list(PAGES.keys()), index=1)
-    try:
-        PAGES[choice]()
-    except NameError as e:
-        st.error(f"Saknad vy: {e}. Kontrollera att Del 1–6 är laddade i rätt ordning.")
-    except Exception as e:
-        st.error(f"Fel i vyn: {e}")
+        # Snabbåtgärder
+        if st.button("🔄 Läs om Data/FX/Settings"):
+            st.session_state["SETTINGS_MAP"] = get_settings_map()
+            st.session_state["FX"] = get_fx_map()
+            st.session_state["DATA"] = read_data_df()
+            st.success("Omladdat.")
 
-# Kör appen
+    # Kör vald sida
+    _PAGE_FUN.get(choice, page_overview)()
+
+# Streamlit-entry
 if __name__ == "__main__":
     main()
