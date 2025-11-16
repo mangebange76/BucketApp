@@ -2525,10 +2525,6 @@ def page_buy_suggestions():
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 6/6: 🏆 Ranking, 🔍 Analys & 🧭 Main
-#
-#  - Kör beräkningsmotorn (Del 3) för att skriva riktkurser
-#  - Per-ticker analysvy med metodtabell
-#  - Huvudnavigering + hel tabell längst ned i Analys
 # ============================================================
 
 # -------------------------
@@ -2536,7 +2532,8 @@ def page_buy_suggestions():
 # -------------------------
 def _fv_from_meta(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    Returnerar (today, y1, y2, y3, bull_1y, bear_1y) med försiktig nyckelhantering.
+    Returnerar (today, y1, y2, y3, bull_1y, bear_1y) från en meta-dict/payload.
+    Kompatibel med både äldre 'fair_value_*' och nya 'target_*'.
     """
     if not isinstance(meta, Mapping):
         return None, None, None, None, None, None
@@ -2547,20 +2544,20 @@ def _fv_from_meta(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[float
                 return float(_f(meta[k]))
         return None
 
-    # Vanliga nycklar
-    fv_today = _pick("fair_value_today")
+    # CHANGED: stöd för target_* (ny payload) + äldre fair_value-struktur
+    fv_today = _pick("target_today", "fair_value_today")
     if fv_today is None and isinstance(meta.get("fair_value"), Mapping):
         fv_today = _f(meta["fair_value"].get("today"))
 
-    fv_1y = _pick("fair_value_1y")
+    fv_1y = _pick("target_1y", "fair_value_1y")
     if fv_1y is None and isinstance(meta.get("fair_value"), Mapping):
         fv_1y = _f(meta["fair_value"].get("1y"))
 
-    fv_2y = _pick("fair_value_2y")
+    fv_2y = _pick("target_2y", "fair_value_2y")
     if fv_2y is None and isinstance(meta.get("fair_value"), Mapping):
         fv_2y = _f(meta["fair_value"].get("2y"))
 
-    fv_3y = _pick("fair_value_3y")
+    fv_3y = _pick("target_3y", "fair_value_3y")
     if fv_3y is None and isinstance(meta.get("fair_value"), Mapping):
         fv_3y = _f(meta["fair_value"].get("3y"))
 
@@ -2573,9 +2570,6 @@ def _fv_from_meta(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[float
     )
 
 def _write_fv_into_df(df_cur: pd.DataFrame, idx: int, fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y) -> int:
-    """
-    Skriver riktkurskolumner om värden finns. Returnerar antal ändrade fält.
-    """
     changed = 0
     def _set(col, val):
         nonlocal changed
@@ -2642,21 +2636,12 @@ def page_ranking():
             idx = df_cur.index[mask][0]
             row = df_cur.loc[idx]
 
-            # Kör beräkningsmotor
-            try:
-                methods_df, meta = compute_methods_for_row(row, settings)
-            except Exception as e:
-                # Graceful fallback om signaturen skiljer sig
-                out = compute_methods_for_row(row)  # type: ignore
-                if isinstance(out, tuple) and len(out) == 2:
-                    methods_df, meta = out
-                else:
-                    raise e
-
-            fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(meta or {})
+            # CHANGED: compute_methods_for_row returnerar dict (payload)
+            payload = compute_methods_for_row(row, settings)
+            methods_df = payload.get("methods_df")
+            fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(payload)
             changed_total += _write_fv_into_df(df_cur, idx, fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y)
 
-            # Visa metodtabell för senaste körningen om valt
             if show_methods and methods_df is not None and isinstance(methods_df, pd.DataFrame) and not methods_df.empty:
                 with methods_container:
                     st.markdown(f"**Senast beräknad:** {tkr}")
@@ -2670,14 +2655,12 @@ def page_ranking():
             progress.progress(i/len(target))
             time.sleep(float(delay))
 
-    # Skriv tillbaka
     write_data_df(df_cur)
     st.session_state["DATA"] = df_cur
     progress.empty()
     status.empty()
     st.success(f"Klar – {ok} tickers beräknade, {fail} misslyckades. {changed_total} fält ändrades.")
 
-    # Liten sammanfattning
     with st.expander("Visa uppdaterade riktkurser (filter på valda tickers)"):
         show = df_cur[df_cur["Ticker"].astype(str).str.upper().isin([t.upper() for t in target])][
             ["Ticker","Valuta","Aktuell kurs","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"]
@@ -2713,22 +2696,16 @@ def page_analysis():
     idx = ridx[0]
     row = df.loc[idx]
 
-    # Kör beräkningsmotor för den valda raden
     try:
         settings = get_settings_map()
-        try:
-            methods_df, meta = compute_methods_for_row(row, settings)
-        except Exception as e:
-            out = compute_methods_for_row(row)  # type: ignore
-            if isinstance(out, tuple) and len(out) == 2:
-                methods_df, meta = out
-            else:
-                raise e
+        # CHANGED: hämta payload och plocka metoder/FV ur samma dict
+        payload = compute_methods_for_row(row, settings)
+        methods_df = payload.get("methods_df")
     except Exception as e:
         st.error(f"Beräkningsmotor fel: {e}")
         return
 
-    fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(meta or {})
+    fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(payload or {})
     price = _f(row.get("Aktuell kurs"))
     ccy   = str(_nz(row.get("Valuta"), "SEK")).upper()
 
@@ -2820,24 +2797,20 @@ PAGES = [
 ]
 
 def main():
-    # Säkerställ cache/session
     if "DATA" not in st.session_state:
         try:
             st.session_state["DATA"] = read_data_df()
         except Exception:
             st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
 
-    # Sidebar-nav
     st.sidebar.markdown("## Navigering")
     default_page = st.session_state.get("_nav", PAGES[0])
     if default_page not in PAGES:
         default_page = PAGES[0]
     page = st.sidebar.radio("Gå till", PAGES, index=PAGES.index(default_page), key="nav_radio")
-    # Nollställ quick-nav
     if "_nav" in st.session_state:
         del st.session_state["_nav"]
 
-    # Sidor
     if page == "🏠 Start":
         page_home()
     elif page == "🏆 Ranking":
