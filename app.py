@@ -2505,20 +2505,25 @@ def page_buy_suggestions():
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
-# Del 6/6: 🏆 Ranking & Huvud-UI
+# Del 6/6: 🏆 Ranking & Huvud-UI (FIXAD)
 #
 #  - Ranking: beräknar riktkurser (Idag/1/2/3 år) för valda/alla rader
 #  - Sparar tillbaka till Google Sheets (Data-bladet)
 #  - Huvudmeny + router till alla vyer
+#  - FIX: page_analysis-wrapper + korrekt anrop av compute_methods_for_row
 # ============================================================
+
+# ------- Liten visningshjälpare (används nedan) -------
+def _show_df(df: pd.DataFrame, height: int = 420, use_container_width: bool = True):
+    st.dataframe(df, height=height, use_container_width=use_container_width, hide_index=True)
 
 # ============================================================
 # 🏆 Ranking — beräkna riktkurser och spara till Data
 # ============================================================
 def _extract_fv_from_meta(meta: Mapping[str, Any]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    Försöker hämta fair value (idag/1y/2y/3y) och bull/bear 1y ur meta-objektet,
-    oavsett om nycklarna råkar heta 'fv_today' eller 'fair_value_today' etc.
+    Plockar fair value (idag/1y/2y/3y) samt bull/bear 1y ur meta-objektet,
+    oavsett nyckelnamn.
     """
     def g(*keys):
         for k in keys:
@@ -2536,18 +2541,25 @@ def _extract_fv_from_meta(meta: Mapping[str, Any]) -> tuple[Optional[float], Opt
 
 def _compute_row_fair_values(row: pd.Series) -> dict:
     """
-    Anropar compute_methods_for_row(row) och returnerar ett dict med FV-värden.
-    Stödjer både (methods_df, meta) och {meta...}-återgivningar.
+    Anropar compute_methods_for_row(row, settings, fx_map) från Del 3 och
+    returnerar FV-värden som kan skrivas till Data-bladet.
     """
+    # FIX: hämta settings/fx_map och skicka in (rätt signatur)
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    fx_map   = st.session_state.get("FX") or get_fx_map()
+
     try:
-        res = compute_methods_for_row(row)  # Definierad i Del 3
+        res = compute_methods_for_row(row, settings, fx_map)  # Del 3: (methods_df, sanity, meta)
     except Exception as e:
         raise RuntimeError(f"compute_methods_for_row fel: {e}")
 
+    # Stöd både (methods_df, sanity, meta) och (methods_df, meta) samt dict
     meta: Mapping[str, Any] | None = None
-    if isinstance(res, tuple) and len(res) >= 2:
-        # (methods_df, meta)
-        meta = res[1]
+    if isinstance(res, tuple):
+        if len(res) >= 3:
+            meta = res[2]
+        elif len(res) == 2:
+            meta = res[1]
     elif isinstance(res, Mapping):
         meta = res
     else:
@@ -2555,12 +2567,12 @@ def _compute_row_fair_values(row: pd.Series) -> dict:
 
     fv0, fv1, fv2, fv3, bull1, bear1 = _extract_fv_from_meta(meta or {})
     out = {}
-    if fv0 is not None:  out["Riktkurs idag"] = float(fv0)
-    if fv1 is not None:  out["Riktkurs 1 år"] = float(fv1)
-    if fv2 is not None:  out["Riktkurs 2 år"] = float(fv2)
-    if fv3 is not None:  out["Riktkurs 3 år"] = float(fv3)
-    if bull1 is not None: out["Bull 1 år"] = float(bull1)
-    if bear1 is not None: out["Bear 1 år"] = float(bear1)
+    if fv0 is not None:   out["Riktkurs idag"] = float(fv0)
+    if fv1 is not None:   out["Riktkurs 1 år"] = float(fv1)
+    if fv2 is not None:   out["Riktkurs 2 år"] = float(fv2)
+    if fv3 is not None:   out["Riktkurs 3 år"] = float(fv3)
+    if bull1 is not None: out["Bull 1 år"]     = float(bull1)
+    if bear1 is not None: out["Bear 1 år"]     = float(bear1)
     return out
 
 def page_ranking():
@@ -2659,7 +2671,6 @@ def page_ranking():
     st.success(f"Klar. {len(target)} tickers beräknade. Fel: {errs}.")
     if results:
         out = pd.DataFrame(results)
-        # Formatera med två decimaler för FV/Pris
         for c in ("Kurs","FV idag","FV 1y","FV 2y","FV 3y"):
             if c in out.columns:
                 out[c] = out[c].map(lambda x: "" if _f(x) is None else f"{float(x):.2f}")
@@ -2668,10 +2679,25 @@ def page_ranking():
         _show_df(out, height=420, use_container_width=True)
 
 # ============================================================
+# 🔍 Analys — wrapper till render_analysis_view (Del 4)
+# ============================================================
+def page_analysis():
+    # FIX: enkel wrapper så menyns "🔍 Analys" fungerar
+    df = st.session_state.get("DATA")
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        df = read_data_df()
+        st.session_state["DATA"] = df
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    fx_map   = st.session_state.get("FX") or get_fx_map()
+    try:
+        render_analysis_view(df, settings, fx_map)  # definierad i Del 4
+    except Exception as e:
+        st.error(f"Fel i analysvyn: {e}")
+
+# ============================================================
 # 🧭 Huvud-UI (router)
 # ============================================================
 def _ensure_session_loaded():
-    # Ladda in grunddata, FX och settings till session om saknas
     if "DATA" not in st.session_state or st.session_state.get("DATA") is None:
         try:
             st.session_state["DATA"] = read_data_df()
@@ -2692,24 +2718,24 @@ def main():
     st.sidebar.title("📈 Aktieanalys & investeringsförslag")
     _ensure_session_loaded()
 
-    # Navigationsordning enligt basversionen
+    # Meny i samma anda som basversionen
     PAGES = {
-        "🏆 Ranking": page_ranking,
-        "🔍 Analys": page_analysis,              # Del 4
-        "📦 Portfölj": page_portfolio,           # Del 5
-        "🛒 Köpförslag": page_buy_suggestions,   # Del 5
-        "✏️ Editor": page_editor,                # Del 5
-        "➕ Lägg till": page_add_ticker,         # Del 5
-        "🧩 Massuppdatering": page_batch,        # Del 5
-        "🕒 Snapshot": page_snapshot,            # Del 5
-        "⚙️ Settings": page_settings,            # Del 5
+        "🏠 Översikt": page_overview,              # Del 6 (redan definierad tidigare i din kodbas)
+        "🏆 Ranking": page_ranking,                # (denna del)
+        "🔍 Analys": page_analysis,                # FIX: wrapper
+        "📦 Portfölj": page_portfolio,             # Del 5
+        "🛒 Köpförslag": page_buy_suggestions,     # Del 5
+        "✏️ Editor": page_editor,                  # Del 5
+        "➕ Lägg till": page_add_ticker,           # Del 5
+        "🧩 Massuppdatering": page_batch,          # Del 5
+        "🕒 Snapshot": page_snapshot,              # Del 5
+        "⚙️ Settings": page_settings,              # Del 5
     }
-    choice = st.sidebar.radio("Meny", list(PAGES.keys()), index=0)
+    choice = st.sidebar.radio("Meny", list(PAGES.keys()), index=1)
     try:
         PAGES[choice]()
     except NameError as e:
-        # Om någon vy inte definierats i denna del men i tidigare delar
-        st.error(f"Saknad vy: {e}. Säkerställ att alla delar (1–6) är laddade i rätt ordning.")
+        st.error(f"Saknad vy: {e}. Kontrollera att Del 1–6 är laddade i rätt ordning.")
     except Exception as e:
         st.error(f"Fel i vyn: {e}")
 
