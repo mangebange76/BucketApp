@@ -801,7 +801,6 @@ def _yf_ebitda_ttm(tkr) -> Optional[float]:
         fin = tkr.financials
         if fin is not None and not fin.empty:
             if "Ebitda" in fin.index:
-                vals = fin.loc("Ebitda")
                 vals = fin.loc["Ebitda"].dropna()
                 if not vals.empty:
                     return float(vals.iloc[0])
@@ -1466,6 +1465,7 @@ def compute_fair_values_for_row(row: pd.Series, settings: Dict[str, str], fx_map
 #  - _build_ranking_table(): beräkna FV för många tickers (cache)
 #  - ui_ranking(): lista/rankning med uppsida, valbar horisont, ev. "ägda först"
 #  - ui_hel_tabell(): visa hela databasen längst ned (ofiltererad, enkel tabell)
+#  - page_analysis() / page_ranking(): wrappers som anropas från Del 6-router
 #
 # OBS:
 # • Använder hjälpare, Sheets I/O och FX/Settings från Del 1.
@@ -1705,6 +1705,24 @@ def _show_df(df: pd.DataFrame, height: int = 360, use_container_width: bool = Tr
     except Exception:
         # Fallback om render misslyckas (t.ex. pga blandade typer)
         st.table(df.head(200))
+
+
+# ------------------------------------------------------------
+# Wrappers som anropas från routern i Del 6
+# ------------------------------------------------------------
+def page_analysis():
+    """Wrapper för analys-sidan (Del 6 kallar 'page_analysis')."""
+    df = df_or_reload_from_session()
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    fx_map = st.session_state.get("FX") or get_fx_map()
+    ui_analys_enskilt_bolag(df, fx_map, settings)
+
+def page_ranking():
+    """Wrapper för ranking-sidan (Del 6 kallar 'page_ranking')."""
+    df = df_or_reload_from_session()
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    fx_map = st.session_state.get("FX") or get_fx_map()
+    ui_ranking(df, fx_map, settings)
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
@@ -2506,140 +2524,342 @@ def page_buy_suggestions():
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
-# Del 6/6: Main & Router
+# Del 6/6: 🏆 Ranking, 🔍 Analys & 🧭 Main
 #
-#  - Bootstrap av DATA, FX och Settings till session_state
-#  - Sidomeny + sidväxling till respektive page_* funktion
-#  - Enkla diagnostics + felhantering i huvudloopen
-#  - (Streamlit kör main() vid import)
+#  - Kör beräkningsmotorn (Del 3) för att skriva riktkurser
+#  - Per-ticker analysvy med metodtabell
+#  - Huvudnavigering + hel tabell längst ned i Analys
 # ============================================================
 
 # -------------------------
-# Bootstrap helpers
+# Hjälpare för FV-extraktion
 # -------------------------
-def _bootstrap_state(force_reload: bool = False) -> None:
+def _fv_from_meta(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    Laddar Settings, FX och Data till st.session_state om de saknas
-    eller om force_reload=True.
+    Returnerar (today, y1, y2, y3, bull_1y, bear_1y) med försiktig nyckelhantering.
     """
-    if force_reload or ("SETTINGS_MAP" not in st.session_state):
-        try:
-            st.session_state["SETTINGS_MAP"] = get_settings_map()
-        except Exception as e:
-            st.warning(f"Kunde inte läsa Settings: {e}")
-            st.session_state["SETTINGS_MAP"] = {}
+    if not isinstance(meta, Mapping):
+        return None, None, None, None, None, None
 
-    if force_reload or ("FX" not in st.session_state):
-        try:
-            st.session_state["FX"] = get_fx_map()
-        except Exception as e:
-            st.warning(f"Kunde inte läsa Valutakurser: {e}")
-            st.session_state["FX"] = {}
+    def _pick(*keys):
+        for k in keys:
+            if k in meta and _f(meta[k]) is not None:
+                return float(_f(meta[k]))
+        return None
 
-    if force_reload or ("DATA" not in st.session_state):
+    # Vanliga nycklar
+    fv_today = _pick("fair_value_today")
+    if fv_today is None and isinstance(meta.get("fair_value"), Mapping):
+        fv_today = _f(meta["fair_value"].get("today"))
+
+    fv_1y = _pick("fair_value_1y")
+    if fv_1y is None and isinstance(meta.get("fair_value"), Mapping):
+        fv_1y = _f(meta["fair_value"].get("1y"))
+
+    fv_2y = _pick("fair_value_2y")
+    if fv_2y is None and isinstance(meta.get("fair_value"), Mapping):
+        fv_2y = _f(meta["fair_value"].get("2y"))
+
+    fv_3y = _pick("fair_value_3y")
+    if fv_3y is None and isinstance(meta.get("fair_value"), Mapping):
+        fv_3y = _f(meta["fair_value"].get("3y"))
+
+    bull_1y = _pick("bull_1y")
+    bear_1y = _pick("bear_1y")
+
+    return (
+        _f(fv_today), _f(fv_1y), _f(fv_2y), _f(fv_3y),
+        _f(bull_1y), _f(bear_1y),
+    )
+
+def _write_fv_into_df(df_cur: pd.DataFrame, idx: int, fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y) -> int:
+    """
+    Skriver riktkurskolumner om värden finns. Returnerar antal ändrade fält.
+    """
+    changed = 0
+    def _set(col, val):
+        nonlocal changed
+        if val is None:
+            return
+        if col not in df_cur.columns:
+            df_cur[col] = np.nan
+        old = df_cur.at[idx, col]
+        if (pd.isna(old) and not pd.isna(val)) or (not pd.isna(old) and not pd.isna(val) and float(old) != float(val)):
+            df_cur.at[idx, col] = round(float(val), 2)
+            changed += 1
+
+    _set("Riktkurs idag", fv_today)
+    _set("Riktkurs 1 år", fv_1y)
+    _set("Riktkurs 2 år", fv_2y)
+    _set("Riktkurs 3 år", fv_3y)
+    _set("Bull 1 år", bull_1y)
+    _set("Bear 1 år", bear_1y)
+    return changed
+
+# -------------------------
+# 🏆 Ranking (beräkna & skriv FV)
+# -------------------------
+def page_ranking():
+    st.header("🏆 Ranking (beräknar riktkurser och skriver till Data)")
+    base_df = read_data_df()
+    if base_df.empty:
+        st.info("Inget att räkna på – Data-bladet är tomt.")
+        return
+
+    tickers = sorted(base_df["Ticker"].dropna().astype(str).unique().tolist())
+    sel = st.multiselect("Välj tickers (tom = alla)", options=tickers, default=[])
+
+    col_top1, col_top2, col_top3 = st.columns([1,1,2])
+    with col_top1:
+        delay = st.slider("Fördröjning (sek)", min_value=0.0, max_value=2.0, value=0.5, step=0.5)
+    with col_top2:
+        show_methods = st.checkbox("Visa metodtabell för senaste", value=False)
+    with col_top3:
+        st.caption("Beräknar 'Riktkurs idag/1/2/3 år' samt ev. 'Bull/Bear 1 år' enligt beräkningsmotorn (Del 3).")
+
+    go = st.button("🚀 Starta ranking")
+    if not go:
+        return
+
+    target = tickers if len(sel) == 0 else sel
+    df_cur = base_df.copy()
+    settings = get_settings_map()
+
+    progress = st.progress(0.0)
+    status = st.empty()
+    methods_container = st.empty()
+    changed_total = 0
+    ok, fail = 0, 0
+
+    for i, tkr in enumerate(target, start=1):
+        try:
+            status.write(f"Beräknar {i}/{len(target)} – {tkr}")
+            mask = df_cur["Ticker"].astype(str).str.upper() == str(tkr).upper()
+            if not mask.any():
+                fail += 1
+                progress.progress(i/len(target))
+                continue
+            idx = df_cur.index[mask][0]
+            row = df_cur.loc[idx]
+
+            # Kör beräkningsmotor
+            try:
+                methods_df, meta = compute_methods_for_row(row, settings)
+            except Exception as e:
+                # Graceful fallback om signaturen skiljer sig
+                out = compute_methods_for_row(row)  # type: ignore
+                if isinstance(out, tuple) and len(out) == 2:
+                    methods_df, meta = out
+                else:
+                    raise e
+
+            fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(meta or {})
+            changed_total += _write_fv_into_df(df_cur, idx, fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y)
+
+            # Visa metodtabell för senaste körningen om valt
+            if show_methods and methods_df is not None and isinstance(methods_df, pd.DataFrame) and not methods_df.empty:
+                with methods_container:
+                    st.markdown(f"**Senast beräknad:** {tkr}")
+                    _show_df(methods_df, height=260, use_container_width=True)
+
+            ok += 1
+        except Exception as e:
+            st.error(f"{tkr}: {e}")
+            fail += 1
+        finally:
+            progress.progress(i/len(target))
+            time.sleep(float(delay))
+
+    # Skriv tillbaka
+    write_data_df(df_cur)
+    st.session_state["DATA"] = df_cur
+    progress.empty()
+    status.empty()
+    st.success(f"Klar – {ok} tickers beräknade, {fail} misslyckades. {changed_total} fält ändrades.")
+
+    # Liten sammanfattning
+    with st.expander("Visa uppdaterade riktkurser (filter på valda tickers)"):
+        show = df_cur[df_cur["Ticker"].astype(str).str.upper().isin([t.upper() for t in target])][
+            ["Ticker","Valuta","Aktuell kurs","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"]
+        ].copy()
+        for c in ("Aktuell kurs","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år","Bull 1 år","Bear 1 år"):
+            if c in show.columns:
+                show[c] = pd.to_numeric(show[c], errors="coerce").map(lambda v: "" if pd.isna(v) else f"{float(v):.2f}")
+        _show_df(show, height=300, use_container_width=True)
+
+# -------------------------
+# 🔍 Analys (per ticker)
+# -------------------------
+def page_analysis():
+    st.header("🔍 Analys (per ticker)")
+
+    df: pd.DataFrame | None = st.session_state.get("DATA")
+    if df is None or df.empty:
+        df = read_data_df()
+    if df is None or df.empty:
+        st.info("Ingen data laddad.")
+        return
+
+    names_map = _names_map_from_df(df)
+    tickers = df["Ticker"].dropna().astype(str).unique().tolist()
+    sel = _select_with_search_nav("Välj ticker", tickers, names_map, "analysis_idx", "analysis_q")
+    if not sel:
+        return
+
+    ridx = df.index[df["Ticker"].astype(str).str.upper() == sel.upper()]
+    if len(ridx) == 0:
+        st.error("Kunde inte hitta vald rad.")
+        return
+    idx = ridx[0]
+    row = df.loc[idx]
+
+    # Kör beräkningsmotor för den valda raden
+    try:
+        settings = get_settings_map()
+        try:
+            methods_df, meta = compute_methods_for_row(row, settings)
+        except Exception as e:
+            out = compute_methods_for_row(row)  # type: ignore
+            if isinstance(out, tuple) and len(out) == 2:
+                methods_df, meta = out
+            else:
+                raise e
+    except Exception as e:
+        st.error(f"Beräkningsmotor fel: {e}")
+        return
+
+    fv_today, fv_1y, fv_2y, fv_3y, bull_1y, bear_1y = _fv_from_meta(meta or {})
+    price = _f(row.get("Aktuell kurs"))
+    ccy   = str(_nz(row.get("Valuta"), "SEK")).upper()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Valuta", ccy)
+    with c2:
+        st.metric("Aktuell kurs", "—" if price is None else f"{float(price):.2f}")
+    with c3:
+        st.metric("FV idag", "—" if fv_today is None else f"{float(fv_today):.2f}")
+    with c4:
+        up = None
+        if _pos(price) and _pos(fv_today):
+            up = (float(fv_today) - float(price)) / float(price) * 100.0
+        st.metric("Uppsida mot FV idag", "—" if up is None else f"{up:.1f}%")
+
+    c5, c6, c7 = st.columns(3)
+    with c5:
+        st.metric("FV 1 år", "—" if fv_1y is None else f"{float(fv_1y):.2f}")
+    with c6:
+        st.metric("FV 2 år", "—" if fv_2y is None else f"{float(fv_2y):.2f}")
+    with c7:
+        st.metric("FV 3 år", "—" if fv_3y is None else f"{float(fv_3y):.2f}")
+
+    c8, c9 = st.columns(2)
+    with c8:
+        st.metric("Bull 1 år", "—" if bull_1y is None else f"{float(bull_1y):.2f}")
+    with c9:
+        st.metric("Bear 1 år", "—" if bear_1y is None else f"{float(bear_1y):.2f}")
+
+    st.markdown("#### Metodtabell")
+    if methods_df is not None and isinstance(methods_df, pd.DataFrame) and not methods_df.empty:
+        _show_df(methods_df, height=320, use_container_width=True)
+    else:
+        st.caption("Ingen metodtabell att visa.")
+
+    st.markdown("---")
+    st.subheader("Hela databasen (read-only)")
+    _show_df(df, height=360, use_container_width=True)
+
+# -------------------------
+# 🏠 Start (översikt)
+# -------------------------
+def page_home():
+    st.header("🏠 Översikt")
+    df: pd.DataFrame | None = st.session_state.get("DATA")
+    if df is None or df.empty:
+        df = read_data_df()
+    if df is None or df.empty:
+        st.info("Ingen data laddad.")
+        return
+
+    fx_map = get_fx_map()
+    pos = _position_value_tables(df, fx_map)
+    tot_val = float(pos["Värde (SEK)"].sum()) if not pos.empty else 0.0
+    owned = int((df.get("Antal aktier") > 0).sum()) if "Antal aktier" in df.columns else 0
+    uniq = df["Ticker"].nunique() if "Ticker" in df.columns else 0
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Antal tickers", f"{uniq}")
+    with c2:
+        st.metric("Antal innehav (>0 aktier)", f"{owned}")
+    with c3:
+        st.metric("Portföljvärde (SEK)", f"{tot_val:,.0f}".replace(",", " "))
+
+    st.markdown("---")
+    st.subheader("Snabblänkar")
+    col = st.columns(4)
+    col[0].button("🏆 Till Ranking", on_click=lambda: st.session_state.update({"_nav": "🏆 Ranking"}))
+    col[1].button("📦 Till Portfölj", on_click=lambda: st.session_state.update({"_nav": "📦 Portfölj"}))
+    col[2].button("🛒 Till Köpförslag", on_click=lambda: st.session_state.update({"_nav": "🛒 Köpförslag"}))
+    col[3].button("🔍 Till Analys", on_click=lambda: st.session_state.update({"_nav": "🔍 Analys"}))
+
+# -------------------------
+# 🧭 Main
+# -------------------------
+PAGES = [
+    "🏠 Start",
+    "🏆 Ranking",
+    "📦 Portfölj",
+    "🛒 Köpförslag",
+    "✏️ Editor",
+    "➕ Lägg till",
+    "🧩 Massuppdatering",
+    "🕒 Snapshot",
+    "⚙️ Settings",
+    "🔍 Analys",
+]
+
+def main():
+    # Säkerställ cache/session
+    if "DATA" not in st.session_state:
         try:
             st.session_state["DATA"] = read_data_df()
-        except Exception as e:
-            st.warning(f"Kunde inte läsa Data-bladet: {e}")
+        except Exception:
             st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
 
-def _call_page(fn_name: str) -> None:
-    """
-    Anropa en page_* funktion om den finns, annars visa ett tydligt meddelande.
-    """
-    fn = globals().get(fn_name)
-    if callable(fn):
-        fn()
+    # Sidebar-nav
+    st.sidebar.markdown("## Navigering")
+    default_page = st.session_state.get("_nav", PAGES[0])
+    if default_page not in PAGES:
+        default_page = PAGES[0]
+    page = st.sidebar.radio("Gå till", PAGES, index=PAGES.index(default_page), key="nav_radio")
+    # Nollställ quick-nav
+    if "_nav" in st.session_state:
+        del st.session_state["_nav"]
+
+    # Sidor
+    if page == "🏠 Start":
+        page_home()
+    elif page == "🏆 Ranking":
+        page_ranking()
+    elif page == "📦 Portfölj":
+        page_portfolio()
+    elif page == "🛒 Köpförslag":
+        page_buy_suggestions()
+    elif page == "✏️ Editor":
+        page_editor()
+    elif page == "➕ Lägg till":
+        page_add_ticker()
+    elif page == "🧩 Massuppdatering":
+        page_batch()
+    elif page == "🕒 Snapshot":
+        page_snapshot()
+    elif page == "⚙️ Settings":
+        page_settings()
+    elif page == "🔍 Analys":
+        page_analysis()
     else:
-        st.error(f"Sidan '{fn_name}' saknas i denna laddning. Kontrollera att samtliga delar (Del 1–6) är på plats.")
+        page_home()
 
-# -------------------------
-# Vynamn & router
-# -------------------------
-_PAGES = {
-    "🏆 Ranking":           "page_ranking",        # (Del 4)
-    "📊 Analys":            "page_analysis",       # (Del 4)
-    "⚙️ Settings":          "page_settings",       # (Del 5)
-    "🕒 Snapshot":          "page_snapshot",       # (Del 5)
-    "✏️ Editor":            "page_editor",         # (Del 5)
-    "➕ Lägg till":         "page_add_ticker",     # (Del 5)
-    "📦 Portfölj":          "page_portfolio",      # (Del 5)
-    "🧩 Massuppdatering":   "page_batch",          # (Del 5)
-    "🛒 Köpförslag":        "page_buy_suggestions" # (Del 5)
-}
-
-def _sidebar_status() -> None:
-    """
-    Liten statusruta i sidomenyn: radantal, senaste läsning etc.
-    """
-    st.sidebar.markdown("---")
-    try:
-        df = st.session_state.get("DATA")
-        n_rows = 0 if df is None else int(getattr(df, "shape", [0])[0])
-    except Exception:
-        n_rows = 0
-
-    st.sidebar.caption(f"Rader i Data: **{n_rows}**")
-    try:
-        fx_map = st.session_state.get("FX") or {}
-        st.sidebar.caption(f"Valutor cachade: **{len(fx_map)}**")
-    except Exception:
-        pass
-
-def _sidebar_controls() -> str:
-    """
-    Renderar toppsektionen av sidomenyn: titel, vyval, uppdatera-knapp.
-    Returnerar det valda vy-namnet.
-    """
-    st.sidebar.title("📈 Aktieanalys")
-    choice = st.sidebar.selectbox("Välj vy", list(_PAGES.keys()), index=0)
-
-    col1, col2 = st.sidebar.columns([1, 1])
-    with col1:
-        if st.button("🔄 Uppdatera cache", use_container_width=True):
-            _bootstrap_state(force_reload=True)
-            st.success("Cache uppdaterad.")
-    with col2:
-        if st.button("🧹 Rensa (st.cache)", use_container_width=True):
-            try:
-                st.cache_data.clear()
-                st.success("Cache rensad.")
-            except Exception as e:
-                st.warning(f"Kunde inte rensa cache: {e}")
-
-    _sidebar_status()
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Basversion 2025-11-16 • Endast buggfixar – ingen strukturell ändring.")
-    return choice
-
-# -------------------------
-# Huvudfunktion
-# -------------------------
-def main():
-    # 1) Bootstrap
-    _bootstrap_state(force_reload=False)
-
-    # 2) Sidomeny
-    try:
-        choice = _sidebar_controls()
-    except Exception as e:
-        st.error(f"Sidomeny-fel: {e}")
-        choice = list(_PAGES.keys())[0]
-
-    # 3) Router + central felhantering
-    try:
-        page_fn = _PAGES.get(choice)
-        if not page_fn:
-            st.error("Okänd vy.")
-        else:
-            _call_page(page_fn)
-    except Exception as e:
-        st.error(f"💥 Fel i huvudloopen: {e}")
-
-    # 4) Liten sidfot
-    st.markdown("---")
-    st.caption("© Magnus – Aktieanalys & investeringsförslag • den här appen räknar allt i bolagets handelsvaluta och "
-               "skriver/läser Google Sheets enligt kolumnschemat i Del 1/6. Riktkurser beräknas i Del 3/6 & visas i Del 4/6.")
-
-# Kör direkt vid import (Streamlit-mönster)
-main()
+if __name__ == "__main__":
+    main()
