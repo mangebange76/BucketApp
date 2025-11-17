@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 1/6: Bas & infrastruktur
@@ -1222,9 +1223,9 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     bvps       = _pos(_nz(y_snap.get("bvps"), row.get("BVPS")))
 
     # Heuristik: klassificera
-    is_financial  = any(k in sektor for k in ("finans", "financial", "bank", "insurance", "försäkring"))
+    is_financial  = any(k in sektor for k in ("finans", "financial", "bank", "insurance", "forsakring", "försäkring"))
     is_reit       = any(k in sektor for k in ("reit", "fastighet", "real estate"))
-    is_utility    = any(k in sektor for k in ("utility", "verk", "kraft", "försörjn"))
+    is_utility    = any(k in sektor for k in ("utility", "verk", "kraft", "forsorjn", "försörjn"))
     is_energy     = any(k in sektor for k in ("energy", "olja", "gas", "oil", "gas"))
     is_industrial = any(k in sektor for k in ("industr", "capital goods", "machinery", "transport", "marine", "shipping"))
     is_tech       = any(k in sektor for k in ("tech", "software", "internet", "semiconductor", "it"))
@@ -1253,11 +1254,9 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         # behåll pb & ev_e enligt data
     elif is_utility or is_energy or is_industrial:
         # Tillgångstunga/cykliska → EV/EBITDA + PE; EV/S ok men inte primär
-        # behåll datadrivna allow, men kräver inte EV/S
         pass
     elif is_tech or is_health:
         # Tidigt skede/loss-making → EV/S prioriteras; PE om positiv EPS
-        # behåll allow enligt data; om EPS ≤ 0 → slå av PE
         if not (eps_ttm and eps_ttm > 0):
             allow["pe"] = False
         # EV/EBITDA kräver positiv EBITDA — redan hanterat via data
@@ -1278,7 +1277,12 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         prefer_order = ["pb","pe","ev_e","ev_s"]
     primary = next((fam for fam in prefer_order if allow.get(fam)), None)
 
-    why = f"auto_profile: sektor='{sektor or '—'}', ticker='{ticker}', allow={{{', '.join([f'{k}:{'✓' if v else '×'}' for k,v in allow.items()])}}}, primary='{primary or '—'}'"
+    # Bygg en ren ASCII-diagnostiksträng
+    allow_bits = ", ".join([f"{k}:{'yes' if v else 'no'}" for k, v in allow.items()])
+    sektor_label = (sektor or "-")
+    primary_label = (primary or "-")
+    why = f"auto_profile: sektor='{sektor_label}', ticker='{ticker}', allow={{" + allow_bits + f"}}, primary='{primary_label}'"
+
     return {"allow": allow, "primary": primary, "why": why}
 
 # -------------------------
@@ -1532,19 +1536,19 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     # Sätt ihop metodtabellen i tydlig ordning
     methods_df = pd.concat([pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df], ignore_index=True)
 
-    # --- Sanity-text ---
+    # --- Sanity-text (ASCII) ---
     sanity = (
-        f"price={'ok' if price else '—'}, "
-        f"eps_ttm={'ok' if (eps_ttm or eps_ttm==0) else '—'}, "
-        f"eps_1y={'ok' if eps_1y_est else '—'}, "
-        f"eps_2y={'ok' if eps_2y_est else '—'}, "
-        f"rev_ttm={'ok' if rev_ttm else '—'}, "
-        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '—'}(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
-        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '—'}(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
-        f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm==0) else '—'}, "
-        f"shares={'ok' if shares else '—'}, "
-        f"pe_anchor={round(pe_anchor,2) if pe_anchor else '—'}, decay={decay}, "
-        f"bucket='{bucket_label or '—'}' → MoS={int(mos*100)}%, "
+        f"price={'ok' if price else '-'}, "
+        f"eps_ttm={'ok' if (eps_ttm or eps_ttm==0) else '-'}, "
+        f"eps_1y={'ok' if eps_1y_est else '-'}, "
+        f"eps_2y={'ok' if eps_2y_est else '-'}, "
+        f"rev_ttm={'ok' if rev_ttm else '-'}, "
+        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '-'}(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
+        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
+        f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm==0) else '-'}, "
+        f"shares={'ok' if shares else '-'}, "
+        f"pe_anchor={round(pe_anchor,2) if pe_anchor else '-'}, decay={decay}, "
+        f"bucket='{bucket_label or '-'}' -> MoS={int(mos*100)}%, "
         f"{profile['why']}"
     )
 
@@ -1609,173 +1613,233 @@ def compute_fair_values_for_row(row: pd.Series, settings: Dict[str, str], fx_map
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
-# Del 4/6: UI — Analysvy & Ranking (Fair Value-kort)
+# Del 4/6: Analys- & Ranking-UI (byggstenar)
 #
-#  - view_analys(): välj bolag, räkna ut FV och visa metodtabell
-#  - view_ranking(): kompakt rankingtabell baserad på FV vs pris
-#  - Allt i aktiens handelsvaluta; ingen FX på EPS/riktkurser
-#  - Enkel tabell med hela databasen längst ner (ofiltrerad)
+#  - render_analysis_view(): enskild ticker → fair value + metodtabell
+#  - render_ranking_view(): lista/sortering på uppsida per vald horisont
+#  - Hjälpfunktioner för formattering & bulk-beräkning
+#
+# Not:
+#  • Alla priser/targets i aktiens handelsvaluta (ingen FX på EPS/targets).
+#  • compute_methods_for_row()/compute_fair_values_for_row() definieras i Del 3.
+#  • Datakällor (Sheets/Valuta/Settings) finns i Del 1–2; main() lägger ihop.
 # ============================================================
 
-# -----------------------------------
-# Små UI-hjälpare (format & metrik)
-# -----------------------------------
-def _fmt_num(x: Any, nd: int = 2) -> str:
+# -------------------------
+# Formatteringshjälp
+# -------------------------
+def _fmt2(x: Any) -> str:
     v = _f(x)
-    if v is None or not math.isfinite(v):
-        return "—"
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return ""
     try:
-        return f"{v:.{nd}f}"
+        return f"{float(v):.2f}"
     except Exception:
         return str(v)
 
-def _fmt_pct(x: Any, nd: int = 1) -> str:
-    v = _f(x)
-    if v is None or not math.isfinite(v):
-        return "—"
-    return f"{v*100:.{nd}f}%"
-
-def _upside_ratio(price: Optional[float], target: Optional[float]) -> Optional[float]:
-    p = _pos(price); t = _pos(target)
-    if p is None or t is None or p <= 0:
+def _pct_change(target: Optional[float], price: Optional[float]) -> Optional[float]:
+    t, p = _pos(target), _pos(price)
+    if t is None or p is None or p == 0:
         return None
-    return (t - p) / p
-
-# -----------------------------------
-# FV-kort (huvudpanel för ett bolag)
-# -----------------------------------
-def _render_fv_card(ticker: str, payload: Dict[str, Any]) -> None:
-    currency = (payload.get("currency") or "USD")
-    price    = _f(payload.get("price"))
-    t0 = _f(payload.get("target_today"))
-    t1 = _f(payload.get("target_1y"))
-    t2 = _f(payload.get("target_2y"))
-    t3 = _f(payload.get("target_3y"))
-
-    u0 = _upside_ratio(price, t0)
-    u1 = _upside_ratio(price, t1)
-    u2 = _upside_ratio(price, t2)
-    u3 = _upside_ratio(price, t3)
-
-    st.markdown(f"### {ticker} · {currency}")
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
-    with c1:
-        st.metric("Aktuell kurs", f"{_fmt_num(price)} {currency}")
-    with c2:
-        st.metric("Fair Value (idag)", f"{_fmt_num(t0)} {currency}", _fmt_pct(u0) if u0 is not None else None)
-    with c3:
-        st.metric("Riktkurs 1 år (MoS)", f"{_fmt_num(t1)} {currency}", _fmt_pct(u1) if u1 is not None else None)
-    with c4:
-        st.metric("Riktkurs 2 år (MoS)", f"{_fmt_num(t2)} {currency}", _fmt_pct(u2) if u2 is not None else None)
-    with c5:
-        st.metric("Riktkurs 3 år (MoS)", f"{_fmt_num(t3)} {currency}", _fmt_pct(u3) if u3 is not None else None)
-
-    # Diagnostikrad
-    sanity = str(payload.get("Input-sammanfattning") or "")
-    with st.expander("Diagnostik & indata", expanded=False):
-        st.write(sanity)
-
-    # Metodtabell (2 decimaler)
-    methods_df = payload.get("methods_df")
-    if methods_df is not None and not (hasattr(methods_df, "empty") and methods_df.empty):
-        df_show = methods_df.copy()
-        for col in ["Idag", "1 år", "2 år", "3 år"]:
-            if col in df_show.columns:
-                df_show[col] = df_show[col].map(lambda v: None if _f(v) is None else float(f"{_f(v):.2f}"))
-        st.markdown("#### Metoder (alla i aktiens valuta)")
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
-    else:
-        st.info("Inga metoder att visa för detta bolag (saknar nödvändig data).")
-
-# -----------------------------------
-# Analys-vy (per bolag)
-# -----------------------------------
-def view_analys(data_df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> None:
-    st.header("Analys")
-    if data_df is None or (hasattr(data_df, "empty") and data_df.empty):
-        st.info("Ingen data ännu. Lägg till bolag i vyn ”Lägg till / uppdatera”.")
-        return
-
-    # Val av bolag
-    tickers = sorted([str(t) for t in data_df["Ticker"].dropna().unique().tolist()])
-    if not tickers:
-        st.info("Hittade inga tickers i databasen.")
-        return
-
-    col_sel, col_btn = st.columns([3, 1])
-    with col_sel:
-        ticker = st.selectbox("Välj bolag", tickers, index=0)
-    with col_btn:
-        st.write("")  # spacing
-
-    # Hämta rad och beräkna
     try:
-        row = data_df.loc[data_df["Ticker"].astype(str) == str(ticker)].iloc[0]
+        return (t - p) / p * 100.0
     except Exception:
-        st.error("Kunde inte läsa vald rad från databasen.")
+        return None
+
+def _pick_target(payload: Dict[str, Any], horizon: str) -> Optional[float]:
+    h = str(horizon or "").lower()
+    if h in ("idag", "today", "0", "now"):
+        return _f(payload.get("target_today"))
+    if h in ("1y", "1 år", "1 ar", "1"):
+        return _f(payload.get("target_1y"))
+    if h in ("2y", "2 år", "2 ar", "2"):
+        return _f(payload.get("target_2y"))
+    if h in ("3y", "3 år", "3 ar", "3"):
+        return _f(payload.get("target_3y"))
+    return _f(payload.get("target_today"))
+
+# -------------------------
+# Kompakt summeringsrad (för tabell/CSV)
+# -------------------------
+def _build_summary_row(row: pd.Series, payload: Dict[str, Any]) -> Dict[str, Any]:
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H.%M.%S")
+    return {
+        "Timestamp": ts,
+        "Ticker": str(row.get("Ticker") or "").upper(),
+        "Valuta": (payload.get("currency") or "USD"),
+        "Aktuell kurs (0)": _f(payload.get("price")),
+        "Riktkurs idag": _f(payload.get("target_today")),
+        "Riktkurs 1 år": _f(payload.get("target_1y")),
+        "Riktkurs 2 år": _f(payload.get("target_2y")),
+        "Riktkurs 3 år": _f(payload.get("target_3y")),
+        "Bull 1 år": _f(payload.get("bull_1y")),
+        "Bear 1 år": _f(payload.get("bear_1y")),
+        "Metod": str(payload.get("method") or "fair_value_v3_auto"),
+        "Input-sammanfattning": str(payload.get("Input-sammanfattning") or ""),
+        "Kommentar": str(payload.get("note") or ""),
+    }
+
+# -------------------------
+# Render: metodtabell (expander)
+# -------------------------
+def _render_methods_table(payload: Dict[str, Any]) -> None:
+    dfm = payload.get("methods_df")
+    if dfm is None or (hasattr(dfm, "empty") and dfm.empty):
+        st.info("Inga metodvärden att visa.")
+        return
+    # Runda siffror snyggt
+    dfv = dfm.copy()
+    for c in ["Idag", "1 år", "2 år", "3 år"]:
+        if c in dfv.columns:
+            dfv[c] = dfv[c].map(lambda x: None if _f(x) is None else float(f"{float(x):.6f}"))
+    st.dataframe(dfv, use_container_width=True, hide_index=True)
+
+# -------------------------
+# Analys-vy (enskild ticker)
+# -------------------------
+def render_analysis_view(df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> None:
+    if df is None or df.empty or "Ticker" not in df.columns:
+        st.warning("Ingen data att analysera.")
         return
 
-    payload = compute_methods_for_row(row, settings, fx_map)
-    _render_fv_card(ticker, payload)
+    tickers = df["Ticker"].dropna().astype(str).unique().tolist()
+    tickers = [t for t in tickers if t.strip() != ""]
+    tickers.sort()
 
-    st.divider()
-    st.subheader("Hela databasen (enkel tabell)")
-    st.caption("Ofiltrerad översikt — alla kolumner. (Scrolla i sidled vid behov.)")
-    st.dataframe(data_df, use_container_width=True)
+    c1, c2 = st.columns([1, 2], gap="large")
+    with c1:
+        sel = st.selectbox("Välj ticker", tickers, index=0 if tickers else None)
+        row = df[df["Ticker"].astype(str).str.upper() == str(sel).upper()]
+        if row.empty:
+            st.error("Kunde inte hitta vald ticker i Data-bladet.")
+            return
+        row = row.iloc[0]
 
-# -----------------------------------
-# Ranking-vy (kompakt)
-# -----------------------------------
-def _build_ranking_table(data_df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> pd.DataFrame:
+        payload = compute_methods_for_row(row, settings, fx_map)
+
+        price   = _f(payload.get("price"))
+        fv_t0   = _f(payload.get("target_today"))
+        fv_1y   = _f(payload.get("target_1y"))
+        fv_2y   = _f(payload.get("target_2y"))
+        fv_3y   = _f(payload.get("target_3y"))
+        curr    = payload.get("currency") or "USD"
+
+        st.metric("Aktuell kurs", f"{_fmt2(price)} {curr}")
+        st.metric("Fair Value (idag)", f"{_fmt2(fv_t0)} {curr}", delta=None)
+        st.caption(payload.get("Input-sammanfattning") or "")
+
+        up0 = _pct_change(fv_t0, price)
+        up1 = _pct_change(fv_1y, price)
+        up2 = _pct_change(fv_2y, price)
+        up3 = _pct_change(fv_3y, price)
+
+        st.write("**Uppsida mot aktuell kurs**")
+        st.write(
+            f"Idag: {(_fmt2(up0) + ' %') if up0 is not None else '-'}  •  "
+            f"1 år: {(_fmt2(up1) + ' %') if up1 is not None else '-'}  •  "
+            f"2 år: {(_fmt2(up2) + ' %') if up2 is not None else '-'}  •  "
+            f"3 år: {(_fmt2(up3) + ' %') if up3 is not None else '-'}"
+        )
+
+    with c2:
+        with st.expander("Metoder & detaljer", expanded=True):
+            _render_methods_table(payload)
+            st.code(payload.get("Input-sammanfattning") or "", language="text")
+
+    # Summeringsrad (enligt användarens tabellstruktur)
+    summary = _build_summary_row(row, payload)
+    st.subheader("Sammanfattning (denna ticker)")
+    df_sum = pd.DataFrame([summary])
+    st.dataframe(df_sum, use_container_width=True, hide_index=True)
+
+    # Alltid visa hela databasen längst ner (enkel tabell, ofiltrerad)
+    st.markdown("---")
+    st.caption("Hela databasen (enkel tabell):")
+    st.dataframe(df, use_container_width=True)
+
+# -------------------------
+# Bulk: beräkna FV för flera rader (ranking)
+# -------------------------
+def _bulk_compute(df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> pd.DataFrame:
     rows = []
-    for _, r in data_df.iterrows():
+    tickers = df["Ticker"].dropna().astype(str).tolist() if "Ticker" in df.columns else []
+    tickers = [t for t in tickers if t.strip() != ""]
+    prog = st.progress(0.0, text="Beräknar fair value…")
+    n = len(tickers)
+    for i, t in enumerate(tickers, start=1):
         try:
-            fv = compute_fair_values_for_row(r, settings, fx_map)
-            price = _f(fv.get("price"))
-            fv0   = _f(fv.get("fv_today"))
-            fv1   = _f(fv.get("fv_1y"))
-            cur = {
-                "Ticker": fv.get("ticker"),
-                "Valuta": fv.get("currency"),
-                "Aktuell kurs": price,
-                "Fair Value (idag)": fv0,
-                "Riktkurs 1 år (MoS)": fv1,
-                "Uppsida % (FV idag)": _upside_ratio(price, fv0),
-                "Uppsida % (1 år)": _upside_ratio(price, fv1),
-            }
-            rows.append(cur)
-        except Exception:
-            # Fortsätt även om en rad fallerar
-            pass
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        # Sortera på störst uppsida mot FV idag
-        df = df.sort_values(by="Uppsida % (FV idag)", ascending=False, na_position="last").reset_index(drop=True)
-        # Formatera två decimaler (utom procentkolumner som vi visar som tal; UI kan visa procent via st.dataframe)
-        for c in ["Aktuell kurs", "Fair Value (idag)", "Riktkurs 1 år (MoS)"]:
-            if c in df.columns:
-                df[c] = df[c].map(lambda v: None if _f(v) is None else float(f"{_f(v):.2f}"))
-        # Procent som två decimaler för tydlighet (siffror, inte strängar)
-        for c in ["Uppsida % (FV idag)", "Uppsida % (1 år)"]:
-            if c in df.columns:
-                df[c] = df[c].map(lambda v: None if _f(v) is None else float(f"{_f(v)*100:.2f}"))
-    return df
+            row = df[df["Ticker"].astype(str).str.upper() == t.upper()].iloc[0]
+            payload = compute_methods_for_row(row, settings, fx_map)
+            rows.append((row, payload))
+        except Exception as e:
+            st.warning(f"{t}: beräkningsfel – {e}")
+        prog.progress(i / max(1, n), text=f"Beräknar fair value… ({i}/{n})")
+    prog.empty()
 
-def view_ranking(data_df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> None:
-    st.header("Ranking (Fair Value)")
-    if data_df is None or (hasattr(data_df, "empty") and data_df.empty):
-        st.info("Ingen data i databasen ännu.")
+    out = []
+    for row, payload in rows:
+        d = _build_summary_row(row, payload)
+        # Lägg uppsidor för snabb sortering i UI
+        price = _f(payload.get("price"))
+        d["Uppsida % (idag)"] = _pct_change(d["Riktkurs idag"], price)
+        d["Uppsida % (1 år)"] = _pct_change(d["Riktkurs 1 år"], price)
+        d["Uppsida % (2 år)"] = _pct_change(d["Riktkurs 2 år"], price)
+        d["Uppsida % (3 år)"] = _pct_change(d["Riktkurs 3 år"], price)
+        out.append(d)
+
+    cols = [
+        "Timestamp","Ticker","Valuta","Aktuell kurs (0)",
+        "Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år",
+        "Bull 1 år","Bear 1 år","Metod","Input-sammanfattning","Kommentar",
+        "Uppsida % (idag)","Uppsida % (1 år)","Uppsida % (2 år)","Uppsida % (3 år)"
+    ]
+    df_out = pd.DataFrame(out)
+    # Säkerställ kolumnordning där det går
+    ordered = [c for c in cols if c in df_out.columns] + [c for c in df_out.columns if c not in cols]
+    df_out = df_out.reindex(columns=ordered)
+    return df_out
+
+# -------------------------
+# Ranking-vy
+# -------------------------
+def render_ranking_view(df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict[str, float]) -> None:
+    if df is None or df.empty or "Ticker" not in df.columns:
+        st.warning("Ingen data att ranka.")
         return
 
-    with st.spinner("Beräknar ranking…"):
-        rank_df = _build_ranking_table(data_df, settings, fx_map)
+    st.subheader("Ranking – uppsida mot aktuell kurs")
+    colA, colB = st.columns([1, 2], gap="medium")
+    with colA:
+        horizon = st.selectbox("Horisont", ["Idag", "1 år", "2 år", "3 år"], index=1)
+        show_n = st.slider("Visa topp N", min_value=5, max_value=200, value=50, step=5)
+    with colB:
+        st.caption("Värden i aktiens valuta. Framtida riktkurser använder Bucket-MoS enligt Del 3.")
 
-    if rank_df is None or (hasattr(rank_df, "empty") and rank_df.empty):
-        st.info("Kunde inte beräkna ranking (saknar nödvändig data).")
+    df_rank = _bulk_compute(df, settings, fx_map)
+    # Välj uppsida-kolumn
+    hmap = {"Idag":"Uppsida % (idag)", "1 år":"Uppsida % (1 år)", "2 år":"Uppsida % (2 år)", "3 år":"Uppsida % (3 år)"}
+    up_col = hmap.get(horizon, "Uppsida % (1 år)")
+    if up_col not in df_rank.columns:
+        st.error("Kunde inte beräkna uppsida.")
         return
 
-    st.dataframe(rank_df, use_container_width=True, hide_index=True)
-    st.caption("Uppsida visas i procent. Alla belopp i respektive akties handelsvaluta.")
+    df_show = df_rank.sort_values(by=up_col, ascending=False).head(show_n).copy()
+
+    # Visa kärnkolumner först
+    show_cols = [
+        "Ticker","Valuta","Aktuell kurs (0)","Riktkurs idag","Riktkurs 1 år","Riktkurs 2 år","Riktkurs 3 år", up_col
+    ]
+    show_cols = [c for c in show_cols if c in df_show.columns]
+    st.dataframe(df_show[show_cols], use_container_width=True, hide_index=True)
+
+    with st.expander("Visa alla kolumner (rankingresultat)", expanded=False):
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    # Alltid visa hela databasen längst ner
+    st.markdown("---")
+    st.caption("Hela databasen (enkel tabell):")
+    st.dataframe(df, use_container_width=True)
+
 # (Slut Del 4/6)
 
 # ============================================================
@@ -2594,315 +2658,139 @@ def page_buy_suggestions():
 
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
-# Del 6/6: 🏆 Ranking (riktkurser) + Main()
+# Del 6/6: Navigation & main()
 #
-#  - Beräknar fair value Idag/1/2/3 år samt Bull/Bear 1 år
-#  - Skriver riktkurserna till Data-bladet
-#  - Huvudnavigering för alla vyer
+#  - Laddar DATA/FX/Settings till session
+#  - Sidopanel med vyval
+#  - Säker felhantering runt huvudloopen
+#  - (Valfritt) enkel “Visa hela databasen”-footer
 # ============================================================
 
-# --------------------------------------------
-# Skydd: om compute_methods_for_row saknas (Del 3)
-# --------------------------------------------
-if "compute_methods_for_row" not in globals():
-    def compute_methods_for_row(*args, **kwargs):
-        raise RuntimeError(
-            "compute_methods_for_row saknas. Säkerställ att Del 3/6 är korrekt inladdad."
-        )
-
-# --------------------------------------------
-# Hjälpare för ranking
-# --------------------------------------------
-def _try_compute_methods(row: pd.Series) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
-    """
-    Anropar compute_methods_for_row robust, oavsett signatur (Series eller dict, med/utan settings).
-    Returnerar (methods_df, meta). Vid fel: (None, {"error": str}).
-    """
-    try:
-        # Vanligast: rad som Series
+def _ensure_session_bootstrap() -> None:
+    """Läs in DATA/FX/Settings till session_state om saknas."""
+    if "SETTINGS_MAP" not in st.session_state or not st.session_state.get("SETTINGS_MAP"):
         try:
-            return compute_methods_for_row(row)  # type: ignore
-        except TypeError:
-            pass
-        # Alternativ 1: Series + settings
-        try:
-            return compute_methods_for_row(row, settings=get_settings_map())  # type: ignore
-        except TypeError:
-            pass
-        # Alternativ 2: dict
-        rdict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
-        try:
-            return compute_methods_for_row(rdict)  # type: ignore
-        except TypeError:
-            # Alternativ 3: dict + settings
-            return compute_methods_for_row(rdict, settings=get_settings_map())  # type: ignore
-    except Exception as e:
-        return None, {"error": str(e)}
-
-def _extract_fair_values(methods_df: Optional[pd.DataFrame], meta: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Försöker plocka ut fair value (idag/1y/2y/3y + bull/bear 1y) från meta i första hand.
-    Om saknas, gör ett försök via methods_df (t.ex. rad 'fair_value' eller kolumner 'target_*').
-    """
-    out = {"today": None, "1y": None, "2y": None, "3y": None, "bull_1y": None, "bear_1y": None}
-
-    fv = (meta or {}).get("fair_value", {})
-    if isinstance(fv, Mapping):
-        out["today"]   = _f(fv.get("today"))
-        out["1y"]      = _f(fv.get("1y"))
-        out["2y"]      = _f(fv.get("2y"))
-        out["3y"]      = _f(fv.get("3y"))
-        out["bull_1y"] = _f(fv.get("bull_1y"))
-        out["bear_1y"] = _f(fv.get("bear_1y"))
-
-    # Om något saknas, försök hämta från methods_df
-    def _try_df(colnames: List[str]) -> Optional[float]:
-        if methods_df is None or methods_df is np.nan:
-            return None
-        try:
-            df = methods_df.copy()
-            # Leta på en ev. 'fair_value'-rad
-            method_col = None
-            for cand in ("method", "Method", "modell", "Modell", "name", "Name"):
-                if cand in df.columns:
-                    method_col = cand
-                    break
-            if method_col:
-                mask = df[method_col].astype(str).str.contains("fair", case=False, na=False)
-                if mask.any():
-                    r = df[mask].iloc[0]
-                    for c in colnames:
-                        if c in df.columns and _f(r.get(c)) is not None:
-                            return _f(r.get(c))
-            # Annars, ta median över metodkolumner om de finns
-            for c in colnames:
-                if c in df.columns:
-                    vals = pd.to_numeric(df[c], errors="coerce").dropna()
-                    if not vals.empty:
-                        return float(vals.median())
+            st.session_state["SETTINGS_MAP"] = get_settings_map()
         except Exception:
-            return None
-        return None
-
-    # Fallbacks om saknas
-    if out["today"]   is None: out["today"]   = _try_df(["target_today", "FV_today", "Fair Today"])
-    if out["1y"]      is None: out["1y"]      = _try_df(["target_1y", "FV_1y", "Fair 1Y"])
-    if out["2y"]      is None: out["2y"]      = _try_df(["target_2y", "FV_2y", "Fair 2Y"])
-    if out["3y"]      is None: out["3y"]      = _try_df(["target_3y", "FV_3y", "Fair 3Y"])
-    if out["bull_1y"] is None: out["bull_1y"] = _try_df(["bull_1y", "Bull 1Y"])
-    if out["bear_1y"] is None: out["bear_1y"] = _try_df(["bear_1y", "Bear 1Y"])
-
-    return out
-
-def _r2(x: Optional[float]) -> Optional[float]:
-    v = _f(x)
-    if v is None: 
-        return None
-    try:
-        return float(f"{float(v):.2f}")
-    except Exception:
-        return None
-
-def _update_row_with_fair_values(df: pd.DataFrame, idx, fv: Dict[str, Optional[float]]) -> None:
-    """
-    Sätter riktkurskolumner i df på index idx om värden finns.
-    Två decimaler, inget annat.
-    """
-    mapping = [
-        ("Riktkurs idag", fv.get("today")),
-        ("Riktkurs 1 år", fv.get("1y")),
-        ("Riktkurs 2 år", fv.get("2y")),
-        ("Riktkurs 3 år", fv.get("3y")),
-        ("Bull 1 år",    fv.get("bull_1y")),
-        ("Bear 1 år",    fv.get("bear_1y")),
-    ]
-    for col, val in mapping:
-        if col not in df.columns:
-            df[col] = np.nan
-        v2 = _r2(val)
-        if v2 is not None:
-            df.at[idx, col] = v2
-
-    # Stämpel
-    col_stamp = "Senast rankad"
-    if col_stamp not in df.columns:
-        df[col_stamp] = np.nan
-    df.at[idx, col_stamp] = now_stamp()
-
-def _rank_one(row: pd.Series) -> Dict[str, Any]:
-    """
-    Rankar en rad → returnerar sammanfattning (för visning i tabellen).
-    """
-    tkr = str(row.get("Ticker") or "").upper().strip()
-    ccy = str(_nz(row.get("Valuta"), "SEK")).upper()
-    price = _f(row.get("Aktuell kurs"))
-
-    methods_df, meta = _try_compute_methods(row)
-    if isinstance(meta, dict) and meta.get("error"):
-        return {"Ticker": tkr, "Valuta": ccy, "Kurs": price, "FV idag": None, "FV 1 år": None, "FV 2 år": None, "FV 3 år": None,
-                "Bull 1 år": None, "Bear 1 år": None, "Uppsida (%)": None, "Status": f"Fel: {meta.get('error')}"}
-
-    fv = _extract_fair_values(methods_df, meta)
-    # Uppsida vs idag
-    upct = None
-    if _pos(price) and _pos(fv.get("today")):
-        upct = (float(fv["today"]) - float(price)) / float(price) * 100.0
-
-    return {
-        "Ticker": tkr,
-        "Valuta": ccy,
-        "Kurs": _r2(price),
-        "FV idag": _r2(fv.get("today")),
-        "FV 1 år": _r2(fv.get("1y")),
-        "FV 2 år": _r2(fv.get("2y")),
-        "FV 3 år": _r2(fv.get("3y")),
-        "Bull 1 år": _r2(fv.get("bull_1y")),
-        "Bear 1 år": _r2(fv.get("bear_1y")),
-        "Uppsida (%)": None if upct is None else float(f"{upct:.1f}"),
-        "Status": "OK",
-        "_fv_raw": fv
-    }
-
-# --------------------------------------------
-# 🏆 Ranking-sida
-# --------------------------------------------
-def page_ranking():
-    st.header("🏆 Ranking (Riktkurser)")
-
-    df = st.session_state.get("DATA")
-    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-        df = read_data_df()
-        st.session_state["DATA"] = df
-
-    if df is None or df.empty:
-        st.info("Inga rader i Data-bladet.")
-        return
-
-    tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
-    defaults = []  # tom = alla
-    sel = st.multiselect("Välj tickers (tom = alla)", options=tickers, default=defaults)
-    target = tickers if len(sel) == 0 else sel
-
-    c1, c2, c3 = st.columns([1,1,2])
-    with c1:
-        do_save = st.checkbox("Spara till Data", value=True)
-    with c2:
-        show_only_errors = st.checkbox("Visa endast fel", value=False)
-    with c3:
-        st.caption("Beräkning enligt appens beräkningsmotor (Del 3) och FV-logik från basversionen.")
-
-    if not st.button("🚀 Kör ranking"):
-        return
-
-    work = df.copy()
-    rows_out = []
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    for i, t in enumerate(target, start=1):
-        status.write(f"Beräknar {i}/{len(target)} – {t}")
-        try:
-            mask = work["Ticker"].astype(str).str.upper() == str(t).upper()
-            if not mask.any():
-                rows_out.append({"Ticker": t, "Status": "Saknas i Data"})
-                progress.progress(i/len(target))
-                continue
-
-            idx = work.index[mask][0]
-            row = work.loc[idx]
-
-            res = _rank_one(row)
-            rows_out.append(res)
-
-            if res.get("Status") == "OK" and do_save:
-                _update_row_with_fair_values(work, idx, res.get("_fv_raw", {}))
-        except Exception as e:
-            rows_out.append({"Ticker": t, "Status": f"Fel: {e}"})
-        progress.progress(i/len(target))
-
-    progress.empty()
-    status.empty()
-
-    # Spara till Sheets om valt
-    if do_save:
-        try:
-            write_data_df(work)
-            st.session_state["DATA"] = work
-            st.success("Riktkurser uppdaterade i Data-bladet.")
-        except Exception as e:
-            st.error(f"Kunde inte spara till Data: {e}")
-
-    # Visa resultat-tabell
-    out = pd.DataFrame(rows_out)
-    if not out.empty:
-        if show_only_errors:
-            mask_err = out["Status"].astype(str).str.startswith("Fel")
-            out = out[mask_err | (out["Status"].astype(str) == "Saknas i Data")]
-        # Städa visningskolumner
-        show_cols = ["Ticker","Valuta","Kurs","FV idag","FV 1 år","FV 2 år","FV 3 år","Bull 1 år","Bear 1 år","Uppsida (%)","Status"]
-        for c in show_cols:
-            if c not in out.columns:
-                out[c] = np.nan
-        _show_df(out[show_cols].reset_index(drop=True), height=420, use_container_width=True)
-
-# --------------------------------------------
-# Main: navigering mellan alla sidor
-# --------------------------------------------
-def _ensure_session_boot():
-    # Ladda in grunddata till session vid behov
-    if "DATA" not in st.session_state:
-        try:
-            st.session_state["DATA"] = read_data_df()
-        except Exception:
-            st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
-    if "FX" not in st.session_state:
+            st.session_state["SETTINGS_MAP"] = {}
+    if "FX" not in st.session_state or not st.session_state.get("FX"):
         try:
             st.session_state["FX"] = get_fx_map()
         except Exception:
             st.session_state["FX"] = {}
+    if "DATA" not in st.session_state or not isinstance(st.session_state.get("DATA"), pd.DataFrame):
+        try:
+            st.session_state["DATA"] = read_data_df()
+        except Exception:
+            st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
+
+def _quick_stats_block() -> None:
+    df = st.session_state.get("DATA")
+    fx = st.session_state.get("FX", {}) or {}
+    try:
+        pos = _position_value_tables(df, fx)
+        tot = float(pos["Värde (SEK)"].sum()) if not pos.empty else 0.0
+        uniq = len(df["Ticker"].dropna().unique()) if isinstance(df, pd.DataFrame) and not df.empty else 0
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("Portföljvärde (SEK)", f"{tot:,.0f}".replace(",", " "))
+        with c2: st.metric("Antal rader", f"{len(df) if isinstance(df, pd.DataFrame) else 0}")
+        with c3: st.metric("Unika tickers", str(uniq))
+    except Exception:
+        pass
+
+def _render_footer_show_all_data() -> None:
+    """Valfri footer för snabb överblick över hela databasen."""
+    df = st.session_state.get("DATA")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    st.markdown("---")
+    st.subheader("📄 Hela databasen (read-only)")
+    try:
+        _show_df(df, height=360, use_container_width=True)
+    except Exception:
+        st.table(df.head(200))
+
+def _page_exists(fn_name: str) -> bool:
+    fn = globals().get(fn_name)
+    return callable(fn)
 
 def main():
-    _ensure_session_boot()
-
-    st.sidebar.title("📈 Aktieanalys & investeringsförslag")
-    menu = st.sidebar.radio(
-        "Meny",
-        [
-            "🏆 Ranking",
-            "📦 Portfölj",
-            "🛒 Köpförslag",
-            "✏️ Editor",
-            "➕ Lägg till",
-            "🧩 Massuppdatering",
-            "🕒 Snapshot",
-            "⚙️ Settings",
-        ],
-        index=0
-    )
-
     try:
-        if menu == "🏆 Ranking":
-            page_ranking()
-        elif menu == "📦 Portfölj":
-            page_portfolio()
-        elif menu == "🛒 Köpförslag":
-            page_buy_suggestions()
-        elif menu == "✏️ Editor":
-            page_editor()
-        elif menu == "➕ Lägg till":
-            page_add_ticker()
-        elif menu == "🧩 Massuppdatering":
-            page_batch()
-        elif menu == "🕒 Snapshot":
-            page_snapshot()
-        elif menu == "⚙️ Settings":
-            page_settings()
+        _ensure_session_bootstrap()
+
+        # -------------------
+        # Sidopanel / Navigering
+        # -------------------
+        st.sidebar.header("Navigering")
+        # Föreslagen ordning; lägg bara till de som existerar
+        pages: list[tuple[str, str]] = []
+        if _page_exists("page_analysis"):      pages.append(("📊 Analys", "page_analysis"))
+        if _page_exists("page_ranking"):       pages.append(("🏆 Ranking", "page_ranking"))
+        if _page_exists("page_portfolio"):     pages.append(("📦 Portfölj", "page_portfolio"))
+        if _page_exists("page_buy_suggestions"): pages.append(("🛒 Köpförslag", "page_buy_suggestions"))
+        if _page_exists("page_editor"):        pages.append(("✏️ Editor", "page_editor"))
+        if _page_exists("page_add_ticker"):    pages.append(("➕ Lägg till", "page_add_ticker"))
+        if _page_exists("page_batch"):         pages.append(("🧩 Massuppdatering", "page_batch"))
+        if _page_exists("page_snapshot"):      pages.append(("🕒 Snapshot", "page_snapshot"))
+        if _page_exists("page_settings"):      pages.append(("⚙️ Settings", "page_settings"))
+
+        # Om inga kända sidor hittas – visa minst Portfölj/Settings om de finns
+        if not pages:
+            if _page_exists("page_portfolio"): pages.append(("📦 Portfölj", "page_portfolio"))
+            if _page_exists("page_settings"):  pages.append(("⚙️ Settings", "page_settings"))
+
+        # Läs om-knappar
+        if st.sidebar.button("↻ Läs om DATA"):
+            try:
+                st.session_state["DATA"] = read_data_df()
+                st.success("DATA omläst.")
+            except Exception as e:
+                st.error(f"Kunde inte läsa DATA: {e}")
+
+        if st.sidebar.button("↻ Läs om FX/Settings"):
+            try:
+                st.session_state["FX"] = get_fx_map()
+                st.session_state["SETTINGS_MAP"] = get_settings_map()
+                st.success("FX & Settings omlästa.")
+            except Exception as e:
+                st.error(f"Kunde inte läsa FX/Settings: {e}")
+
+        # Välj sida
+        page_names = [p[0] for p in pages]
+        default_idx = 0
+        # Försök defaulta till Analys eller Portfölj
+        for want in ("📊 Analys", "📦 Portfölj"):
+            if want in page_names:
+                default_idx = page_names.index(want)
+                break
+        chosen = st.sidebar.radio("Välj vy", options=page_names, index=default_idx)
+
+        # Snabbstatus
+        with st.sidebar.expander("Snabbstatus"):
+            _quick_stats_block()
+
+        st.sidebar.caption("Basversion: 2025-11-16")
+
+        # -------------------
+        # Kör vald sida
+        # -------------------
+        fn_name = dict(pages)[chosen]
+        fn = globals().get(fn_name)
+        if callable(fn):
+            fn()
         else:
-            page_ranking()
+            st.error("Den valda sidan saknas i denna build.")
+
+        # (Valfritt) Visa hela databasen längst ner — användbart i felsökning/översikt
+        # Vill du alltid visa i Analys-vyn kan du sätta detta villkor:
+        # if chosen == "📊 Analys": _render_footer_show_all_data()
+        if st.sidebar.checkbox("Visa 'Hela databasen' längst ner", value=False):
+            _render_footer_show_all_data()
+
     except Exception as e:
         st.error(f"💥 Fel i huvudloopen: {e}")
 
-# Streamlit entry
+# Streamlit kör modul-koden direkt; main() gör strukturen tydlig.
 if __name__ == "__main__":
     main()
 # (Slut Del 6/6)
