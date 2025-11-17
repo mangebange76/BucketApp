@@ -2659,10 +2659,6 @@ def page_buy_suggestions():
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 6/6: 🏆 Ranking (riktkurser) + Main()
-#
-#  - Beräknar fair value Idag/1/2/3 år samt Bull/Bear 1 år
-#  - Skriver riktkurserna till Data-bladet
-#  - Huvudnavigering för alla vyer
 # ============================================================
 
 # --------------------------------------------
@@ -2677,36 +2673,89 @@ if "compute_methods_for_row" not in globals():
 # --------------------------------------------
 # Hjälpare för ranking
 # --------------------------------------------
+
+# CHANGED: robust normalisering av returvärde (hanterar 2- eller 3-tuple)
+def _normalize_cmr_result(res) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+    """
+    Normalisera retur från compute_methods_for_row till (methods_df, meta).
+    Stöd: 
+      • (df, meta)
+      • (df, sanity_text, meta)  – vanlig i basversionen
+      • (df,)                    – meta tom
+      • dict med 'methods_df'    – meta = resten
+    """
+    methods_df: Optional[pd.DataFrame] = None
+    meta: Dict[str, Any] = {}
+
+    # tuple/list-varianter
+    if isinstance(res, (tuple, list)):
+        if len(res) == 2:
+            a, b = res
+            methods_df = a
+            meta = b if isinstance(b, Mapping) else {"info": b}
+        elif len(res) == 3:
+            a, b, c = res
+            methods_df = a
+            # meta är den som är dict av b/c
+            if isinstance(c, Mapping):
+                meta = c
+            elif isinstance(b, Mapping):
+                meta = b
+            else:
+                meta = {"info_b": b, "info_c": c}
+        elif len(res) == 1:
+            methods_df = res[0]
+        else:
+            methods_df = res[0]
+            meta = {"extra": list(res[1:])}
+        return methods_df, meta
+
+    # dict-variant
+    if isinstance(res, Mapping):
+        if "methods_df" in res:
+            methods_df = res.get("methods_df")
+            meta = {k: v for k, v in res.items() if k != "methods_df"}
+        else:
+            meta = dict(res)
+        return methods_df, meta
+
+    # allt annat -> anta att det är df
+    return res, {}
+
 def _try_compute_methods(row: pd.Series) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
     """
     Anropar compute_methods_for_row robust, oavsett signatur (Series eller dict, med/utan settings).
     Returnerar (methods_df, meta). Vid fel: (None, {"error": str}).
     """
     try:
-        # Vanligast: rad som Series
-        try:
-            return compute_methods_for_row(row)  # type: ignore
-        except TypeError:
-            pass
-        # Alternativ 1: Series + settings
-        try:
-            return compute_methods_for_row(row, settings=get_settings_map())  # type: ignore
-        except TypeError:
-            pass
-        # Alternativ 2: dict
+        variants = []
         rdict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        # Prova i denna ordning (vanligast först)
+        variants.append(( (row,), {} ))
+        variants.append(( (row,), {"settings": get_settings_map()} ))
+        variants.append(( (rdict,), {} ))
+        variants.append(( (rdict,), {"settings": get_settings_map()} ))
+
+        for args, kwargs in variants:
+            try:
+                res = compute_methods_for_row(*args, **kwargs)  # type: ignore
+                return _normalize_cmr_result(res)
+            except TypeError:
+                # prova nästa signatur
+                continue
+        # Sista försök: utan argument (om någon legacy-signatur finns)
         try:
-            return compute_methods_for_row(rdict)  # type: ignore
-        except TypeError:
-            # Alternativ 3: dict + settings
-            return compute_methods_for_row(rdict, settings=get_settings_map())  # type: ignore
+            res = compute_methods_for_row()  # type: ignore
+            return _normalize_cmr_result(res)
+        except Exception as e:
+            return None, {"error": str(e)}
     except Exception as e:
         return None, {"error": str(e)}
 
 def _extract_fair_values(methods_df: Optional[pd.DataFrame], meta: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """
     Försöker plocka ut fair value (idag/1y/2y/3y + bull/bear 1y) från meta i första hand.
-    Om saknas, gör ett försök via methods_df (t.ex. rad 'fair_value' eller kolumner 'target_*').
+    Om saknas, försök via methods_df.
     """
     out = {"today": None, "1y": None, "2y": None, "3y": None, "bull_1y": None, "bear_1y": None}
 
@@ -2738,7 +2787,7 @@ def _extract_fair_values(methods_df: Optional[pd.DataFrame], meta: Dict[str, Any
                     for c in colnames:
                         if c in df.columns and _f(r.get(c)) is not None:
                             return _f(r.get(c))
-            # Annars, ta median över metodkolumner om de finns
+            # Annars, ta median över kolumn om den finns
             for c in colnames:
                 if c in df.columns:
                     vals = pd.to_numeric(df[c], errors="coerce").dropna()
@@ -2748,14 +2797,12 @@ def _extract_fair_values(methods_df: Optional[pd.DataFrame], meta: Dict[str, Any
             return None
         return None
 
-    # Fallbacks om saknas
-    if out["today"]   is None: out["today"]   = _try_df(["target_today", "FV_today", "Fair Today", "Idag"])
-    if out["1y"]      is None: out["1y"]      = _try_df(["target_1y", "FV_1y", "Fair 1Y", "1 år"])
-    if out["2y"]      is None: out["2y"]      = _try_df(["target_2y", "FV_2y", "Fair 2Y", "2 år"])
-    if out["3y"]      is None: out["3y"]      = _try_df(["target_3y", "FV_3y", "Fair 3Y", "3 år"])
-    if out["bull_1y"] is None: out["bull_1y"] = _try_df(["bull_1y", "Bull 1Y"])
-    if out["bear_1y"] is None: out["bear_1y"] = _try_df(["bear_1y", "Bear 1Y"])
-
+    if out["today"]   is None: out["today"]   = _try_df(["target_today","FV_today","Fair Today","Idag"])
+    if out["1y"]      is None: out["1y"]      = _try_df(["target_1y","FV_1y","Fair 1Y","1 år"])
+    if out["2y"]      is None: out["2y"]      = _try_df(["target_2y","FV_2y","Fair 2Y","2 år"])
+    if out["3y"]      is None: out["3y"]      = _try_df(["target_3y","FV_3y","Fair 3Y","3 år"])
+    if out["bull_1y"] is None: out["bull_1y"] = _try_df(["bull_1y","Bull 1Y"])
+    if out["bear_1y"] is None: out["bear_1y"] = _try_df(["bear_1y","Bear 1Y"])
     return out
 
 def _r2(x: Optional[float]) -> Optional[float]:
@@ -2768,10 +2815,6 @@ def _r2(x: Optional[float]) -> Optional[float]:
         return None
 
 def _update_row_with_fair_values(df: pd.DataFrame, idx, fv: Dict[str, Optional[float]]) -> None:
-    """
-    Sätter riktkurskolumner i df på index idx om värden finns.
-    Två decimaler, inget annat.
-    """
     mapping = [
         ("Riktkurs idag", fv.get("today")),
         ("Riktkurs 1 år", fv.get("1y")),
@@ -2787,16 +2830,12 @@ def _update_row_with_fair_values(df: pd.DataFrame, idx, fv: Dict[str, Optional[f
         if v2 is not None:
             df.at[idx, col] = v2
 
-    # Stämpel
     col_stamp = "Senast rankad"
     if col_stamp not in df.columns:
         df[col_stamp] = np.nan
     df.at[idx, col_stamp] = now_stamp()
 
 def _rank_one(row: pd.Series) -> Dict[str, Any]:
-    """
-    Rankar en rad → returnerar sammanfattning (för visning i tabellen).
-    """
     tkr = str(row.get("Ticker") or "").upper().strip()
     ccy = str(_nz(row.get("Valuta"), "SEK")).upper()
     price = _f(row.get("Aktuell kurs"))
@@ -2807,7 +2846,6 @@ def _rank_one(row: pd.Series) -> Dict[str, Any]:
                 "Bull 1 år": None, "Bear 1 år": None, "Uppsida (%)": None, "Status": f"Fel: {meta.get('error')}"}
 
     fv = _extract_fair_values(methods_df, meta)
-    # Uppsida vs idag
     upct = None
     if _pos(price) and _pos(fv.get("today")):
         upct = (float(fv["today"]) - float(price)) / float(price) * 100.0
@@ -2843,7 +2881,7 @@ def page_ranking():
         return
 
     tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
-    defaults = []  # tom = alla
+    defaults = []
     sel = st.multiselect("Välj tickers (tom = alla)", options=tickers, default=defaults)
     target = tickers if len(sel) == 0 else sel
 
@@ -2887,7 +2925,6 @@ def page_ranking():
     progress.empty()
     status.empty()
 
-    # Spara till Sheets om valt
     if do_save:
         try:
             write_data_df(work)
@@ -2896,13 +2933,11 @@ def page_ranking():
         except Exception as e:
             st.error(f"Kunde inte spara till Data: {e}")
 
-    # Visa resultat-tabell
     out = pd.DataFrame(rows_out)
     if not out.empty:
         if show_only_errors:
             mask_err = out["Status"].astype(str).str.startswith("Fel")
             out = out[mask_err | (out["Status"].astype(str) == "Saknas i Data")]
-        # Städa visningskolumner
         show_cols = ["Ticker","Valuta","Kurs","FV idag","FV 1 år","FV 2 år","FV 3 år","Bull 1 år","Bear 1 år","Uppsida (%)","Status"]
         for c in show_cols:
             if c not in out.columns:
@@ -2913,7 +2948,6 @@ def page_ranking():
 # Main: navigering mellan alla sidor
 # --------------------------------------------
 def _ensure_session_boot():
-    # Ladda in grunddata till session vid behov
     if "DATA" not in st.session_state:
         try:
             st.session_state["DATA"] = read_data_df()
@@ -2966,7 +3000,6 @@ def main():
     except Exception as e:
         st.error(f"💥 Fel i huvudloopen: {e}")
 
-# Streamlit entry
 if __name__ == "__main__":
     main()
 # (Slut Del 6/6)
