@@ -1,4 +1,3 @@
-
 ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 1/6: Bas & infrastruktur
@@ -508,7 +507,9 @@ def _load_data_into_session() -> None:
             st.error(f"Kunde inte ladda Data-bladet: {e}")
             st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
 
-# (Slut Del 1/6) ============================================================
+# (Slut Del 1/6)
+
+# ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 2/6: Datainhämtning (Yahoo) & uppdateringshjälpare
 #
