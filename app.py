@@ -1,4 +1,5 @@
-# ============================================================
+
+============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 1/6: Bas & infrastruktur
 #
@@ -161,6 +162,7 @@ def _pos(x: Any) -> Optional[float]:
 # =============================
 # Google auth & Spreadsheet
 # =============================
+
 def _normalize_private_key(creds: Dict[str, Any]) -> Dict[str, Any]:
     """
     Hanterar privata nycklar där radbrytningar är ersatta med '\\n' i secrets.
@@ -169,6 +171,68 @@ def _normalize_private_key(creds: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(pk, str) and "\\n" in pk:
         creds["private_key"] = pk.replace("\\n", "\n")
     return creds
+
+def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Letar efter en nyckel i både os.environ och st.secrets, med flera alias.
+
+    Exempel:
+      - "SHEET_URL" → letar även efter GOOGLE_SHEET_URL, spreadsheet_url osv.
+      - "SHEET_ID"  → letar även efter GOOGLE_SHEET_ID, SPREADSHEET_ID osv.
+    """
+    key_upper = key.upper()
+
+    # Grundkandidater
+    candidates = {key, key.upper(), key.lower()}
+
+    # Alias för URL
+    if key_upper in {"SHEET_URL", "GOOGLE_SHEET_URL"}:
+        candidates.update(
+            {
+                "SHEET_URL",
+                "sheet_url",
+                "GOOGLE_SHEET_URL",
+                "google_sheet_url",
+                "SPREADSHEET_URL",
+                "spreadsheet_url",
+            }
+        )
+
+    # Alias för ID
+    if key_upper in {"SHEET_ID", "GOOGLE_SHEET_ID", "SPREADSHEET_ID"}:
+        candidates.update(
+            {
+                "SHEET_ID",
+                "sheet_id",
+                "GOOGLE_SHEET_ID",
+                "google_sheet_id",
+                "SPREADSHEET_ID",
+                "spreadsheet_id",
+            }
+        )
+
+    # Sök i miljövariabler först
+    for name in candidates:
+        val = os.environ.get(name)
+        if val:
+            return str(val)
+
+    # Sedan i Streamlit secrets (om det finns)
+    try:
+        secrets_obj = getattr(st, "secrets", None)
+    except Exception:
+        secrets_obj = None
+
+    if secrets_obj is not None:
+        for name in candidates:
+            try:
+                val = secrets_obj.get(name)
+            except Exception:
+                val = None
+            if val:
+                return str(val)
+
+    return default
 
 @st.cache_resource(show_spinner=False)
 def _get_gspread_client() -> gspread.Client:
@@ -202,14 +266,29 @@ def _get_gspread_client() -> gspread.Client:
 
 @st.cache_resource(show_spinner=False)
 def _open_spreadsheet() -> Spreadsheet:
-    sheet_id = st.secrets.get("GOOGLE_SHEET_ID", "").strip()
-    if not sheet_id:
-        raise RuntimeError("Saknar GOOGLE_SHEET_ID i Streamlit secrets.")
+    """
+    Öppnar kalkylarket med stöd för flera olika nycklar:
+      - SHEET_URL / GOOGLE_SHEET_URL / spreadsheet_url
+      - SHEET_ID  / GOOGLE_SHEET_ID  / SPREADSHEET_ID
+    Funkar därmed med samma secrets som din basversion.
+    """
+    # Först försök med URL
+    sheet_url = _env_or_secret("SHEET_URL")
+    # Sedan ID som fallback
+    sheet_id = _env_or_secret("SHEET_ID")
+
     client = _get_gspread_client()
-    try:
+
+    if sheet_url and str(sheet_url).strip():
+        return client.open_by_url(sheet_url)
+
+    if sheet_id and str(sheet_id).strip():
         return client.open_by_key(sheet_id)
-    except Exception as e:
-        raise RuntimeError(f"Kunde inte öppna Google Sheet med id '{sheet_id}': {e}") from e
+
+    raise RuntimeError(
+        "Ange SHEET_URL eller SHEET_ID (eller GOOGLE_SHEET_URL / GOOGLE_SHEET_ID) "
+        "i Streamlit secrets eller som miljövariabler."
+    )
 
 def _open_worksheet(title: str) -> Worksheet:
     """
@@ -429,9 +508,7 @@ def _load_data_into_session() -> None:
             st.error(f"Kunde inte ladda Data-bladet: {e}")
             st.session_state["DATA"] = pd.DataFrame(columns=DATA_COLUMNS)
 
-# (Slut Del 1/6)
-
-# ============================================================
+# (Slut Del 1/6) ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 2/6: Datainhämtning (Yahoo) & uppdateringshjälpare
 #
