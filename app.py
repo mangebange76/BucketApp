@@ -2390,7 +2390,7 @@ def page_batch():
 
 # ============================================================
 # 🛒 Köpförslag + Säljförslag
-#   - Köpförslag: pris < FV idag, 1, 2 och 3 år OCH värde < bucket-cap
+#   - Köpförslag: pris < FV för **vald horisont** OCH värde < bucket-cap
 #   - Filtrering: horisont (för uppsida/sortering), Bucket, innehavsfilter
 #   - Säljförslag: värde > bucket-cap, filtrerbart på Bucket
 # ============================================================
@@ -2427,10 +2427,13 @@ def build_buy_suggestions(df_data: pd.DataFrame, settings: Dict[str, str], fx_ma
                           bucket_filter: str = "Alla") -> pd.DataFrame:
     """
     Köpförslag:
-      • Aktuell kurs < Riktkurs idag, 1 år, 2 år OCH 3 år
+      • Aktuell kurs < Riktkurs för **vald horisont** (Idag / 1 år / 2 år / 3 år)
       • Innehavets värde (SEK) < cap för dess Bucket
       • Filtrering på Bucket + innehav (Alla / Endast innehav / Endast ej ägda)
-      • fv_horizon styr vilken riktkurs som används för 'Uppsida (%)' och sortering.
+      • fv_horizon styr både:
+          – vilken riktkurs som används för 'Uppsida (%)' och sortering
+          – köpsignalen (kurs < vald FV)
+    Övriga riktkurser används endast som visningsfält.
     """
     cols_out = [
         "Ticker","Bolagsnamn","Bucket","Valuta",
@@ -2478,10 +2481,21 @@ def build_buy_suggestions(df_data: pd.DataFrame, settings: Dict[str, str], fx_ma
             fv_2y    = _f(r.get("Riktkurs 2 år"))
             fv_3y    = _f(r.get("Riktkurs 3 år"))
 
-            # Krav: pris måste vara lägre än ALLA fyra riktkurser (och alla måste finnas)
-            if not all(_pos(x) for x in (fv_today, fv_1y, fv_2y, fv_3y)):
+            # Aktiv FV för uppsida/sortering + köpsignal
+            fv_map = {
+                "Idag": fv_today,
+                "1 år": fv_1y,
+                "2 år": fv_2y,
+                "3 år": fv_3y,
+            }
+            fv_active = fv_map.get(fv_horizon, fv_today)
+
+            # Måste ha en användbar FV för vald horisont
+            if not _pos(fv_active):
                 continue
-            if not (price < fv_today and price < fv_1y and price < fv_2y and price < fv_3y):
+
+            # Köpsignal: pris < FV (vald horisont)
+            if not (price < fv_active):
                 continue
 
             entry = lu.get(
@@ -2508,14 +2522,6 @@ def build_buy_suggestions(df_data: pd.DataFrame, settings: Dict[str, str], fx_ma
             if _pos(value_sek) and value_sek >= cap:
                 continue
 
-            # Aktiv FV för uppsida/sortering
-            fv_map = {
-                "Idag": fv_today,
-                "1 år": fv_1y,
-                "2 år": fv_2y,
-                "3 år": fv_3y,
-            }
-            fv_active = fv_map.get(fv_horizon, fv_today)
             up_pct = None
             if _pos(price) and _pos(fv_active):
                 up_pct = (fv_active - price) / price * 100.0
@@ -2635,16 +2641,17 @@ def page_buy_suggestions():
         bucket_filter_buy = st.selectbox("Bucket-filter (köpförslag)", bucket_opts, index=0)
 
     st.caption(
-        "Köpförslag visar **endast** bolag där aktuell kurs är lägre än "
-        "*alla* riktkurser (idag, 1 år, 2 år, 3 år) **och** där innehavet "
-        "inte är större än maxvärdet (cap) för respektive Bucket."
+        f"Köpförslag visar bolag där aktuell kurs är lägre än riktkurs för **vald horisont** "
+        f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket."
     )
 
     with st.spinner("Bygger köpförslag…"):
-        sug = build_buy_suggestions(df, settings, fx_map,
-                                    own_filter=own_filter,
-                                    fv_horizon=fv_horizon,
-                                    bucket_filter=bucket_filter_buy)
+        sug = build_buy_suggestions(
+            df, settings, fx_map,
+            own_filter=own_filter,
+            fv_horizon=fv_horizon,
+            bucket_filter=bucket_filter_buy,
+        )
 
     if sug.empty:
         st.info("Inga köpkandidater uppfyller kriterierna just nu.")
@@ -2699,7 +2706,7 @@ def page_buy_suggestions():
 #  - Kopplar ihop alla vyer:
 #       • Analys (enskild ticker)
 #       • Ranking (lista/sortering)
-#       • Köpförslag & Säljförslag (NY LOGIK)
+#       • Köpförslag & Säljförslag
 #       • Editor
 #       • Lägg till ticker
 #       • Portfölj (inkl. kommande utdelningar)
@@ -2778,8 +2785,10 @@ def main():
 
     # Liten info om datakälla
     st.sidebar.markdown("---")
-    st.sidebar.caption("Data hämtas från Google Sheets + Yahoo Finance.\n"
-                       "Riktkurser beräknas i handelsvalutan (ingen FX på EPS/targets).")
+    st.sidebar.caption(
+        "Data hämtas från Google Sheets + Yahoo Finance.\n"
+        "Riktkurser beräknas i handelsvalutan (ingen FX på EPS/targets)."
+    )
 
     # Routing
     if page == "📊 Analys":
