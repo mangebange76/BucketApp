@@ -892,29 +892,10 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     Alla värden är i aktiens handelsvaluta.
     """
     snap = yahoo_fetch_for_ticker(ticker)
-
-    # --- CHANGED: normalisera "Utestående aktier" till FULLT antal aktier ---
-    raw_shares = _f(snap.get("Utestående aktier"))
-    shares_out = None
-    if raw_shares is not None:
-        try:
-            v = float(raw_shares)
-            if v < 1_000:
-                # Tolkning: värdet är i MILJARDER (t.ex. 1.5 = 1.5B)
-                shares_out = v * 1_000_000_000.0
-            elif v < 1_000_000:
-                # Tolkning: värdet är i MILJONER (t.ex. 1500 = 1.5B)
-                shares_out = v * 1_000_000.0
-            else:
-                # Redan fullt antal aktier
-                shares_out = v
-        except Exception:
-            shares_out = raw_shares
-
     return {
         "price":            _f(snap.get("Aktuell kurs")),
         "currency":         (snap.get("Valuta") or "USD"),
-        "shares_out":       shares_out,
+        "shares_out":       _f(snap.get("Utestående aktier")),
         "net_debt":         _f(snap.get("Net debt")),
         "rev_ttm":          _f(snap.get("Rev TTM")),
         "ebitda_ttm":       _f(snap.get("EBITDA TTM")),
@@ -951,7 +932,7 @@ def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac
     m0 = _pos(mult0)
     if m0 is None:
         return None
-    try:  # exponentiell decay i stället för linjär
+    try:  # CHANGED: exponentiell decay i stället för linjär
         y = max(0, int(years))
         d = float(decay)
         factor = 1.0 - d
@@ -1046,7 +1027,9 @@ def _eps_path_fill(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Op
     e3 = (e2 or 0.0) * (1.0 + (g or 0.0))
     return float(e0), float(e1), float(e2), float(e3)
 
-def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optional[float], rev2: Optional[float], rev3: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optional[float],
+                 rev2: Optional[float], rev3: Optional[float]
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     b0 = _f(ebitda_ttm)
     if b0 is None:
         return None, None, None, None
@@ -1315,7 +1298,8 @@ def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool]) -> Dict
 # -------------------------
 # Huvud: compute_methods_for_row → DICT (auto-profil)
 # -------------------------
-def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = None, fx_map: Dict[str, float] | None = None) -> Dict[str, Any]:
+def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = None,
+                            fx_map: Dict[str, float] | None = None) -> Dict[str, Any]:
     """
     Returnerar en DICT som funkar både för Ranking-sidan och analysvyer:
       {
@@ -1350,22 +1334,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     shares   = _pos(_nz(y.get("shares_out"), row.get("Utestående aktier")))
     net_debt = _nz(y.get("net_debt"), row.get("Net debt"))
 
-    # --- Revenue: Yahoo i full skala, bladet i miljoner (TTM & estimat) ---
-    sheet_rev_ttm_m = _f(row.get("Rev TTM"))
-    sheet_rev_1y_m  = _f(row.get("Rev 1Y") or row.get("Rev 1y") or row.get("Revenue 1Y"))
-    sheet_rev_2y_m  = _f(row.get("Rev 2Y") or row.get("Rev 2y") or row.get("Revenue 2Y"))
-
-    def _millions_to_full(x: Optional[float]) -> Optional[float]:
-        return x * 1_000_000 if x is not None else None
-
-    sheet_rev_ttm_full = _millions_to_full(sheet_rev_ttm_m)
-    sheet_rev_1y_full  = _millions_to_full(sheet_rev_1y_m)
-    sheet_rev_2y_full  = _millions_to_full(sheet_rev_2y_m)
-
-    rev_ttm = _nz(y.get("rev_ttm"), sheet_rev_ttm_full)
-    rev_1y  = sheet_rev_1y_full
-    rev_2y  = sheet_rev_2y_full
-
+    rev_ttm    = _nz(y.get("rev_ttm"), row.get("Rev TTM"))
     ebitda_ttm = _nz(y.get("ebitda_ttm"), row.get("EBITDA TTM"))
     eps_ttm    = _nz(y.get("eps_ttm"), row.get("EPS TTM"))
 
@@ -1378,6 +1347,11 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 
     eps_1y_est = _pos(_nz(row.get("EPS 1Y"), est.get("eps_1y")))
     eps_2y_est = _pos(_nz(row.get("EPS 2Y"), est.get("eps_2y")))
+
+    # CHANGED: manuella revenue-estimat om de finns på raden
+    rev_1y_manual = _pos(_nz(row.get("Rev 1Y"), None))
+    rev_2y_manual = _pos(_nz(row.get("Rev 2Y"), None))
+    rev_3y_manual = _pos(_nz(row.get("Rev 3Y"), None))
 
     # Historisk CAGR (clamp)
     rev_cagr_hist_raw = _f(_nz(row.get("Rev CAGR"), y.get("rev_cagr_hist")))
@@ -1392,25 +1366,25 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
-    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # default 8% kompression/år
+    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # 8% kompression/år
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
-    # Revenue-path: använd dina estimat först, annars historisk CAGR
+    # Revenue-path (TTM + ev. manuella estimat + CAGR)
     r0 = _pos(rev_ttm)
     if r0 is None:
-        r1 = r2 = r3 = None
+        g = float(_nz(rev_cagr_hist, 0.0))
+        r1 = rev_1y_manual
+        r2 = rev_2y_manual if rev_2y_manual is not None else (r1 * (1.0 + g) if r1 is not None else None)
+        r3 = rev_3y_manual if rev_3y_manual is not None else (r2 * (1.0 + g) if r2 is not None else None)
     else:
         g = float(_nz(rev_cagr_hist, 0.0))
-        r1 = _pos(rev_1y)
-        r2 = _pos(rev_2y)
-        if r1 is None:
-            r1 = r0 * (1.0 + g)
-        if r2 is None:
-            r2 = r1 * (1.0 + g)
-        r3 = r2 * (1.0 + g)
+        r1 = rev_1y_manual if rev_1y_manual is not None else (r0 * (1.0 + g))
+        r2 = rev_2y_manual if rev_2y_manual is not None else ((r1 or r0) * (1.0 + g))
+        r3 = rev_3y_manual if rev_3y_manual is not None else ((r2 or r1 or r0) * (1.0 + g))
 
     # EPS-path
-    e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est, eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
+    e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est,
+                                    eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
 
     # EBITDA-path (skala med intäkter)
     b0, b1, b2, b3 = _ebitda_path(_f(ebitda_ttm), r0, r1, r2, r3)
@@ -1429,6 +1403,44 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     profile = _auto_method_profile(row, y)
     allow_fams = profile["allow"]
 
+    # ---- EV/S-pris via relativ väg mot dagens kurs (ingen enhetsrisk) ----
+    def _evs_price(rel_rev, rel_mult) -> Optional[float]:
+        if not _pos(price):
+            return None
+        if not (_pos(rel_rev) and _pos(rel_mult)):
+            return None
+        try:
+            factor = float(rel_rev) * float(rel_mult)
+            if not math.isfinite(factor):
+                return None
+            # CHANGED: clamp totalt EV/S-scenario per horisont
+            factor = max(0.10, min(5.0, factor))  # 0.1x–5x av dagens kurs
+            return float(price) * factor
+        except Exception:
+            return None
+
+    # Relativa faktorer mot r0/evs0
+    def _rel(r, base):
+        if _pos(r) and _pos(base):
+            try:
+                return float(r) / float(base)
+            except Exception:
+                return None
+        return None
+
+    rev_rel_1 = _rel(r1, r0) if _pos(r0) else None
+    rev_rel_2 = _rel(r2, r0) if _pos(r0) else None
+    rev_rel_3 = _rel(r3, r0) if _pos(r0) else None
+    mult_rel_0 = 1.0
+    mult_rel_1 = _rel(evs1, evs0) if _pos(evs0) else None
+    mult_rel_2 = _rel(evs2, evs0) if _pos(evs0) else None
+    mult_rel_3 = _rel(evs3, evs0) if _pos(evs0) else None
+
+    evs_price_0 = price if _pos(price) and _pos(evs0) and _pos(r0) else None
+    evs_price_1 = _evs_price(rev_rel_1, mult_rel_1) if (rev_rel_1 is not None and mult_rel_1 is not None) else None
+    evs_price_2 = _evs_price(rev_rel_2, mult_rel_2) if (rev_rel_2 is not None and mult_rel_2 is not None) else None
+    evs_price_3 = _evs_price(rev_rel_3, mult_rel_3) if (rev_rel_3 is not None and mult_rel_3 is not None) else None
+
     # --- Priser per metod (alla i aktiens valuta) ---
     methods = []
     methods.append({
@@ -1439,11 +1451,11 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
         "3 år": _price_from_pe(e3, pe3m),
     })
     methods.append({
-        "Metod": "ev_sales",
-        "Idag": _equity_price_from_ev(_ev_from_sales(r0, evs0), net_debt, shares),
-        "1 år": _equity_price_from_ev(_ev_from_sales(r1, evs1), net_debt, shares),
-        "2 år": _equity_price_from_ev(_ev_from_sales(r2, evs2), net_debt, shares),
-        "3 år": _equity_price_from_ev(_ev_from_sales(r3, evs3), net_debt, shares),
+        "Metod": "ev_sales",  # CHANGED: baserad på relativ prisfaktor mot dagens kurs
+        "Idag": evs_price_0,
+        "1 år": evs_price_1,
+        "2 år": evs_price_2,
+        "3 år": evs_price_3,
     })
     methods.append({
         "Metod": "ev_ebitda",
@@ -1482,7 +1494,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     }
 
     # Sätt ihop metodtabellen i tydlig ordning
-    methods_df = pd.concat([pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df], ignore_index=True)
+    methods_df = pd.concat(
+        [pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df],
+        ignore_index=True
+    )
 
     # --- Sanity-text (ASCII) ---
     sanity = (
