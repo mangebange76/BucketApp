@@ -1006,12 +1006,25 @@ def _price_from_pb(pb: Optional[float], bvps: Optional[float]) -> Optional[float
 # -------------------------
 # EPS/REV paths
 # -------------------------
-def _eps_path_fill(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Optional[float],
-                   eps_cagr_hist: Optional[float], eps_cagr_long: Optional[float],
-                   rev_cagr_hist: Optional[float]) -> Tuple[float, float, float, float]:
+def _eps_path_fill(
+    eps_ttm: Optional[float],
+    eps_1y: Optional[float],
+    eps_2y: Optional[float],
+    eps_cagr_hist: Optional[float],
+    eps_cagr_long: Optional[float],
+    rev_cagr_hist: Optional[float],
+) -> Tuple[float, float, float, float]:
+    """
+    Bygger EPS-bana (ttm, 1y, 2y, 3y).
+
+    CHANGED: vi lägger in guardrails så att EPS inte får hoppa mer
+    än EPS_CAGR_MAX (+35 %) eller falla mer än EPS_CAGR_MIN (-20 %)
+    per år, oavsett vad enstaka estimat säger. Det hindrar
+    vansinniga riktkurser om någon källa råkar ge t.ex. 3.5 → 350.
+    """
     e0 = _pos(eps_ttm) or 0.0
-    e1 = _pos(eps_1y)
-    e2 = _pos(eps_2y)
+    e1_raw = _pos(eps_1y)
+    e2_raw = _pos(eps_2y)
 
     # Välj första tillgängliga tillväxtindikator
     g = None
@@ -1020,25 +1033,63 @@ def _eps_path_fill(eps_ttm: Optional[float], eps_1y: Optional[float], eps_2y: Op
             g = float(_f(cand))
             break
 
-    if e1 is None:
+    # Basbana utan guardrails
+    if e1_raw is None:
         e1 = e0 * (1.0 + (g or 0.0))
-    if e2 is None:
+    else:
+        e1 = e1_raw
+
+    if e2_raw is None:
         e2 = (e1 or 0.0) * (1.0 + (g or 0.0))
+    else:
+        e2 = e2_raw
+
     e3 = (e2 or 0.0) * (1.0 + (g or 0.0))
+
+    # ---- Guardrails för år-till-år-hopp ----
+    max_g = EPS_CAGR_MAX
+    min_g = EPS_CAGR_MIN
+
+    def _clamp_step(prev: float, nxt: Optional[float]) -> float:
+        if nxt is None:
+            return prev
+        if prev <= 0:
+            return float(nxt)
+        try:
+            rel = float(nxt) / float(prev) - 1.0
+        except Exception:
+            return prev
+        if rel > max_g:
+            rel = max_g
+        elif rel < min_g:
+            rel = min_g
+        return float(prev) * (1.0 + rel)
+
+    e1 = _clamp_step(e0, e1)
+    e2 = _clamp_step(e1, e2)
+    e3 = _clamp_step(e2, e3)
+
     return float(e0), float(e1), float(e2), float(e3)
 
-def _ebitda_path(ebitda_ttm: Optional[float], rev0: Optional[float], rev1: Optional[float],
-                 rev2: Optional[float], rev3: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def _ebitda_path(
+    ebitda_ttm: Optional[float],
+    rev0: Optional[float],
+    rev1: Optional[float],
+    rev2: Optional[float],
+    rev3: Optional[float],
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     b0 = _f(ebitda_ttm)
     if b0 is None:
         return None, None, None, None
     if rev0 is None or rev1 is None:
         return b0, b0, b0, b0
+
     def scale(r):
         try:
             return (b0 * (r / rev0)) if (r and rev0) else b0
         except Exception:
             return b0
+
     return b0, scale(rev1), scale(rev2), scale(rev3)
 
 # -------------------------
@@ -1106,7 +1157,11 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
         if _pos(eps_1y) and eps_cagr_long is not None:
             eps_2y = float(eps_1y) * (1.0 + float(eps_cagr_long))
 
-        return {"eps_1y": _f(eps_1y), "eps_2y": _f(eps_2y), "eps_cagr_long": _f(eps_cagr_long)}
+        return {
+            "eps_1y": _f(eps_1y),
+            "eps_2y": _f(eps_2y),
+            "eps_cagr_long": _f(eps_cagr_long),
+        }
     except Exception:
         return {"eps_1y": None, "eps_2y": None, "eps_cagr_long": None}
 
@@ -1161,16 +1216,13 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
 
     # Sektor-skift (bara PE/PB är relevanta när EV är avstängt)
     if is_financial or ticker in bdc_mreit_tickers:
-        # Finans/BDC/mREIT → P/B primärt, PE sekundärt (om lönsam)
         allow["ev_s"] = False
         allow["ev_e"] = False
         allow["pe"] = allow["pe"] and (eps_ttm and eps_ttm > 0)
     elif is_reit:
-        # REIT/fastigheter → P/B om möjligt
         allow["ev_s"] = False
         allow["ev_e"] = False
     elif is_tech or is_health:
-        # Tech/health: PE om positiv EPS, annars inget (EV-spår avstängt nedan)
         if not (eps_ttm and eps_ttm > 0):
             allow["pe"] = False
 
@@ -1201,8 +1253,11 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
 # -------------------------
 # Fair Value via familjemedian (v3 med filtrering)
 # -------------------------
-def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[float],
-                               allow_fams: Dict[str, bool]) -> Dict[str, Any]:
+def _compute_fair_value_row_v3(
+    methods_df: pd.DataFrame,
+    now_price: Optional[float],
+    allow_fams: Dict[str, bool],
+) -> Dict[str, Any]:
     """
     Median över *tillåtna* metodfamiljer:
       • 'pe_hist_vs_eps'          → fam 'pe'
@@ -1240,7 +1295,6 @@ def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[flo
             v = _f(r.get(c))
             if v is None:
                 continue
-            # Filtrera kurs-kopior i "Idag"
             if c == "Idag" and _pos(now_price) and _pos(v):
                 if abs(v - float(now_price)) / float(now_price) <= 0.005:
                     continue
@@ -1248,7 +1302,6 @@ def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[flo
             vals.append(float(v))
 
         if not vals:
-            # Fall-back: PE-raden om den finns och 'pe' är tillåten
             try:
                 if allow_fams.get("pe", False):
                     row_pe = methods_df[methods_df["Metod"] == "pe_hist_vs_eps"].iloc[0]
@@ -1301,9 +1354,11 @@ def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool]) -> Dict
 # -------------------------
 # Huvud: compute_methods_for_row → DICT (auto-profil)
 # -------------------------
-def compute_methods_for_row(row: pd.Series,
-                            settings: Dict[str, str] | None = None,
-                            fx_map: Dict[str, float] | None = None) -> Dict[str, Any]:
+def compute_methods_for_row(
+    row: pd.Series,
+    settings: Dict[str, str] | None = None,
+    fx_map: Dict[str, float] | None = None,
+) -> Dict[str, Any]:
     """
     Returnerar en DICT som funkar både för Ranking-sidan och analysvyer:
       {
@@ -1379,8 +1434,14 @@ def compute_methods_for_row(row: pd.Series,
         r3 = r2 * (1.0 + g)
 
     # EPS-path
-    e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est,
-                                    eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
+    e0, e1, e2, e3 = _eps_path_fill(
+        _f(eps_ttm),
+        eps_1y_est,
+        eps_2y_est,
+        eps_cagr_hist,
+        eps_cagr_long,
+        rev_cagr_hist,
+    )
 
     # EBITDA-path (skala med intäkter)
     b0, b1, b2, b3 = _ebitda_path(_f(ebitda_ttm), r0, r1, r2, r3)
@@ -1505,9 +1566,11 @@ def compute_methods_for_row(row: pd.Series,
 # -------------------------
 # Kompakt extraktor (FV) för UI
 # -------------------------
-def compute_fair_values_for_row(row: pd.Series,
-                                settings: Dict[str, str],
-                                fx_map: Dict[str, float]) -> Dict[str, Any]:
+def compute_fair_values_for_row(
+    row: pd.Series,
+    settings: Dict[str, str],
+    fx_map: Dict[str, float],
+) -> Dict[str, Any]:
     """
     Beräknar metoder för en rad och returnerar en kompakt dict för UI:
       {
