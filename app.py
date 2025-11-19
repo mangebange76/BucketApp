@@ -7,12 +7,12 @@
 #  - Delegerar innehåll till app_pages.py
 #
 # Moduler:
-#   core_utils.py   → get_fx_map (m.m.)
-#   sheets_io.py    → _load_data_into_session (läser Data-bladet)
+#   core_utils.py   → helpers (t.ex. _f, _pos, now_stamp, m.m.)
+#   sheets_io.py    → I/O mot Google Sheets (+ ev. get_fx_map)
+#   yahoo_fetch.py  → Yahoo-hämtning
+#   valuation.py    → beräkningsmotor
+#   analysis_ui.py  → analys/ranking-UI
 #   app_pages.py    → page_*-funktioner för alla vyer
-#   analysis_ui.py  → analys/ranking-UI (anropas inifrån app_pages)
-#   valuation.py    → beräkningsmotor (anropas inifrån analysis_ui/app_pages)
-#   yahoo_fetch.py  → Yahoo-hämtning (anropas inifrån app_pages)
 # ============================================================
 
 from __future__ import annotations
@@ -21,9 +21,22 @@ from __future__ import annotations
 import streamlit as st
 
 # ---------- Egna moduler ----------
-from core_utils import get_fx_map
+
+# DATA-laddning
 from sheets_io import _load_data_into_session
 
+# Försök hämta get_fx_map från sheets_io i första hand, annars core_utils.
+try:
+    from sheets_io import get_fx_map  # typiskt läge
+except Exception:
+    try:
+        from core_utils import get_fx_map  # fallback om du har den där
+    except Exception:
+        # Sista fallback – appen funkar, men FX blir bara SEK=1.0
+        def get_fx_map() -> dict[str, float]:
+            return {"SEK": 1.0}
+
+# Sidornas UI – implementeras i app_pages.py
 from app_pages import (
     page_analysis,
     page_ranking,
@@ -59,16 +72,16 @@ def _ensure_session_state() -> None:
     Själva laddningen av DATA görs av sheets_io._load_data_into_session()
     med samma logik som i gamla Del 1/6.
     """
-    # DATA
+    # DATA (Google Sheet → st.session_state["DATA"])
     _load_data_into_session()
 
-    # FX (valutakurser)
+    # FX (valutakurser → st.session_state["FX"])
     if "FX" not in st.session_state or not isinstance(st.session_state["FX"], dict):
         try:
             st.session_state["FX"] = get_fx_map()
         except Exception as e:
             st.warning(f"Kunde inte ladda valutakurser (FX): {e}")
-            st.session_state["FX"] = {}
+            st.session_state["FX"] = {"SEK": 1.0}
 
 # -------------------------
 # MAIN
@@ -76,7 +89,7 @@ def _ensure_session_state() -> None:
 def main():
     st.title("📈 Aktieanalys & investeringsförslag")
 
-    # Se till att DATA + FX är laddat
+    # Se till att DATA + FX är laddat innan vi visar någon sida
     _ensure_session_state()
 
     # Sidebar-navigering
