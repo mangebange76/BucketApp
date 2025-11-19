@@ -917,17 +917,10 @@ def mass_update_from_yahoo(df: pd.DataFrame, idx_list: List[int], sleep_sec: flo
 #  - AUTO-PROFIL: väljer vilka metodfamiljer som passar (per sektor/mått)
 #  - Metodpriser: PE, EV/S, EV/EBITDA, P/B (+ placeholders för struktur)
 #  - Multipel-decay & PE-ankare
-#  - Fair Value = median över valda metodfamiljer (v3)
+#  - Fair Value idag = PE-growth-hybrid (EPS-bas * fair PE)
 #  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
 #  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
 #  - compute_fair_values_for_row() → kompakt DICT för UI
-#
-# Viktigt (uppdaterat):
-#  • P/E-ankaret bygger i första hand på PE FWD från Yahoo.
-#  • EPS 1Y / EPS 2Y hämtas i första hand från din rad (manuella estimat),
-#    annars från Yahoo-estimat om de finns.
-#  • Rev/EPS CAGR prioriterar värden som appen hämtar (y['rev_cagr_hist'],
-#    y['eps_cagr_hist']) om/när de börjar fyllas, annars tas värden i raden.
 # ============================================================
 
 # -------------------------
@@ -998,10 +991,6 @@ def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac
     return max(m, floor)
 
 def _pe_anchor(pe_ttm: Optional[float], pe_fwd: Optional[float], w_ttm: float) -> Optional[float]:
-    """
-    Ursprunglig blandning av TTM/FWD (behålls som fallback).
-    I compute_methods_for_row används numera PE FWD i första hand.
-    """
     pt = _pos(pe_ttm)
     pf = _pos(pe_fwd)
     if pt is None and pf is None:
@@ -1383,7 +1372,7 @@ def compute_methods_for_row(row: pd.Series,
     Returnerar en DICT som funkar både för Ranking-sidan och analysvyer:
       {
         "Metod": "fair_value_v3_auto",
-        "target_today": float|None,  # = Fair Value idag (ingen MoS)
+        "target_today": float|None,  # = Fair Value idag (PE-growth-hybrid, ingen MoS)
         "target_1y":    float|None,  # = Best case 1y * (1 - MoS bucket)
         "target_2y":    float|None,  # = Best case 2y * (1 - MoS bucket)
         "target_3y":    float|None,  # = Best case 3y * (1 - MoS bucket)
@@ -1424,15 +1413,14 @@ def compute_methods_for_row(row: pd.Series,
     p_b        = _pos(_nz(y.get("p_b"), row.get("P/B")))
     bvps       = _pos(_nz(y.get("bvps"), row.get("BVPS")))
 
-    # Dina manuella EPS-estimat har prio, annars Yahoo-estimat
     eps_1y_est = _pos(_nz(row.get("EPS 1Y"), est.get("eps_1y")))
     eps_2y_est = _pos(_nz(row.get("EPS 2Y"), est.get("eps_2y")))
 
-    # Historisk CAGR (CLAMP) – nu med prio på värden hämtade av appen
-    rev_cagr_hist_raw = _f(_nz(y.get("rev_cagr_hist"), row.get("Rev CAGR")))
+    # Historisk CAGR (clamp)
+    rev_cagr_hist_raw = _f(_nz(row.get("Rev CAGR"), y.get("rev_cagr_hist")))
     rev_cagr_hist     = max(REV_CAGR_MIN, min(REV_CAGR_MAX, rev_cagr_hist_raw)) if rev_cagr_hist_raw is not None else None
 
-    eps_cagr_hist_raw = _f(_nz(y.get("eps_cagr_hist"), row.get("EPS CAGR")))
+    eps_cagr_hist_raw = _f(_nz(row.get("EPS CAGR"), y.get("eps_cagr_hist")))
     eps_cagr_hist     = max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_hist_raw)) if eps_cagr_hist_raw is not None else None
 
     eps_cagr_long = _f(est.get("eps_cagr_long"))
@@ -1447,12 +1435,7 @@ def compute_methods_for_row(row: pd.Series,
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
     decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # default 8% kompression/år
-
-    # NY LOGIK: använd PE FWD i första hand, annars fallback till blandning
-    if pe_fwd is not None:
-        pe_anchor = pe_fwd
-    else:
-        pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
+    pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
     # Tillämpa ev. P/E-tak för cykliska/crypto (enbart på ankaret)
     if pe_anchor is not None and pe_cap is not None:
@@ -1460,6 +1443,57 @@ def compute_methods_for_row(row: pd.Series,
             pe_anchor = min(float(pe_anchor), float(pe_cap))
         except Exception:
             pass
+
+    # --- Fair Value (PE-growth-hybrid) kandidat för "Idag" ---
+    fv_today_pe = None
+    try:
+        # EPS-bas: först EPS 1Y (estimat), annars EPS TTM
+        eps_base = _pos(eps_1y_est) or _pos(eps_ttm)
+        if eps_base is not None and eps_base > 0:
+            # Tillväxt-signal g: prioritet långsiktig EPS, därefter historisk EPS, sedan rev
+            g = None
+            for cand in (eps_cagr_long, eps_cagr_hist, rev_cagr_hist, 0.0):
+                if cand is not None:
+                    g = float(cand)
+                    break
+            if g is None:
+                g = 0.0
+            # Negativ tillväxt → 0 för fair value-PE (annars blir det "konkursvibbar")
+            if g < 0.0:
+                g = 0.0
+            # Clamp 0–30 %
+            if g > 0.30:
+                g = 0.30
+
+            # PE baserat på tillväxt: 15–30x för 0–30 % tillväxt
+            pe_growth = 15.0 + 50.0 * g
+
+            # Marknads-PE: använd PE FWD i första hand, sedan ankare, sedan PE TTM (max 40x)
+            pe_mkt = None
+            for cand in (pe_fwd, pe_anchor, pe_ttm):
+                c = _pos(cand)
+                if c is not None:
+                    pe_mkt = c
+                    break
+            if pe_mkt is not None:
+                try:
+                    pe_mkt = min(float(pe_mkt), 40.0)
+                except Exception:
+                    pass
+
+            # Fair PE idag: snitt av growth-PE och marknads-PE om båda finns
+            pe_fair_today = None
+            if pe_growth is not None and pe_mkt is not None:
+                pe_fair_today = 0.5 * float(pe_growth) + 0.5 * float(pe_mkt)
+            elif pe_growth is not None:
+                pe_fair_today = float(pe_growth)
+            elif pe_mkt is not None:
+                pe_fair_today = float(pe_mkt)
+
+            if pe_fair_today is not None and pe_fair_today > 0:
+                fv_today_pe = float(eps_base) * float(pe_fair_today)
+    except Exception:
+        fv_today_pe = None
 
     # Revenue-path (om bara TTM → väx med rev_cagr_hist)
     r0 = _pos(rev_ttm)
@@ -1471,7 +1505,7 @@ def compute_methods_for_row(row: pd.Series,
         r2 = r1 * (1.0 + g)
         r3 = r2 * (1.0 + g)
 
-    # EPS-path (TTM + dina estimat + CAGR)
+    # EPS-path
     e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est,
                                     eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
 
@@ -1524,8 +1558,13 @@ def compute_methods_for_row(row: pd.Series,
 
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
-    # --- Fair Value (familjemedian, filtrerad av auto-profil) = IDAG ---
+    # --- Fair Value (familjemedian, filtrerad av auto-profil) = bas ---
     fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams)
+
+    # Om vi lyckades räkna fram PE-growth-FV för idag, använd den som "Idag"
+    if fv_today_pe is not None:
+        fv_row["Idag"] = fv_today_pe
+
     # --- Bästa scenario (max per horisont över tillåtna familjer) ---
     best_row = _best_case_row(methods_df, allow_fams)
 
@@ -1573,7 +1612,7 @@ def compute_methods_for_row(row: pd.Series,
     payload: Dict[str, Any] = {
         "Metod": "fair_value_v3_auto",
         "method": "fair_value_v3_auto",
-        "target_today": target_today,  # Fair value idag (ingen MoS)
+        "target_today": target_today,  # Fair value idag (PE-growth-hybrid, ingen MoS)
         "target_1y":    target_1y,     # Best case – MoS
         "target_2y":    target_2y,     # Best case – MoS
         "target_3y":    target_3y,     # Best case – MoS
@@ -1603,7 +1642,7 @@ def compute_fair_values_for_row(row: pd.Series,
         'ticker': 'AAPL',
         'price':  195.12,
         'currency': 'USD',
-        'fv_today':  Fair Value idag (utan MoS),
+        'fv_today':  Fair Value idag (utan MoS, PE-growth-hybrid),
         'fv_1y':     Best case 1y – MoS(bucket),
         'fv_2y':     Best case 2y – MoS(bucket),
         'fv_3y':     Best case 3y – MoS(bucket),
