@@ -1,9 +1,20 @@
-# valuation.py — Beräkningsmotor (auto-val av metod & riktkurser)
+# ============================================================
+# valuation.py – Beräkningsmotor (auto-val av metod & riktkurser)
+#
+#  - fetch_from_yahoo(): wrapper runt yahoo_fetch_for_ticker
+#  - EPS-estimat från Yahoo (earnings_trend)
+#  - AUTO-PROFIL: väljer vilka metodfamiljer som passar (per sektor/mått)
+#  - Metodpriser: PE, EV/S, EV/EBITDA, P/B (+ placeholders för struktur)
+#  - Multipel-decay & PE-ankare
+#  - Fair Value idag = PE-growth-hybrid (EPS-bas * fair PE)
+#  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
+#  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
+#  - compute_fair_values_for_row() → kompakt DICT för UI
+# ============================================================
 
 from __future__ import annotations
 
 import math
-import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,17 +22,18 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from core_utils import _f, _pos, _nz, get_settings_map
+from core_utils import _f, _pos, _nz  # bara helpers här
+from sheets_io import get_settings_map   # <-- FLYTTAD HIT
 from yahoo_fetch import yahoo_fetch_for_ticker
 
 
 # -------------------------
-# Wrapper: Del 2 → Del 3
+# Wrapper: Yahoo → beräkningsmotor
 # -------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     """
-    Mappa Del 2:s yahoo_fetch_for_ticker() till stabila nycklar för beräkningsmotorn.
+    Mappa yahoo_fetch_for_ticker() till stabila nycklar för beräkningsmotorn.
     Alla värden är i aktiens handelsvaluta.
     """
     snap = yahoo_fetch_for_ticker(ticker)
@@ -62,12 +74,8 @@ PE_CAP_CYCLICAL  = 10.0  # shipping, tankers, energy, materials
 # -------------------------
 # Små hjälpare (beräkning)
 # -------------------------
-def _decay_multiple(
-    mult0: Optional[float],
-    years: int,
-    decay: float,
-    floor_frac: float = 0.60,
-) -> Optional[float]:
+def _decay_multiple(mult0: Optional[float], years: int, decay: float,
+                    floor_frac: float = 0.60) -> Optional[float]:
     """
     Exponentiell kompression av multipel:
       mult_y = mult0 * (1 - decay) ** years
@@ -105,11 +113,8 @@ def _pe_anchor(pe_ttm: Optional[float], pe_fwd: Optional[float], w_ttm: float) -
         return None
 
 
-def _equity_price_from_ev(
-    ev_target: Optional[float],
-    net_debt: Optional[float],
-    shares_fd: Optional[float],
-) -> Optional[float]:
+def _equity_price_from_ev(ev_target: Optional[float], net_debt: Optional[float],
+                          shares_fd: Optional[float]) -> Optional[float]:
     e = _pos(ev_target)
     s = _pos(shares_fd)
     if e is None or s is None:
@@ -341,7 +346,7 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         "pb":   (p_b is not None) and (p_b > 0) and (bvps is not None) and (bvps > 0),
     }
 
-    # Sektor-skift
+    # Sektor-skift (bara PE/PB är relevanta när EV är avstängt)
     if is_financial or ticker in bdc_mreit_tickers:
         allow["ev_s"] = False
         allow["ev_e"] = False
@@ -376,6 +381,7 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         prefer_order = ["pe","ev_s","ev_e","pb"]
     primary = next((fam for fam in prefer_order if allow.get(fam)), None)
 
+    # Diagnostiksträng
     allow_bits = ", ".join([f"{k}:{'yes' if v else 'no'}" for k, v in allow.items()])
     sektor_label = (sektor or "-")
     primary_label = (primary or "-")
@@ -458,17 +464,19 @@ def _mos_for_bucket(bucket_label: Any) -> float:
 
 def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool]) -> Dict[str, Any]:
     fam_ok = {
-        "pe_hist_vs_eps": "pe",
-        "ev_sales": "ev_s",
-        "ev_ebitda": "ev_e",
-        "ev_dacf": "ev_e",
-        "p_b": "pb",
+        "pe_hist_vs_eps":"pe",
+        "ev_sales":"ev_s",
+        "ev_ebitda":"ev_e",
+        "ev_dacf":"ev_e",
+        "p_b":"pb",
     }
     cols = ["Idag", "1 år", "2 år", "3 år"]
     base = {"Metod": "best_case"}
     if methods_df is None or (hasattr(methods_df, "empty") and methods_df.empty):
         return {**base, **{c: np.nan for c in cols}}
-    sub = methods_df[methods_df["Metod"].map(lambda m: allow_fams.get(fam_ok.get(str(m), ""), False))].copy()
+    sub = methods_df[
+        methods_df["Metod"].map(lambda m: allow_fams.get(fam_ok.get(str(m), ""), False))
+    ].copy()
     for c in cols:
         try:
             vals = [float(v) for v in sub[c].tolist() if _f(v) is not None]
@@ -514,26 +522,34 @@ def compute_methods_for_row(
 
     # Historisk CAGR (clamp)
     rev_cagr_hist_raw = _f(_nz(row.get("Rev CAGR"), y.get("rev_cagr_hist")))
-    rev_cagr_hist     = max(REV_CAGR_MIN, min(REV_CAGR_MAX, rev_cagr_hist_raw)) if rev_cagr_hist_raw is not None else None
+    rev_cagr_hist     = (
+        max(REV_CAGR_MIN, min(REV_CAGR_MAX, rev_cagr_hist_raw))
+        if rev_cagr_hist_raw is not None
+        else None
+    )
 
     eps_cagr_hist_raw = _f(_nz(row.get("EPS CAGR"), y.get("eps_cagr_hist")))
-    eps_cagr_hist     = max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_hist_raw)) if eps_cagr_hist_raw is not None else None
+    eps_cagr_hist     = (
+        max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_hist_raw))
+        if eps_cagr_hist_raw is not None
+        else None
+    )
 
     eps_cagr_long = _f(est.get("eps_cagr_long"))
     if eps_cagr_long is not None:
         eps_cagr_long = max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_long))
 
-    # AUTO-PROFIL
+    # AUTO-PROFIL: vilka familjer + ev. P/E-tak
     profile = _auto_method_profile(row, y)
     allow_fams = profile["allow"]
     pe_cap = profile.get("pe_cap")
 
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
-    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08
+    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # default 8% kompression/år
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
-    # P/E-tak
+    # P/E-tak för cykliska/crypto
     if pe_anchor is not None and pe_cap is not None:
         try:
             pe_anchor = min(float(pe_anchor), float(pe_cap))
@@ -613,9 +629,24 @@ def compute_methods_for_row(
     pe2m = _decay_multiple(pe_anchor, 2, decay)
     pe3m = _decay_multiple(pe_anchor, 3, decay)
 
-    evs0, evs1, evs2, evs3 = ev_sales,  _decay_multiple(ev_sales,  1, decay), _decay_multiple(ev_sales,  2, decay), _decay_multiple(ev_sales,  3, decay)
-    eve0, eve1, eve2, eve3 = ev_ebitda, _decay_multiple(ev_ebitda, 1, decay), _decay_multiple(ev_ebitda, 2, decay), _decay_multiple(ev_ebitda, 3, decay)
-    pb0,  pb1,  pb2,  pb3  = p_b,       _decay_multiple(p_b,       1, decay), _decay_multiple(p_b,       2, decay), _decay_multiple(p_b,       3, decay)
+    evs0, evs1, evs2, evs3 = (
+        ev_sales,
+        _decay_multiple(ev_sales, 1, decay),
+        _decay_multiple(ev_sales, 2, decay),
+        _decay_multiple(ev_sales, 3, decay),
+    )
+    eve0, eve1, eve2, eve3 = (
+        ev_ebitda,
+        _decay_multiple(ev_ebitda, 1, decay),
+        _decay_multiple(ev_ebitda, 2, decay),
+        _decay_multiple(ev_ebitda, 3, decay),
+    )
+    pb0, pb1, pb2, pb3 = (
+        p_b,
+        _decay_multiple(p_b, 1, decay),
+        _decay_multiple(p_b, 2, decay),
+        _decay_multiple(p_b, 3, decay),
+    )
 
     # --- Priser per metod (alla i aktiens valuta) ---
     methods: List[Dict[str, Any]] = []
@@ -647,7 +678,6 @@ def compute_methods_for_row(
         "2 år": _price_from_pb(pb2, bvps),
         "3 år": _price_from_pb(pb3, bvps),
     })
-    # Platshållare
     for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
         methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
@@ -656,7 +686,6 @@ def compute_methods_for_row(
     # --- Fair Value (familjemedian, filtrerad av auto-profil) = bas ---
     fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams)
 
-    # Om vi lyckades räkna fram PE-growth-FV för idag, använd den som "Idag"
     if fv_today_pe is not None:
         fv_row["Idag"] = fv_today_pe
 
@@ -668,7 +697,7 @@ def compute_methods_for_row(
     mos = _mos_for_bucket(bucket_label)
     best_mos_row = {
         "Metod": "best_case_MoS",
-        "Idag": _f(fv_row.get("Idag")),  # ingen MoS på dagens fair value
+        "Idag": _f(fv_row.get("Idag")),
         "1 år": (_f(best_row.get("1 år")) * (1.0 - mos)) if _f(best_row.get("1 år")) is not None else np.nan,
         "2 år": (_f(best_row.get("2 år")) * (1.0 - mos)) if _f(best_row.get("2 år")) is not None else np.nan,
         "3 år": (_f(best_row.get("3 år")) * (1.0 - mos)) if _f(best_row.get("3 år")) is not None else np.nan,
