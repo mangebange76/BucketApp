@@ -892,10 +892,29 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     Alla värden är i aktiens handelsvaluta.
     """
     snap = yahoo_fetch_for_ticker(ticker)
+
+    # --- CHANGED: normalisera "Utestående aktier" till FULLT antal aktier ---
+    raw_shares = _f(snap.get("Utestående aktier"))
+    shares_out = None
+    if raw_shares is not None:
+        try:
+            v = float(raw_shares)
+            if v < 1_000:
+                # Tolkning: värdet är i MILJARDER (t.ex. 1.5 = 1.5B)
+                shares_out = v * 1_000_000_000.0
+            elif v < 1_000_000:
+                # Tolkning: värdet är i MILJONER (t.ex. 1500 = 1.5B)
+                shares_out = v * 1_000_000.0
+            else:
+                # Redan fullt antal aktier
+                shares_out = v
+        except Exception:
+            shares_out = raw_shares
+
     return {
         "price":            _f(snap.get("Aktuell kurs")),
         "currency":         (snap.get("Valuta") or "USD"),
-        "shares_out":       _f(snap.get("Utestående aktier")),
+        "shares_out":       shares_out,
         "net_debt":         _f(snap.get("Net debt")),
         "rev_ttm":          _f(snap.get("Rev TTM")),
         "ebitda_ttm":       _f(snap.get("EBITDA TTM")),
