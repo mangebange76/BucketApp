@@ -7,8 +7,8 @@
 #  - Delegerar innehåll till app_pages.py
 #
 # Moduler:
-#   core_utils.py   → helpers (t.ex. _f, _pos, now_stamp, m.m.)
-#   sheets_io.py    → I/O mot Google Sheets (+ ev. get_fx_map)
+#   core_utils.py   → helpers (_f, _pos, now_stamp, etc)
+#   sheets_io.py    → I/O mot Google Sheets + FX/Settings
 #   yahoo_fetch.py  → Yahoo-hämtning
 #   valuation.py    → beräkningsmotor
 #   analysis_ui.py  → analys/ranking-UI
@@ -22,19 +22,16 @@ import streamlit as st
 
 # ---------- Egna moduler ----------
 
-# DATA-laddning
-from sheets_io import _load_data_into_session
+# Data-laddning från Google Sheets
+from sheets_io import read_data_df
 
-# Försök hämta get_fx_map från sheets_io i första hand, annars core_utils.
+# FX-karta: försök ta från sheets_io, annars fallback
 try:
-    from sheets_io import get_fx_map  # typiskt läge
+    from sheets_io import get_fx_map  # normalläget
 except Exception:
-    try:
-        from core_utils import get_fx_map  # fallback om du har den där
-    except Exception:
-        # Sista fallback – appen funkar, men FX blir bara SEK=1.0
-        def get_fx_map() -> dict[str, float]:
-            return {"SEK": 1.0}
+    def get_fx_map() -> dict[str, float]:
+        # Fallback om get_fx_map inte finns eller sheets_io ändras
+        return {"SEK": 1.0}
 
 # Sidornas UI – implementeras i app_pages.py
 from app_pages import (
@@ -68,12 +65,16 @@ st.markdown(
 # -------------------------
 def _ensure_session_state() -> None:
     """
-    Säkerställ att DATA- och FX-objekt finns i st.session_state.
-    Själva laddningen av DATA görs av sheets_io._load_data_into_session()
-    med samma logik som i gamla Del 1/6.
+    Se till att DATA- och FX-objekt finns i st.session_state.
+    Själva I/O-logiken ligger i sheets_io.py.
     """
     # DATA (Google Sheet → st.session_state["DATA"])
-    _load_data_into_session()
+    if "DATA" not in st.session_state:
+        try:
+            st.session_state["DATA"] = read_data_df()
+        except Exception as e:
+            st.error(f"Kunde inte ladda Data-bladet: {e}")
+            st.session_state["DATA"] = None
 
     # FX (valutakurser → st.session_state["FX"])
     if "FX" not in st.session_state or not isinstance(st.session_state["FX"], dict):
