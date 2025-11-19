@@ -924,11 +924,25 @@ EPS_CAGR_MAX =  0.35   # +35 %
 # Små hjälpare (beräkning)
 # -------------------------
 def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac: float = 0.60) -> Optional[float]:
+    """
+    Exponentiell kompression av multipel:
+      mult_y = mult0 * (1 - decay) ** years
+    med golv på floor_frac * mult0.
+    """
     m0 = _pos(mult0)
     if m0 is None:
         return None
-    m = m0 * (1.0 - decay * years)
-    floor = m0 * floor_frac
+    try:  # CHANGED: exponentiell decay i stället för linjär
+        y = max(0, int(years))
+        d = float(decay)
+        factor = 1.0 - d
+        if factor <= 0:
+            m = m0 * floor_frac
+        else:
+            m = m0 * (factor ** y)
+    except Exception:
+        m = m0
+    floor = m0 * float(floor_frac)
     return max(m, floor)
 
 def _pe_anchor(pe_ttm: Optional[float], pe_fwd: Optional[float], w_ttm: float) -> Optional[float]:
@@ -1344,7 +1358,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
-    decay = _f(settings.get("multiple_decay", 0.10)) or 0.10
+    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # CHANGED: default 8% kompression/år
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
     # Revenue-path (om bara TTM → väx med rev_cagr_hist)
@@ -1363,7 +1377,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     # EBITDA-path (skala med intäkter)
     b0, b1, b2, b3 = _ebitda_path(_f(ebitda_ttm), r0, r1, r2, r3)
 
-    # Multiplar med decay
+    # Multiplar med decay (exponentiell)
     pe0  = pe_anchor
     pe1m = _decay_multiple(pe_anchor, 1, decay)
     pe2m = _decay_multiple(pe_anchor, 2, decay)
@@ -1737,7 +1751,6 @@ def render_ranking_view(df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict
     st.dataframe(df, use_container_width=True)
 
 # (Slut Del 4/6)
-
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 5/6: Settings, Snapshot, Editor, Lägg till, Portfölj,
@@ -2811,8 +2824,6 @@ def main():
         page_snapshot()
     else:
         page_analysis()
-
-
 if __name__ == "__main__":
     main()
 # (Slut Del 6/6 – hela app.py klar)
