@@ -776,6 +776,45 @@ def _yf_dividend_annual(tkr) -> Optional[float]:
         pass
     return None
 
+# NEW: historisk "CAGR" från Yahoo (revenueGrowth / earningsGrowth)
+def _yf_rev_cagr_hist(tkr) -> Optional[float]:  # CHANGED / NEW
+    """
+    Hämtar revenueGrowth från Yahoo info (≈ senaste årets intäkts-tillväxt).
+    Används som proxy för Rev CAGR i beräkningsmotorn.
+    """
+    if tkr is None:
+        return None
+    try:
+        info = tkr.info
+        v = info.get("revenueGrowth")
+        if v is None:
+            return None
+        fv = _f(v)
+        if fv is None:
+            return None
+        return float(fv)
+    except Exception:
+        return None
+
+def _yf_eps_cagr_hist(tkr) -> Optional[float]:  # CHANGED / NEW
+    """
+    Hämtar earningsGrowth från Yahoo info (≈ senaste årets vinst-tillväxt).
+    Används som proxy för EPS CAGR i beräkningsmotorn.
+    """
+    if tkr is None:
+        return None
+    try:
+        info = tkr.info
+        v = info.get("earningsGrowth")
+        if v is None:
+            return None
+        fv = _f(v)
+        if fv is None:
+            return None
+        return float(fv)
+    except Exception:
+        return None
+
 # ------------------------------
 # Hämta ett paket för en ticker
 # ------------------------------
@@ -795,11 +834,13 @@ def yahoo_fetch_for_ticker(sym: str) -> Dict[str, Any]:
         "P/B": _yf_p_b(tkr),
         "BVPS": _yf_bvps(tkr),
         "Årlig utdelning": _yf_dividend_annual(tkr),
-        # Dessa lämnas orörda här (kan hämtas från andra källor / manuellt):
+        # CHANGED: nu fylls dessa från Yahoo (revenueGrowth / earningsGrowth)
+        "Rev CAGR": _yf_rev_cagr_hist(tkr),   # CHANGED
+        "EPS CAGR": _yf_eps_cagr_hist(tkr),   # CHANGED
+        # Resterande kan hämtas från andra källor / manuellt:
         "Net debt": None,
         "EPS 1Y": None, "EPS 2Y": None,
         "Rev 1Y": None, "Rev 2Y": None,
-        "Rev CAGR": None, "EPS CAGR": None,
         "Utdelning CAGR": None,
     }
     return out
@@ -880,6 +921,13 @@ def mass_update_from_yahoo(df: pd.DataFrame, idx_list: List[int], sleep_sec: flo
 #  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
 #  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
 #  - compute_fair_values_for_row() → kompakt DICT för UI
+#
+# Viktigt (uppdaterat):
+#  • P/E-ankaret bygger i första hand på PE FWD från Yahoo.
+#  • EPS 1Y / EPS 2Y hämtas i första hand från din rad (manuella estimat),
+#    annars från Yahoo-estimat om de finns.
+#  • Rev/EPS CAGR prioriterar värden som appen hämtar (y['rev_cagr_hist'],
+#    y['eps_cagr_hist']) om/när de börjar fyllas, annars tas värden i raden.
 # ============================================================
 
 # -------------------------
@@ -950,6 +998,10 @@ def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac
     return max(m, floor)
 
 def _pe_anchor(pe_ttm: Optional[float], pe_fwd: Optional[float], w_ttm: float) -> Optional[float]:
+    """
+    Ursprunglig blandning av TTM/FWD (behålls som fallback).
+    I compute_methods_for_row används numera PE FWD i första hand.
+    """
     pt = _pos(pe_ttm)
     pf = _pos(pe_fwd)
     if pt is None and pf is None:
@@ -1372,14 +1424,15 @@ def compute_methods_for_row(row: pd.Series,
     p_b        = _pos(_nz(y.get("p_b"), row.get("P/B")))
     bvps       = _pos(_nz(y.get("bvps"), row.get("BVPS")))
 
+    # Dina manuella EPS-estimat har prio, annars Yahoo-estimat
     eps_1y_est = _pos(_nz(row.get("EPS 1Y"), est.get("eps_1y")))
     eps_2y_est = _pos(_nz(row.get("EPS 2Y"), est.get("eps_2y")))
 
-    # Historisk CAGR (clamp)
-    rev_cagr_hist_raw = _f(_nz(row.get("Rev CAGR"), y.get("rev_cagr_hist")))
+    # Historisk CAGR (CLAMP) – nu med prio på värden hämtade av appen
+    rev_cagr_hist_raw = _f(_nz(y.get("rev_cagr_hist"), row.get("Rev CAGR")))
     rev_cagr_hist     = max(REV_CAGR_MIN, min(REV_CAGR_MAX, rev_cagr_hist_raw)) if rev_cagr_hist_raw is not None else None
 
-    eps_cagr_hist_raw = _f(_nz(row.get("EPS CAGR"), y.get("eps_cagr_hist")))
+    eps_cagr_hist_raw = _f(_nz(y.get("eps_cagr_hist"), row.get("EPS CAGR")))
     eps_cagr_hist     = max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_hist_raw)) if eps_cagr_hist_raw is not None else None
 
     eps_cagr_long = _f(est.get("eps_cagr_long"))
@@ -1394,7 +1447,12 @@ def compute_methods_for_row(row: pd.Series,
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
     decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # default 8% kompression/år
-    pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
+
+    # NY LOGIK: använd PE FWD i första hand, annars fallback till blandning
+    if pe_fwd is not None:
+        pe_anchor = pe_fwd
+    else:
+        pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
     # Tillämpa ev. P/E-tak för cykliska/crypto (enbart på ankaret)
     if pe_anchor is not None and pe_cap is not None:
@@ -1413,7 +1471,7 @@ def compute_methods_for_row(row: pd.Series,
         r2 = r1 * (1.0 + g)
         r3 = r2 * (1.0 + g)
 
-    # EPS-path
+    # EPS-path (TTM + dina estimat + CAGR)
     e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est,
                                     eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
 
