@@ -870,6 +870,16 @@ def mass_update_from_yahoo(df: pd.DataFrame, idx_list: List[int], sleep_sec: flo
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 3/6: Beräkningsmotor (auto-val av metod & riktkurser)
+#
+#  - fetch_from_yahoo(): wrapper runt yahoo_fetch_for_ticker (Del 2)
+#  - EPS-estimat från Yahoo (earnings_trend)
+#  - AUTO-PROFIL: väljer vilka metodfamiljer som passar (per sektor/mått)
+#  - Metodpriser: PE, EV/S, EV/EBITDA, P/B (+ placeholders för struktur)
+#  - Multipel-decay & PE-ankare
+#  - Fair Value = median över valda metodfamiljer (v3)
+#  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
+#  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
+#  - compute_fair_values_for_row() → kompakt DICT för UI
 # ============================================================
 
 # -------------------------
@@ -915,14 +925,14 @@ EPS_CAGR_MAX =  0.35   # +35 %
 # -------------------------
 def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac: float = 0.60) -> Optional[float]:
     """
-    CHANGED: Exponentiell kompression av multipel:
+    Exponentiell kompression av multipel:
       mult_y = mult0 * (1 - decay) ** years
     med golv på floor_frac * mult0.
     """
     m0 = _pos(mult0)
     if m0 is None:
         return None
-    try:
+    try:  # exponentiell decay i stället för linjär
         y = max(0, int(years))
         d = float(decay)
         factor = 1.0 - d
@@ -1106,6 +1116,7 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     """
     Returnerar vilka metodfamiljer som ska användas för FV-medianen.
     Familjer: 'pe', 'ev_s', 'ev_e', 'pb'
+    Beslut baseras på Sektor + måtttillgänglighet + tecken på tidigt skede.
     """
     sektor = str(_nz(row.get("Sektor"), "")).lower()
     ticker = str(_nz(row.get("Ticker"), "")).upper()
@@ -1142,18 +1153,26 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
 
     # Sektor-skift
     if is_financial or ticker in bdc_mreit_tickers:
+        # Finans/BDC/mREIT → P/B primärt, PE sekundärt (om lönsam), undvik EV-mått
         allow["ev_s"] = False
         allow["ev_e"] = False
+        # PE bara om positiv EPS
         allow["pe"] = allow["pe"] and (eps_ttm and eps_ttm > 0)
     elif is_reit:
+        # REIT/fastigheter → P/B + EV/EBITDA om möjligt, undvik EV/S
         allow["ev_s"] = False
+        # behåll pb & ev_e enligt data
     elif is_utility or is_energy or is_industrial:
+        # Tillgångstunga/cykliska → EV/EBITDA + PE; EV/S ok men inte primär
         pass
     elif is_tech or is_health:
+        # Tidigt skede/loss-making → EV/S prioriteras; PE om positiv EPS
         if not (eps_ttm and eps_ttm > 0):
             allow["pe"] = False
+        # EV/EBITDA kräver positiv EBITDA — redan hanterat via data
+    # Övriga sektorer → data-drivet som default
 
-    # Fallback
+    # Fallback: om allt råkar bli avstängt, försök välja ett rimligt spår
     if not any(allow.values()):
         if (rev_ttm is not None) and (ev_rev is not None):
             allow["ev_s"] = True
@@ -1180,6 +1199,18 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
 # Fair Value via familjemedian (v3 med filtrering)
 # -------------------------
 def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[float], allow_fams: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Median över *tillåtna* metodfamiljer:
+      • 'pe_hist_vs_eps'          → fam 'pe'
+      • 'ev_sales'                → fam 'ev_s'
+      • 'ev_ebitda','ev_dacf'     → fam 'ev_e' (en gång)
+      • 'p_b'                     → fam 'pb'
+    Regler:
+      • Dubbletter inom familj ignoreras.
+      • Endast familjer där allow_fams[fam] == True räknas.
+      • 'Idag': filtrera bort värden ≈ aktuell kurs (±0,5 %).
+        Fall-back till 'pe_hist_vs_eps' om allt filtreras bort och 'pe' är tillåten.
+    """
     fam_map = {
         "pe_hist_vs_eps": "pe",
         "ev_sales": "ev_s",
@@ -1205,6 +1236,7 @@ def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[flo
             v = _f(r.get(c))
             if v is None:
                 continue
+            # Filtrera kurs-kopior i "Idag"
             if c == "Idag" and _pos(now_price) and _pos(v):
                 if abs(v - float(now_price)) / float(now_price) <= 0.005:
                     continue
@@ -1212,6 +1244,7 @@ def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[flo
             vals.append(float(v))
 
         if not vals:
+            # Fall-back: PE-raden om den finns och 'pe' är tillåten
             try:
                 if allow_fams.get("pe", False):
                     row_pe = methods_df[methods_df["Metod"] == "pe_hist_vs_eps"].iloc[0]
@@ -1228,6 +1261,11 @@ def _compute_fair_value_row_v3(methods_df: pd.DataFrame, now_price: Optional[flo
 # Bucket → Margin of Safety
 # -------------------------
 def _mos_for_bucket(bucket_label: Any) -> float:
+    """
+    Returnerar MoS (0.05/0.08/0.12) enligt:
+      Bucket A → 5%, Bucket B → 8%, Bucket C → 12%.
+    Okänt → 8% (mitten).
+    """
     s = str(bucket_label or "").lower()
     if "bucket a" in s:
         return 0.05
@@ -1237,42 +1275,16 @@ def _mos_for_bucket(bucket_label: Any) -> float:
         return 0.12
     return 0.08
 
-def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool], primary_fam: Optional[str]) -> Dict[str, Any]:
+def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool]) -> Dict[str, Any]:
     """
-    CHANGED:
-    'Bästa scenario' = primary-familjens priser per horisont.
-    Om primary_fam saknas → max över alla tillåtna familjer (fallback).
+    'Bästa scenario' = max-pris över tillåtna familjer per horisont.
     """
-    fam_map = {
-        "pe_hist_vs_eps": "pe",
-        "ev_sales": "ev_s",
-        "ev_ebitda": "ev_e",
-        "ev_dacf": "ev_e",
-        "p_b": "pb",
-    }
+    fam_ok = {"pe_hist_vs_eps":"pe", "ev_sales":"ev_s", "ev_ebitda":"ev_e", "ev_dacf":"ev_e", "p_b":"pb"}
     cols = ["Idag", "1 år", "2 år", "3 år"]
     base = {"Metod": "best_case"}
-
     if methods_df is None or (hasattr(methods_df, "empty") and methods_df.empty):
         return {**base, **{c: np.nan for c in cols}}
-
-    def fam_of(m: str) -> str:
-        return fam_map.get(m, m)
-
-    # Vilka familjer ska tas med?
-    if primary_fam and allow_fams.get(primary_fam, False):
-        target_fams = {primary_fam}
-    else:
-        target_fams = {fam for fam, ok in allow_fams.items() if ok}
-
-    def include_row(m: str) -> bool:
-        fam = fam_of(m)
-        if fam not in target_fams:
-            return False
-        return allow_fams.get(fam, False)
-
-    sub = methods_df[methods_df["Metod"].map(lambda m: include_row(str(m)))].copy()
-
+    sub = methods_df[methods_df["Metod"].map(lambda m: allow_fams.get(fam_ok.get(str(m), ""), False))].copy()
     for c in cols:
         try:
             vals = [float(v) for v in sub[c].tolist() if _f(v) is not None]
@@ -1282,37 +1294,31 @@ def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool], primary
     return base
 
 # -------------------------
-# Sanity-clamp på framtida riktkurser
-# -------------------------
-def _clamp_future_targets(price: Optional[float],
-                          t1: Optional[float],
-                          t2: Optional[float],
-                          t3: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """
-    CHANGED: skyddar mot helt absurda riktkurser.
-      1 år: max 5× dagens kurs
-      2 år: max 8×
-      3 år: max 12×
-    Om price är None → ingen clamp.
-    """
-    p = _pos(price)
-    if p is None or p <= 0:
-        return t1, t2, t3
-
-    limits = (5.0, 8.0, 12.0)
-    ts = [t1, t2, t3]
-    out: List[Optional[float]] = []
-    for t, lim in zip(ts, limits):
-        if _pos(t) is None:
-            out.append(t)
-        else:
-            out.append(min(float(t), p * lim))
-    return out[0], out[1], out[2]
-
-# -------------------------
 # Huvud: compute_methods_for_row → DICT (auto-profil)
 # -------------------------
 def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = None, fx_map: Dict[str, float] | None = None) -> Dict[str, Any]:
+    """
+    Returnerar en DICT som funkar både för Ranking-sidan och analysvyer:
+      {
+        "Metod": "fair_value_v3_auto",
+        "target_today": float|None,  # = Fair Value idag (ingen MoS)
+        "target_1y":    float|None,  # = Best case 1y * (1 - MoS bucket)
+        "target_2y":    float|None,  # = Best case 2y * (1 - MoS bucket)
+        "target_3y":    float|None,  # = Best case 3y * (1 - MoS bucket)
+        "bull_1y": None, "bear_1y": None,
+        "method": "fair_value_v3_auto",
+        "Input-sammanfattning": "...",
+        "note": "",
+        "currency": "USD",
+        "price": 123.45,
+        "shares_out": ...,
+        "net_debt": ...,
+        "pe_anchor": ...,
+        "decay": ...,
+        "methods_df": <DataFrame>
+      }
+    Alla target i aktiens handelsvaluta.
+    """
     settings = settings or get_settings_map()
 
     ticker = str(row.get("Ticker", "")).strip()
@@ -1325,7 +1331,22 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     shares   = _pos(_nz(y.get("shares_out"), row.get("Utestående aktier")))
     net_debt = _nz(y.get("net_debt"), row.get("Net debt"))
 
-    rev_ttm    = _nz(y.get("rev_ttm"), row.get("Rev TTM"))
+    # --- Revenue: Yahoo i full skala, bladet i miljoner (TTM & estimat) ---
+    sheet_rev_ttm_m = _f(row.get("Rev TTM"))
+    sheet_rev_1y_m  = _f(row.get("Rev 1Y") or row.get("Rev 1y") or row.get("Revenue 1Y"))
+    sheet_rev_2y_m  = _f(row.get("Rev 2Y") or row.get("Rev 2y") or row.get("Revenue 2Y"))
+
+    def _millions_to_full(x: Optional[float]) -> Optional[float]:
+        return x * 1_000_000 if x is not None else None
+
+    sheet_rev_ttm_full = _millions_to_full(sheet_rev_ttm_m)
+    sheet_rev_1y_full  = _millions_to_full(sheet_rev_1y_m)
+    sheet_rev_2y_full  = _millions_to_full(sheet_rev_2y_m)
+
+    rev_ttm = _nz(y.get("rev_ttm"), sheet_rev_ttm_full)
+    rev_1y  = sheet_rev_1y_full
+    rev_2y  = sheet_rev_2y_full
+
     ebitda_ttm = _nz(y.get("ebitda_ttm"), row.get("EBITDA TTM"))
     eps_ttm    = _nz(y.get("eps_ttm"), row.get("EPS TTM"))
 
@@ -1352,26 +1373,30 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 
     # P/E-ankare + decay
     w_ttm = _f(settings.get("pe_anchor_weight_ttm", 0.50)) or 0.50
-    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # 8 % kompression/år
+    decay = _f(settings.get("multiple_decay", 0.08)) or 0.08  # default 8% kompression/år
     pe_anchor = _pe_anchor(pe_ttm, pe_fwd, w_ttm)
 
-    # Revenue-path
+    # Revenue-path: använd dina estimat först, annars historisk CAGR
     r0 = _pos(rev_ttm)
     if r0 is None:
         r1 = r2 = r3 = None
     else:
         g = float(_nz(rev_cagr_hist, 0.0))
-        r1 = r0 * (1.0 + g)
-        r2 = r1 * (1.0 + g)
+        r1 = _pos(rev_1y)
+        r2 = _pos(rev_2y)
+        if r1 is None:
+            r1 = r0 * (1.0 + g)
+        if r2 is None:
+            r2 = r1 * (1.0 + g)
         r3 = r2 * (1.0 + g)
 
     # EPS-path
     e0, e1, e2, e3 = _eps_path_fill(_f(eps_ttm), eps_1y_est, eps_2y_est, eps_cagr_hist, eps_cagr_long, rev_cagr_hist)
 
-    # EBITDA-path
+    # EBITDA-path (skala med intäkter)
     b0, b1, b2, b3 = _ebitda_path(_f(ebitda_ttm), r0, r1, r2, r3)
 
-    # Multiplar med decay
+    # Multiplar med decay (exponentiell)
     pe0  = pe_anchor
     pe1m = _decay_multiple(pe_anchor, 1, decay)
     pe2m = _decay_multiple(pe_anchor, 2, decay)
@@ -1381,12 +1406,11 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     eve0, eve1, eve2, eve3 = ev_ebitda, _decay_multiple(ev_ebitda, 1, decay), _decay_multiple(ev_ebitda, 2, decay), _decay_multiple(ev_ebitda, 3, decay)
     pb0,  pb1,  pb2,  pb3  = p_b,       _decay_multiple(p_b,       1, decay), _decay_multiple(p_b,       2, decay), _decay_multiple(p_b,       3, decay)
 
-    # --- AUTO-PROFIL ---
+    # --- AUTO-PROFIL: vilka familjer ska räknas in? ---
     profile = _auto_method_profile(row, y)
     allow_fams = profile["allow"]
-    primary_fam = profile.get("primary")
 
-    # --- Priser per metod ---
+    # --- Priser per metod (alla i aktiens valuta) ---
     methods = []
     methods.append({
         "Metod": "pe_hist_vs_eps",
@@ -1416,56 +1440,40 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
         "2 år": _price_from_pb(pb2, bvps),
         "3 år": _price_from_pb(pb3, bvps),
     })
+    # Platshållare för struktur
     for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
         methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
     methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
-    # --- Fair Value idag ---
+    # --- Fair Value (familjemedian, filtrerad av auto-profil) = IDAG ---
     fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams)
+    # --- Bästa scenario (max per horisont över tillåtna familjer) ---
+    best_row = _best_case_row(methods_df, allow_fams)
 
-    # --- Bästa scenario (primary-familj) ---
-    best_row = _best_case_row(methods_df, allow_fams, primary_fam)
-
-    # --- MoS per bucket ---
+    # --- Margin of Safety per bucket för framtiden ---
     bucket_label = str(_nz(row.get("Bucket"), "") or "")
     mos = _mos_for_bucket(bucket_label)
-
     best_mos_row = {
         "Metod": "best_case_MoS",
-        "Idag": _f(fv_row.get("Idag")),
+        "Idag": _f(fv_row.get("Idag")),  # ingen MoS på dagens fair value
         "1 år": (_f(best_row.get("1 år")) * (1.0 - mos)) if _f(best_row.get("1 år")) is not None else np.nan,
         "2 år": (_f(best_row.get("2 år")) * (1.0 - mos)) if _f(best_row.get("2 år")) is not None else np.nan,
         "3 år": (_f(best_row.get("3 år")) * (1.0 - mos)) if _f(best_row.get("3 år")) is not None else np.nan,
     }
 
-    # --- Clamp mot aktuell kurs (sanity) ---
-    target_today = _f(fv_row.get("Idag"))
-    t1 = _f(best_mos_row.get("1 år"))
-    t2 = _f(best_mos_row.get("2 år"))
-    t3 = _f(best_mos_row.get("3 år"))
-    t1, t2, t3 = _clamp_future_targets(price, t1, t2, t3)
-    best_mos_row["1 år"] = t1
-    best_mos_row["2 år"] = t2
-    best_mos_row["3 år"] = t3
+    # Sätt ihop metodtabellen i tydlig ordning
+    methods_df = pd.concat([pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df], ignore_index=True)
 
-    # Sätt ihop metodtabellen
-    methods_df = pd.concat(
-        [pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df],
-        ignore_index=True
-    )
-
-    # --- Sanity-text ---
+    # --- Sanity-text (ASCII) ---
     sanity = (
         f"price={'ok' if price else '-'}, "
         f"eps_ttm={'ok' if (eps_ttm or eps_ttm==0) else '-'}, "
         f"eps_1y={'ok' if eps_1y_est else '-'}, "
         f"eps_2y={'ok' if eps_2y_est else '-'}, "
         f"rev_ttm={'ok' if rev_ttm else '-'}, "
-        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '-'}"
-        f"(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
-        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}"
-        f"(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
+        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '-'}(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
+        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
         f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm==0) else '-'}, "
         f"shares={'ok' if shares else '-'}, "
         f"pe_anchor={round(pe_anchor,2) if pe_anchor else '-'}, decay={decay}, "
@@ -1473,18 +1481,19 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
         f"{profile['why']}"
     )
 
-    # --- Targets som används i UI ---
-    target_1y = t1
-    target_2y = t2
-    target_3y = t3
+    # --- Targets att skriva till Data-bladet ---
+    target_today = _f(fv_row.get("Idag"))
+    target_1y    = _f(best_mos_row.get("1 år")) if _f(best_mos_row.get("1 år")) is not None else _f(fv_row.get("1 år"))
+    target_2y    = _f(best_mos_row.get("2 år")) if _f(best_mos_row.get("2 år")) is not None else _f(fv_row.get("2 år"))
+    target_3y    = _f(best_mos_row.get("3 år")) if _f(best_mos_row.get("3 år")) is not None else _f(fv_row.get("3 år"))
 
     payload: Dict[str, Any] = {
         "Metod": "fair_value_v3_auto",
         "method": "fair_value_v3_auto",
-        "target_today": target_today,
-        "target_1y":    target_1y,
-        "target_2y":    target_2y,
-        "target_3y":    target_3y,
+        "target_today": target_today,  # Fair value idag (ingen MoS)
+        "target_1y":    target_1y,     # Best case – MoS
+        "target_2y":    target_2y,     # Best case – MoS
+        "target_3y":    target_3y,     # Best case – MoS
         "bull_1y": None,
         "bear_1y": None,
         "Input-sammanfattning": sanity,
@@ -1503,6 +1512,20 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 # Kompakt extraktor (FV) för UI
 # -------------------------
 def compute_fair_values_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float]) -> Dict[str, Any]:
+    """
+    Beräknar metoder för en rad och returnerar en kompakt dict för UI:
+      {
+        'ticker': 'AAPL',
+        'price':  195.12,
+        'currency': 'USD',
+        'fv_today':  Fair Value idag (utan MoS),
+        'fv_1y':     Best case 1y – MoS(bucket),
+        'fv_2y':     Best case 2y – MoS(bucket),
+        'fv_3y':     Best case 3y – MoS(bucket),
+        'sanity': '...',
+        'methods_df': <DataFrame>
+      }
+    """
     payload = compute_methods_for_row(row, settings, fx_map)
     return {
         "ticker": str(row.get("Ticker") or "").upper(),
