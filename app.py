@@ -877,7 +877,7 @@ def mass_update_from_yahoo(df: pd.DataFrame, idx_list: List[int], sleep_sec: flo
 #  - Metodpriser: PE, EV/S, EV/EBITDA, P/B (+ placeholders för struktur)
 #  - Multipel-decay & PE-ankare
 #  - Fair Value = median över valda metodfamiljer (v3)
-#  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
+#  - Riktkurser 1–3 år = primary-metod med MoS per bucket (A 5%, B 8%, C 12%)
 #  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
 #  - compute_fair_values_for_row() → kompakt DICT för UI
 # ============================================================
@@ -925,14 +925,14 @@ EPS_CAGR_MAX =  0.35   # +35 %
 # -------------------------
 def _decay_multiple(mult0: Optional[float], years: int, decay: float, floor_frac: float = 0.60) -> Optional[float]:
     """
-    Exponentiell kompression av multipel:
+    CHANGED: Exponentiell kompression av multipel:
       mult_y = mult0 * (1 - decay) ** years
     med golv på floor_frac * mult0.
     """
     m0 = _pos(mult0)
     if m0 is None:
         return None
-    try:  # CHANGED: exponentiell decay i stället för linjär
+    try:
         y = max(0, int(years))
         d = float(decay)
         factor = 1.0 - d
@@ -1114,7 +1114,7 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
 # -------------------------
 def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returnerar vilka metodfamiljer som ska användas för FV-medianen.
+    Returnerar vilka metodfamiljer som ska användas.
     Familjer: 'pe', 'ev_s', 'ev_e', 'pb'
     Beslut baseras på Sektor + måtttillgänglighet + tecken på tidigt skede.
     """
@@ -1156,12 +1156,10 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         # Finans/BDC/mREIT → P/B primärt, PE sekundärt (om lönsam), undvik EV-mått
         allow["ev_s"] = False
         allow["ev_e"] = False
-        # PE bara om positiv EPS
         allow["pe"] = allow["pe"] and (eps_ttm and eps_ttm > 0)
     elif is_reit:
         # REIT/fastigheter → P/B + EV/EBITDA om möjligt, undvik EV/S
         allow["ev_s"] = False
-        # behåll pb & ev_e enligt data
     elif is_utility or is_energy or is_industrial:
         # Tillgångstunga/cykliska → EV/EBITDA + PE; EV/S ok men inte primär
         pass
@@ -1169,7 +1167,6 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         # Tidigt skede/loss-making → EV/S prioriteras; PE om positiv EPS
         if not (eps_ttm and eps_ttm > 0):
             allow["pe"] = False
-        # EV/EBITDA kräver positiv EBITDA — redan hanterat via data
     # Övriga sektorer → data-drivet som default
 
     # Fallback: om allt råkar bli avstängt, försök välja ett rimligt spår
@@ -1275,16 +1272,44 @@ def _mos_for_bucket(bucket_label: Any) -> float:
         return 0.12
     return 0.08
 
-def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool]) -> Dict[str, Any]:
+def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str,bool], primary_fam: Optional[str]) -> Dict[str, Any]:
     """
-    'Bästa scenario' = max-pris över tillåtna familjer per horisont.
+    CHANGED:
+    'Bästa scenario' = primary-familjens prisbana per horisont.
+      • Om primary_fam finns och är tillåten → använd endast den familjen.
+      • Annars fall-back till max över tillåtna familjer (gammal logik).
     """
-    fam_ok = {"pe_hist_vs_eps":"pe", "ev_sales":"ev_s", "ev_ebitda":"ev_e", "ev_dacf":"ev_e", "p_b":"pb"}
+    fam_map = {
+        "pe_hist_vs_eps": "pe",
+        "ev_sales": "ev_s",
+        "ev_ebitda": "ev_e",
+        "ev_dacf": "ev_e",
+        "p_b": "pb",
+    }
     cols = ["Idag", "1 år", "2 år", "3 år"]
     base = {"Metod": "best_case"}
+
     if methods_df is None or (hasattr(methods_df, "empty") and methods_df.empty):
         return {**base, **{c: np.nan for c in cols}}
-    sub = methods_df[methods_df["Metod"].map(lambda m: allow_fams.get(fam_ok.get(str(m), ""), False))].copy()
+
+    def fam_of(m: str) -> str:
+        return fam_map.get(m, m)
+
+    # Bestäm vilken familj vi filtrerar på
+    if primary_fam and allow_fams.get(primary_fam, False):
+        target_fams = {primary_fam}
+    else:
+        # fall-back: alla tillåtna familjer
+        target_fams = {fam for fam, ok in allow_fams.items() if ok}
+
+    def include_row(m: str) -> bool:
+        fam = fam_of(m)
+        if fam not in target_fams:
+            return False
+        return allow_fams.get(fam, False)
+
+    sub = methods_df[methods_df["Metod"].map(lambda m: include_row(str(m)))].copy()
+
     for c in cols:
         try:
             vals = [float(v) for v in sub[c].tolist() if _f(v) is not None]
@@ -1302,20 +1327,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
       {
         "Metod": "fair_value_v3_auto",
         "target_today": float|None,  # = Fair Value idag (ingen MoS)
-        "target_1y":    float|None,  # = Best case 1y * (1 - MoS bucket)
-        "target_2y":    float|None,  # = Best case 2y * (1 - MoS bucket)
-        "target_3y":    float|None,  # = Best case 3y * (1 - MoS bucket)
-        "bull_1y": None, "bear_1y": None,
-        "method": "fair_value_v3_auto",
-        "Input-sammanfattning": "...",
-        "note": "",
-        "currency": "USD",
-        "price": 123.45,
-        "shares_out": ...,
-        "net_debt": ...,
-        "pe_anchor": ...,
-        "decay": ...,
-        "methods_df": <DataFrame>
+        "target_1y":    float|None,  # = primary-familj 1y * (1 - MoS bucket)
+        "target_2y":    float|None,  # = primary-familj 2y * (1 - MoS bucket)
+        "target_3y":    float|None,  # = primary-familj 3y * (1 - MoS bucket)
+        ...
       }
     Alla target i aktiens handelsvaluta.
     """
@@ -1390,6 +1405,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     # --- AUTO-PROFIL: vilka familjer ska räknas in? ---
     profile = _auto_method_profile(row, y)
     allow_fams = profile["allow"]
+    primary_fam = profile.get("primary")
 
     # --- Priser per metod (alla i aktiens valuta) ---
     methods = []
@@ -1429,8 +1445,9 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 
     # --- Fair Value (familjemedian, filtrerad av auto-profil) = IDAG ---
     fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams)
-    # --- Bästa scenario (max per horisont över tillåtna familjer) ---
-    best_row = _best_case_row(methods_df, allow_fams)
+
+    # --- Bästa scenario (primary-familj) ---
+    best_row = _best_case_row(methods_df, allow_fams, primary_fam)
 
     # --- Margin of Safety per bucket för framtiden ---
     bucket_label = str(_nz(row.get("Bucket"), "") or "")
@@ -1444,7 +1461,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
     }
 
     # Sätt ihop metodtabellen i tydlig ordning
-    methods_df = pd.concat([pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df], ignore_index=True)
+    methods_df = pd.concat(
+        [pd.DataFrame([fv_row]), pd.DataFrame([best_row]), pd.DataFrame([best_mos_row]), methods_df],
+        ignore_index=True
+    )
 
     # --- Sanity-text (ASCII) ---
     sanity = (
@@ -1453,8 +1473,10 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
         f"eps_1y={'ok' if eps_1y_est else '-'}, "
         f"eps_2y={'ok' if eps_2y_est else '-'}, "
         f"rev_ttm={'ok' if rev_ttm else '-'}, "
-        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '-'}(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
-        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
+        f"rev_cagr_hist={'ok' if _f(rev_cagr_hist) is not None else '-'}"
+        f"(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
+        f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}"
+        f"(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
         f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm==0) else '-'}, "
         f"shares={'ok' if shares else '-'}, "
         f"pe_anchor={round(pe_anchor,2) if pe_anchor else '-'}, decay={decay}, "
@@ -1472,9 +1494,9 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
         "Metod": "fair_value_v3_auto",
         "method": "fair_value_v3_auto",
         "target_today": target_today,  # Fair value idag (ingen MoS)
-        "target_1y":    target_1y,     # Best case – MoS
-        "target_2y":    target_2y,     # Best case – MoS
-        "target_3y":    target_3y,     # Best case – MoS
+        "target_1y":    target_1y,     # primary-familj – MoS
+        "target_2y":    target_2y,
+        "target_3y":    target_3y,
         "bull_1y": None,
         "bear_1y": None,
         "Input-sammanfattning": sanity,
@@ -1494,18 +1516,7 @@ def compute_methods_for_row(row: pd.Series, settings: Dict[str, str] | None = No
 # -------------------------
 def compute_fair_values_for_row(row: pd.Series, settings: Dict[str, str], fx_map: Dict[str, float]) -> Dict[str, Any]:
     """
-    Beräknar metoder för en rad och returnerar en kompakt dict för UI:
-      {
-        'ticker': 'AAPL',
-        'price':  195.12,
-        'currency': 'USD',
-        'fv_today':  Fair Value idag (utan MoS),
-        'fv_1y':     Best case 1y – MoS(bucket),
-        'fv_2y':     Best case 2y – MoS(bucket),
-        'fv_3y':     Best case 3y – MoS(bucket),
-        'sanity': '...',
-        'methods_df': <DataFrame>
-      }
+    Beräknar metoder för en rad och returnerar en kompakt dict för UI.
     """
     payload = compute_methods_for_row(row, settings, fx_map)
     return {
@@ -1751,6 +1762,7 @@ def render_ranking_view(df: pd.DataFrame, settings: Dict[str, str], fx_map: Dict
     st.dataframe(df, use_container_width=True)
 
 # (Slut Del 4/6)
+
 # ============================================================
 # app.py — Aktieanalys & investeringsförslag
 # Del 5/6: Settings, Snapshot, Editor, Lägg till, Portfölj,
