@@ -148,12 +148,67 @@ def page_settings() -> None:
 
 
 # ============================================================
-# 🕒 Snapshot (read-only)
+# 🕒 Snapshot (read-only + auto-snapshot vid start)
 # ============================================================
+def _create_snapshot_on_start() -> None:
+    """
+    Skapar en snapshot av DATA-bladet vid app-start.
+    - Kopierar hela DATA till SNAPSHOT-bladet
+    - Lägger till kolumn '_SNAPSHOT_TS' med timestamp
+    - Max 10 snapshots behålls (äldsta rensas när ny skapas)
+    """
+    try:
+        base = read_data_df()
+    except Exception:
+        return
+
+    if base is None or base.empty:
+        return
+
+    snap_existing = _read_df(SNAPSHOT_TITLE)
+    if snap_existing is None or snap_existing.empty:
+        snap_existing = pd.DataFrame()
+
+    snap_ts = now_stamp()
+    base_copy = base.copy()
+    # Lägg till snapshot-timestamp längst fram
+    base_copy.insert(0, "_SNAPSHOT_TS", snap_ts)
+
+    # Om befintlig snapshot-sida saknar kolumnen, lägg till den
+    if not snap_existing.empty and "_SNAPSHOT_TS" not in snap_existing.columns:
+        snap_existing["_SNAPSHOT_TS"] = np.nan
+
+    if snap_existing is None or snap_existing.empty:
+        merged = base_copy
+    else:
+        merged = pd.concat([snap_existing, base_copy], ignore_index=True)
+
+    # Begränsa till max 10 snapshots baserat på unika _SNAPSHOT_TS
+    if "_SNAPSHOT_TS" in merged.columns:
+        ts_series = merged["_SNAPSHOT_TS"].astype(str)
+        # Bevara ordningen: äldsta först, senaste sist
+        unique_ts = list(dict.fromkeys(ts_series.tolist()))
+        if len(unique_ts) > 10:
+            keep = set(unique_ts[-10:])
+            merged = merged[ts_series.isin(keep)].reset_index(drop=True)
+
+    _write_df(SNAPSHOT_TITLE, merged)
+
+
+# Kör snapshot en gång per session när modulen laddas
+if "_SNAPSHOT_DONE" not in st.session_state:
+    try:
+        _create_snapshot_on_start()
+    except Exception:
+        # Tysta fel – vi vill inte krascha appen på grund av snapshot
+        pass
+    st.session_state["_SNAPSHOT_DONE"] = True
+
+
 def page_snapshot() -> None:
     st.header("🕒 Snapshot")
     snap = _read_df(SNAPSHOT_TITLE)
-    if snap.empty:
+    if snap is None or snap.empty:
         st.info("Inga snapshots ännu.")
         return
     _show_df(snap, height=420, use_container_width=True)
@@ -520,7 +575,6 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         })
     out = pd.DataFrame(rows, columns=cols)
     return out
-
 
 def _guess_frequency(freq_raw: Any) -> Optional[int]:
     if freq_raw is None:
@@ -1107,6 +1161,9 @@ def page_portfolio() -> None:
 
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
+#   - Uppdatera alla bolag
+#   - Endast innehav (antal aktier > 0)
+//   - En eller flera Buckets
 # ============================================================
 def page_batch() -> None:
     st.header("🧩 Massuppdatering (Yahoo) — 1s per bolag")
@@ -1115,9 +1172,62 @@ def page_batch() -> None:
         st.info("Data-bladet är tomt.")
         return
 
-    tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
-    sel = st.multiselect("Välj tickers (tom = alla)", options=tickers, default=[])
-    target = tickers if len(sel) == 0 else sel
+    base = df.copy()
+
+    # Välj urvalstyp
+    mode = st.radio(
+        "Vad vill du uppdatera?",
+        ["Alla bolag", "Endast innehav", "Välj bucket(s)"],
+        index=0,
+        horizontal=False,
+    )
+
+    # Filtrera baserat på urvalstyp
+    if mode == "Endast innehav":
+        qty_col = None
+        for cand in ("Antal aktier", "Antal", "Shares"):
+            if cand in base.columns:
+                qty_col = cand
+                break
+        if qty_col is not None:
+            base[qty_col] = pd.to_numeric(base[qty_col], errors="coerce")
+            base = base[base[qty_col] > 0].copy()
+        else:
+            st.warning("Hittade ingen kolumn för antal aktier – kan inte filtrera på innehav.")
+    elif mode == "Välj bucket(s)":
+        bucket_series = base.get("Bucket", pd.Series([], dtype=object))
+        bucket_all = sorted(
+            {
+                str(b)
+                for b in bucket_series.dropna().tolist()
+                if str(b).strip()
+            }
+        )
+        if not bucket_all:
+            st.info("Inga Buckets hittades i Data-bladet.")
+        buckets_sel = st.multiselect(
+            "Välj bucket(s) att uppdatera",
+            options=bucket_all,
+            default=bucket_all,
+        )
+        if buckets_sel:
+            base = base[base["Bucket"].astype(str).isin(buckets_sel)].copy()
+        else:
+            base = base.iloc[0:0].copy()  # tomt urval om inget valt
+
+    # Nuvarande ticker-universum efter filtrering
+    if base.empty:
+        st.info("Inga bolag matchar urvalet.")
+        return
+
+    tickers_universe = sorted(base["Ticker"].dropna().astype(str).unique().tolist())
+
+    sel = st.multiselect(
+        "Välj tickers (tom = alla i urvalet ovan)",
+        options=tickers_universe,
+        default=[],
+    )
+    target = tickers_universe if len(sel) == 0 else sel
 
     delay = st.slider("Fördröjning per bolag (sek)", 0.5, 5.0, 1.0, 0.5)
     go = st.button("🚀 Starta")
@@ -1151,10 +1261,10 @@ def page_batch() -> None:
                     df_cur.at[idx, k] = v
                     changed_total += 1
             else:
-                base = {c: np.nan for c in DATA_COLUMNS}
-                base.update({"Timestamp": now_stamp(), "Ticker": tkr})
-                base.update(updates)
-                df_cur = pd.concat([df_cur, pd.DataFrame([base])], ignore_index=True)
+                base_row = {c: np.nan for c in DATA_COLUMNS}
+                base_row.update({"Timestamp": now_stamp(), "Ticker": tkr})
+                base_row.update(updates)
+                df_cur = pd.concat([df_cur, pd.DataFrame([base_row])], ignore_index=True)
                 changed_total += len(updates)
         except Exception as e:
             st.error(f"{tkr}: {e}")
