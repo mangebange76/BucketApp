@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core_utils import _f, _pos, _nz, now_stamp
+from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
 from sheets_io import (
     _read_df,
     _write_df,
@@ -24,7 +24,6 @@ from sheets_io import (
     SETTINGS_COLUMNS,
     SETTINGS_TITLE,
     SNAPSHOT_TITLE,
-    DEFAULT_BUCKETS,
 )
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
 
@@ -609,7 +608,7 @@ def build_next_dividends_table(
 
     df = pd.DataFrame(
         rows,
-        columns=[
+        columns[
             "Datum",
             "Ticker",
             "Valuta",
@@ -944,7 +943,7 @@ def build_buy_suggestions(
     out = out.sort_values(
         ["Slack till cap (SEK)", "Uppsida (%)"],
         ascending=[False, False],
-    ).reset_index(drop=True)
+    ).reset_index(drop_due=True)
     return out
 
 
