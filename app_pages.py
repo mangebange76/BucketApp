@@ -903,6 +903,9 @@ def build_buy_suggestions(
         "Värde (SEK)",
         "Cap per innehav (SEK)",
         "Slack till cap (SEK)",
+        "Bra köp-nivå",
+        "Fyndläge-nivå",
+        "Köpzon",
     ]
     if df_data is None or df_data.empty:
         return pd.DataFrame(columns=cols_out)
@@ -923,6 +926,7 @@ def build_buy_suggestions(
             if not bucket:
                 continue
 
+            # Bucket-filter
             if bucket_filter and bucket_filter != "Alla" and bucket != bucket_filter:
                 continue
 
@@ -941,9 +945,9 @@ def build_buy_suggestions(
             name = str(_nz(r.get("Bolagsnamn"), ""))
 
             fv_today = _f(payload.get("target_today"))
-            fv_1y = _f(payload.get("target_1y"))
-            fv_2y = _f(payload.get("target_2y"))
-            fv_3y = _f(payload.get("target_3y"))
+            fv_1y    = _f(payload.get("target_1y"))
+            fv_2y    = _f(payload.get("target_2y"))
+            fv_3y    = _f(payload.get("target_3y"))
 
             fv_map = {
                 "Idag": fv_today,
@@ -956,9 +960,11 @@ def build_buy_suggestions(
             if not _pos(fv_active):
                 continue
 
+            # Endast bolag där kursen är under vald FV-horisont
             if not (price < fv_active):
                 continue
 
+            # Hur många äger vi / värde idag?
             entry = lu.get(
                 tkr,
                 {
@@ -979,13 +985,33 @@ def build_buy_suggestions(
             fx = _fx_rate_to_sek(ccy, fx_map)
             value_sek = float((price or 0.0) * (qty or 0.0) * fx)
 
-            # Om cap är oändlig → treat som obegränsad (ingen blockering)
+            # Respektera Bucket-cap: inget förslag om vi redan ligger över cap
             if math.isfinite(cap) and _pos(value_sek) and value_sek >= cap:
                 continue
 
+            # Uppsida mot vald FV-horisont
             up_pct: Optional[float] = None
             if _pos(price) and _pos(fv_active):
                 up_pct = (fv_active - price) / price * 100.0
+
+            # 🔹 Nya nivåer: bra köp / fyndläge utifrån vald FV-horisont
+            bra_level: Optional[float] = None
+            fynd_level: Optional[float] = None
+            zone: str = ""
+
+            if _pos(fv_active):
+                fa = float(fv_active)
+                bra_level = fa * 0.80
+                fynd_level = fa * 0.65
+
+                if _pos(price):
+                    pval = float(price)
+                    if fynd_level is not None and pval <= fynd_level:
+                        zone = "Fyndläge"
+                    elif bra_level is not None and pval <= bra_level:
+                        zone = "Bra köp"
+                    else:
+                        zone = "Under FV"
 
             rows.append({
                 "Ticker": tkr,
@@ -1002,6 +1028,9 @@ def build_buy_suggestions(
                 "Värde (SEK)": value_sek or 0.0,
                 "Cap per innehav (SEK)": cap,
                 "Slack till cap (SEK)": (cap - (value_sek or 0.0)) if math.isfinite(cap) else None,
+                "Bra köp-nivå": bra_level,
+                "Fyndläge-nivå": fynd_level,
+                "Köpzon": zone,
             })
         except Exception:
             continue
@@ -1103,7 +1132,7 @@ def build_sell_suggestions(
 
 
 def page_buy_suggestions() -> None:
-    st.header("🛒 Köpförslag & säljförslag (läser Data-bladet)")
+    st.header("🛒 Köp-/säljförslag (läser Data-bladet)")
     df = st.session_state.get("DATA")
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         df = read_data_df()
@@ -1150,8 +1179,12 @@ def page_buy_suggestions() -> None:
 
     st.caption(
         f"Köpförslag visar bolag där aktuell kurs är lägre än riktkurs för **vald horisont** "
-        f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket. "
-        f"Om ingen cap hittas i Settings behandlas den bucketen som 'obegränsad'."
+        f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket.\n\n"
+        f"Om ingen cap hittas i Settings behandlas den bucketen som **obegränsad**.\n\n"
+        f"Kolumnen **Köpzon** använder samma horisont och markerar:\n"
+        f"- **Fyndläge** ≈ pris ≤ 65 % av FV\n"
+        f"- **Bra köp** ≈ pris ≤ 80 % av FV\n"
+        f"- **Under FV** = mellan 80–100 % av FV"
     )
 
     with st.spinner("Bygger köpförslag…"):
@@ -1177,20 +1210,25 @@ def page_buy_suggestions() -> None:
         )
         show = sug.copy()
 
+        # Pris & FV-kolumner
         if "Kurs" in show.columns:
             show["Kurs"] = show["Kurs"].map(
                 lambda v: "" if _f(v) is None else f"{float(v):.2f}"
             )
-        for c in ("FV idag", "FV 1 år", "FV 2 år", "FV 3 år"):
+        for c in ("FV idag", "FV 1 år", "FV 2 år", "FV 3 år", "Bra köp-nivå", "Fyndläge-nivå"):
             if c in show.columns:
                 show[c] = show[c].map(
                     lambda v: "" if _f(v) is None else f"{float(v):.2f}"
                 )
+
+        # SEK-belopp
         for c in ("Värde (SEK)", "Cap per innehav (SEK)", "Slack till cap (SEK)"):
             if c in show.columns:
                 show[c] = show[c].map(
                     lambda v: "" if _f(v) is None else f"{float(v):.2f}"
                 )
+
+        # Uppsida i %
         if "Uppsida (%)" in show.columns:
             show["Uppsida (%)"] = show["Uppsida (%)"].map(
                 lambda v: f"{v:.1f}%" if v is not None else "—"
