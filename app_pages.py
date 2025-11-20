@@ -1145,5 +1145,3 @@ def page_buy_suggestions() -> None:
                     lambda v: "" if _f(v) is None else f"{float(v):.2f}"
                 )
         _show_df(show_s, height=360, use_container_width=True)
-import streamlit as st
-import pandas as pd
