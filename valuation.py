@@ -761,14 +761,26 @@ def compute_fair_values_for_row(
     fx_map: Dict[str, float],
 ) -> Dict[str, Any]:
     payload = compute_methods_for_row(row, settings, fx_map)
+
+    fv_today = _f(payload.get("target_today"))
+    fv_1y    = _f(payload.get("target_1y"))
+    fv_2y    = _f(payload.get("target_2y"))
+    fv_3y    = _f(payload.get("target_3y"))
+
+    # Nya nivåer runt FV idag
+    bra_kop_niva  = fv_today * 0.80 if fv_today is not None else None
+    fyndlage_niva = fv_today * 0.65 if fv_today is not None else None
+
     return {
-        "ticker": str(row.get("Ticker") or "").upper(),
-        "price": _f(payload.get("price")),
+        "ticker":   str(row.get("Ticker") or "").upper(),
+        "price":    _f(payload.get("price")),
         "currency": (payload.get("currency") or "USD"),
-        "fv_today": _f(payload.get("target_today")),
-        "fv_1y": _f(payload.get("target_1y")),
-        "fv_2y": _f(payload.get("target_2y")),
-        "fv_3y": _f(payload.get("target_3y")),
-        "sanity": payload.get("Input-sammanfattning", ""),
+        "fv_today": fv_today,
+        "fv_1y":    fv_1y,
+        "fv_2y":    fv_2y,
+        "fv_3y":    fv_3y,
+        "bra_kop_niva":  bra_kop_niva,
+        "fyndlage_niva": fyndlage_niva,
+        "sanity":   payload.get("Input-sammanfattning", ""),
         "methods_df": payload.get("methods_df"),
     }
