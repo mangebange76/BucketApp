@@ -1,15 +1,29 @@
-# app.py – huvudfil (enbart router + grund-setup)
+# app.py — Aktieanalys & investeringsförslag (modul-variant)
+# ----------------------------------------------------------
+# Den här filen är bara "router" + två tunna page-wrappers:
+#  - page_analysis()  → använder render_analysis_view() i analysis_ui.py
+#  - page_ranking()   → använder render_ranking_view()  i analysis_ui.py
+#
+# All logik för:
+#  - helpers/konstanter/FX/Settings/Data I/O  → core_utils.py + sheets_io.py
+#  - Yahoo-hämtning + fair value-beräkningar  → yahoo_fetch.py + valuation.py
+#  - UI för Editor / Lägg till / Portfölj /
+#    Massuppdatering / Köpförslag & säljförslag → app_pages.py
+#  - Analys- & ranking-tabeller               → analysis_ui.py
+# ----------------------------------------------------------
 
 from __future__ import annotations
 
+# Standard
+from typing import Any, Dict
+import pandas as pd
 import streamlit as st
 
-# Våra egna moduler
-from core_utils import get_fx_map, get_settings_map
-from sheets_io import read_data_df
+# Egna moduler
+from core_utils import get_fx_map, _load_data_into_session  # wrappers mot sheets_io
+from sheets_io import read_data_df, get_settings_map
+from analysis_ui import render_analysis_view, render_ranking_view
 from app_pages import (
-    page_analysis,
-    page_ranking,
     page_buy_suggestions,
     page_editor,
     page_add_ticker,
@@ -19,33 +33,72 @@ from app_pages import (
     page_snapshot,
 )
 
+
 # =========================
-# UI & Grundinställningar
+# Page-wrappers för Analys & Ranking
 # =========================
-st.set_page_config(
-    page_title="Aktieanalys & investeringsförslag",
-    layout="wide",
-)
-st.markdown("<style>section.main > div {max-width: 1500px;}</style>", unsafe_allow_html=True)
+
+def page_analysis() -> None:
+    """Analys-vy: enskild ticker med fair value + metodtabell."""
+    st.header("📊 Analys – enskild ticker")
+
+    df = st.session_state.get("DATA")
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        df = read_data_df()
+        st.session_state["DATA"] = df
+
+    if df is None or df.empty:
+        st.warning("Ingen data att analysera. Fyll på Data-bladet först.")
+        return
+
+    settings = get_settings_map()
+    fx_map = st.session_state.get("FX") or get_fx_map()
+    st.session_state["FX"] = fx_map
+
+    render_analysis_view(df, settings, fx_map)
 
 
-def _ensure_session_data():
-    """Se till att DATA, FX och SETTINGS finns i session_state."""
-    if "DATA" not in st.session_state:
-        st.session_state["DATA"] = read_data_df()
-    if "FX" not in st.session_state:
-        st.session_state["FX"] = get_fx_map()
-    if "SETTINGS_MAP" not in st.session_state:
-        st.session_state["SETTINGS_MAP"] = get_settings_map()
+def page_ranking() -> None:
+    """Ranking-vy: lista över tickers sorterat på uppsida."""
+    st.header("🏆 Ranking – uppsida per ticker")
+
+    df = st.session_state.get("DATA")
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        df = read_data_df()
+        st.session_state["DATA"] = df
+
+    if df is None or df.empty:
+        st.warning("Ingen data att ranka. Fyll på Data-bladet först.")
+        return
+
+    settings = get_settings_map()
+    fx_map = st.session_state.get("FX") or get_fx_map()
+    st.session_state["FX"] = fx_map
+
+    render_ranking_view(df, settings, fx_map)
 
 
-def main():
+# =========================
+# MAIN
+# =========================
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Aktieanalys & investeringsförslag",
+        layout="wide",
+    )
+    st.markdown("<style>section.main > div {max-width: 1500px;}</style>", unsafe_allow_html=True)
+
     st.title("📈 Aktieanalys & investeringsförslag")
 
-    _ensure_session_data()
+    # Se till att DATA finns i session
+    _load_data_into_session()
+    if "FX" not in st.session_state:
+        st.session_state["FX"] = get_fx_map()
 
     # Sidebar-navigering
     st.sidebar.markdown("## 🧭 Navigering")
+
     page = st.sidebar.radio(
         "Välj vy",
         [
