@@ -29,6 +29,64 @@ from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_meth
 
 
 # -------------------------
+# Autosnapshot vid appstart (max 10 snapshots)
+# -------------------------
+def _auto_snapshot_on_import() -> None:
+    """
+    Skapar en snapshot av Data-bladet vid första import av denna modul.
+    - Läser 'Data' via read_data_df()
+    - Lägger in kolumn 'Snapshot TS' med tidsstämpel
+    - Append:ar till SNAPSHOT_TITLE-bladet
+    - Behåller max 10 unika snapshot-tidsstämplar (äldsta tas bort)
+    Körs EN gång per Python-process (modul-import), vilket i Streamlit
+    motsvarar "appstart" snarare än varje rerun.
+    """
+    try:
+        df = read_data_df()
+        if df is None or df.empty:
+            return
+
+        ts = now_stamp()
+        df_add = df.copy()
+        df_add.insert(0, "Snapshot TS", ts)
+
+        try:
+            snap_old = _read_df(SNAPSHOT_TITLE)
+        except Exception:
+            snap_old = None
+
+        if snap_old is None or snap_old.empty:
+            snap_new = df_add
+        else:
+            snap_new = pd.concat([snap_old, df_add], ignore_index=True)
+
+            # Säkerställ kolumnen finns
+            if "Snapshot TS" not in snap_new.columns:
+                # Om äldre schema saknade kolumnen – sätt allt till första värdet
+                snap_new.insert(0, "Snapshot TS", ts)
+
+            # Behåll max 10 snapshots baserat på unika "Snapshot TS"
+            ts_list = snap_new["Snapshot TS"].astype(str).tolist()
+            # Bevara ordning: första förekommer = äldst
+            seen = []
+            for v in ts_list:
+                if v not in seen:
+                    seen.append(v)
+
+            if len(seen) > 10:
+                keep_ts = set(seen[-10:])  # behåll de 10 senaste
+                snap_new = snap_new[snap_new["Snapshot TS"].astype(str).isin(keep_ts)].copy()
+
+        _write_df(SNAPSHOT_TITLE, snap_new)
+    except Exception:
+        # Snapshot får aldrig krascha appen – svälj ev. fel tyst.
+        pass
+
+
+_auto_snapshot_on_import()
+
+
+# -------------------------
 # Små helpers
 # -------------------------
 def _safe_str_val(x: Any) -> str:
@@ -148,67 +206,12 @@ def page_settings() -> None:
 
 
 # ============================================================
-# 🕒 Snapshot (read-only + auto-snapshot vid start)
+# 🕒 Snapshot (read-only)
 # ============================================================
-def _create_snapshot_on_start() -> None:
-    """
-    Skapar en snapshot av DATA-bladet vid app-start.
-    - Kopierar hela DATA till SNAPSHOT-bladet
-    - Lägger till kolumn '_SNAPSHOT_TS' med timestamp
-    - Max 10 snapshots behålls (äldsta rensas när ny skapas)
-    """
-    try:
-        base = read_data_df()
-    except Exception:
-        return
-
-    if base is None or base.empty:
-        return
-
-    snap_existing = _read_df(SNAPSHOT_TITLE)
-    if snap_existing is None or snap_existing.empty:
-        snap_existing = pd.DataFrame()
-
-    snap_ts = now_stamp()
-    base_copy = base.copy()
-    # Lägg till snapshot-timestamp längst fram
-    base_copy.insert(0, "_SNAPSHOT_TS", snap_ts)
-
-    # Om befintlig snapshot-sida saknar kolumnen, lägg till den
-    if not snap_existing.empty and "_SNAPSHOT_TS" not in snap_existing.columns:
-        snap_existing["_SNAPSHOT_TS"] = np.nan
-
-    if snap_existing is None or snap_existing.empty:
-        merged = base_copy
-    else:
-        merged = pd.concat([snap_existing, base_copy], ignore_index=True)
-
-    # Begränsa till max 10 snapshots baserat på unika _SNAPSHOT_TS
-    if "_SNAPSHOT_TS" in merged.columns:
-        ts_series = merged["_SNAPSHOT_TS"].astype(str)
-        # Bevara ordningen: äldsta först, senaste sist
-        unique_ts = list(dict.fromkeys(ts_series.tolist()))
-        if len(unique_ts) > 10:
-            keep = set(unique_ts[-10:])
-            merged = merged[ts_series.isin(keep)].reset_index(drop=True)
-
-    _write_df(SNAPSHOT_TITLE, merged)
-
-
-# Kör snapshot en gång per session när modulen laddas
-if "_SNAPSHOT_DONE" not in st.session_state:
-    try:
-        _create_snapshot_on_start()
-    except Exception:
-        # Tysta fel – vi vill inte krascha appen på grund av snapshot
-        pass
-    st.session_state["_SNAPSHOT_DONE"] = True
-
-
 def page_snapshot() -> None:
     st.header("🕒 Snapshot")
     snap = _read_df(SNAPSHOT_TITLE)
-    if snap is None or snap.empty:
+    if snap.empty:
         st.info("Inga snapshots ännu.")
         return
     _show_df(snap, height=420, use_container_width=True)
@@ -1081,7 +1084,7 @@ def render_dividend_rolling_12m_section(
             for c in ("Brutto", "Källskatt", "Netto", "Netto SEK"):
                 if c in sub.columns:
                     sub[c] = sub[c].map(
-                        lambda v: f"{float(v):,.2f}".replace(",", " ").replace(".", ",")
+                        lambda v: f"{float(v):, .2f}".replace(",", " ").replace(".", ",")
                         if v is not None
                         else ""
                     )
@@ -1159,11 +1162,10 @@ def page_portfolio() -> None:
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
 
+
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
-#   - Uppdatera alla bolag
-#   - Endast innehav (antal aktier > 0)
-//   - En eller flera Buckets
+#    med urval: alla / endast innehav / valda Buckets
 # ============================================================
 def page_batch() -> None:
     st.header("🧩 Massuppdatering (Yahoo) — 1s per bolag")
@@ -1173,64 +1175,76 @@ def page_batch() -> None:
         return
 
     base = df.copy()
+    if "Antal aktier" in base.columns:
+        base["Antal aktier"] = pd.to_numeric(base["Antal aktier"], errors="coerce")
 
-    # Välj urvalstyp
+    # Urval: alla / endast innehav / valda buckets
+    st.markdown("### Urval att uppdatera")
     mode = st.radio(
-        "Vad vill du uppdatera?",
-        ["Alla bolag", "Endast innehav", "Välj bucket(s)"],
+        "Välj vilka rader som ska ingå i massuppdateringen:",
+        ["Alla bolag", "Endast innehav", "Välj Buckets"],
         index=0,
-        horizontal=False,
+        horizontal=True,
     )
 
-    # Filtrera baserat på urvalstyp
-    if mode == "Endast innehav":
-        qty_col = None
-        for cand in ("Antal aktier", "Antal", "Shares"):
-            if cand in base.columns:
-                qty_col = cand
-                break
-        if qty_col is not None:
-            base[qty_col] = pd.to_numeric(base[qty_col], errors="coerce")
-            base = base[base[qty_col] > 0].copy()
-        else:
-            st.warning("Hittade ingen kolumn för antal aktier – kan inte filtrera på innehav.")
-    elif mode == "Välj bucket(s)":
-        bucket_series = base.get("Bucket", pd.Series([], dtype=object))
-        bucket_all = sorted(
-            {
-                str(b)
-                for b in bucket_series.dropna().tolist()
-                if str(b).strip()
-            }
-        )
-        if not bucket_all:
-            st.info("Inga Buckets hittades i Data-bladet.")
-        buckets_sel = st.multiselect(
-            "Välj bucket(s) att uppdatera",
-            options=bucket_all,
-            default=bucket_all,
-        )
-        if buckets_sel:
-            base = base[base["Bucket"].astype(str).isin(buckets_sel)].copy()
-        else:
-            base = base.iloc[0:0].copy()  # tomt urval om inget valt
+    subset = base
+    selected_buckets: List[str] = []
 
-    # Nuvarande ticker-universum efter filtrering
-    if base.empty:
-        st.info("Inga bolag matchar urvalet.")
+    if mode == "Endast innehav":
+        if "Antal aktier" not in base.columns:
+            st.warning("Kolumnen 'Antal aktier' saknas – kan inte filtrera på innehav.")
+        else:
+            subset = base[base["Antal aktier"] > 0].copy()
+    elif mode == "Välj Buckets":
+        all_buckets = (
+            base.get("Bucket", pd.Series([], dtype=object))
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        all_buckets = sorted([b for b in all_buckets if b])
+        selected_buckets = st.multiselect(
+            "Välj en eller flera Buckets",
+            options=all_buckets,
+            default=all_buckets,
+        )
+        if not selected_buckets:
+            st.info("Välj minst en Bucket för att fortsätta.")
+            return
+        subset = base[base["Bucket"].astype(str).str.strip().isin(selected_buckets)].copy()
+
+    if subset.empty:
+        st.info("Inga rader matchar urvalet.")
         return
 
-    tickers_universe = sorted(base["Ticker"].dropna().astype(str).unique().tolist())
-
-    sel = st.multiselect(
-        "Välj tickers (tom = alla i urvalet ovan)",
-        options=tickers_universe,
-        default=[],
+    # Nuvarande universum av tickers inom urvalet
+    tickers_universe = (
+        subset["Ticker"]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .unique()
+        .tolist()
     )
-    target = tickers_universe if len(sel) == 0 else sel
+    tickers_universe = sorted(tickers_universe)
+
+    st.markdown("### Finjustera (valfritt)")
+    sel_tickers = st.multiselect(
+        "Begränsa till specifika tickers (tom = alla i urvalet)",
+        options=tickers_universe,
+        default=tickers_universe,
+    )
+    target = sel_tickers if sel_tickers else tickers_universe
+
+    if not target:
+        st.info("Inga tickers valda.")
+        return
 
     delay = st.slider("Fördröjning per bolag (sek)", 0.5, 5.0, 1.0, 0.5)
-    go = st.button("🚀 Starta")
+    go = st.button("🚀 Starta massuppdatering")
 
     if not go:
         return
@@ -1275,13 +1289,16 @@ def page_batch() -> None:
     st.session_state["DATA"] = df_cur
     progress.empty()
     status.empty()
-    st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
+    st.success(
+        f"Klar. {len(target)} tickers uppdaterade inom urvalet "
+        f"({mode.lower()}{' / buckets: ' + ', '.join(selected_buckets) if selected_buckets else ''}). "
+        f"{changed_total} fält ändrades."
+    )
 
 
 # ============================================================
 # 🛒 Köpförslag + Säljförslag
 # ============================================================
-
 def _normalize_key(s: str) -> str:
     return (
         (s or "")
