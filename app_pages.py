@@ -12,9 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ✅ DEFAULT_BUCKETS hämtas från core_utils (där den är definierad)
 from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
-
 from sheets_io import (
     _read_df,
     _write_df,
@@ -114,7 +112,6 @@ def page_settings() -> None:
 
     if st.button("💾 Spara Settings"):
         try:
-            # Skriv tillbaka exakt det som visas i editorn (oavsett kolumnnamn)
             df_to_write = edited.copy()
             if df_to_write is None:
                 df_to_write = pd.DataFrame(columns=SETTINGS_COLUMNS)
@@ -126,7 +123,8 @@ def page_settings() -> None:
             # Töm cache så nya värden används direkt
             st.cache_data.clear()
             st.session_state["SETTINGS_MAP"] = get_settings_map()
-            st.success("Settings sparade.")
+            st.success("Settings sparade. Laddar om sidan…")
+            st.experimental_rerun()
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
 
@@ -420,7 +418,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
 
     base = df_data.copy()
 
-    # Hitta rätt kvantitetskolumn (backwards-kompatibelt med gammal app)
+    # Hitta rätt kvantitetskolumn (backwards-kompatibelt)
     qty_col = None
     for cand in ("Antal aktier", "Antal", "Shares"):
         if cand in base.columns:
@@ -428,7 +426,6 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
             break
 
     if qty_col is None:
-        # Ingen kvantitet => inga innehav
         return pd.DataFrame(columns=cols)
 
     base[qty_col] = pd.to_numeric(base[qty_col], errors="coerce")
@@ -804,21 +801,71 @@ def page_batch() -> None:
 # ============================================================
 # 🛒 Köpförslag + Säljförslag
 # ============================================================
+
+def _normalize_key(s: str) -> str:
+    return (
+        (s or "")
+        .lower()
+        .replace("ä", "a")
+        .replace("ö", "o")
+        .replace("å", "a")
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+
 def _cap_for_bucket(bucket_label: str, settings: Dict[str, str]) -> Optional[float]:
-    s = (bucket_label or "").lower().replace("tillväxt", "tillvaxt").strip()
-    mapping = {
-        "bucket a tillväxt": "bucket_cap_A_tillvaxt",
-        "bucket b tillväxt": "bucket_cap_B_tillvaxt",
-        "bucket c tillväxt": "bucket_cap_C_tillvaxt",
-        "bucket a utdelning": "bucket_cap_A_utdelning",
-        "bucket b utdelning": "bucket_cap_B_utdelning",
-        "bucket c utdelning": "bucket_cap_C_utdelning",
-    }
-    k = mapping.get(s)
-    if not k:
-        return None
-    v = _f(settings.get(k))
-    return float(v) if v is not None else None
+    """
+    Försöker hitta cap per Bucket med flera olika namnvarianter.
+    Om ingen nyckel hittas → behandlas som oändlig cap (ingen begränsning).
+    """
+    if not bucket_label:
+        return float("inf")
+
+    s = (bucket_label or "").lower()
+    s_norm = _normalize_key(bucket_label)
+
+    # Lista ut bokstav + typ (tillväxt/utdelning)
+    letter = None
+    if "bucket a" in s:
+        letter = "a"
+    elif "bucket b" in s:
+        letter = "b"
+    elif "bucket c" in s:
+        letter = "c"
+
+    kind = None
+    if "tillv" in s or "growth" in s:
+        kind = "tillvaxt"
+    elif "utdel" in s or "div" in s:
+        kind = "utdelning"
+
+    if letter is None or kind is None:
+        return float("inf")
+
+    # Kanoniskt namn enligt vår nuvarande konvention
+    canonical = f"bucket_cap_{letter}_{kind}"
+
+    # 1) Direkt match på kanoniskt namn (case-insensitive + åäö-normalisering)
+    for k, v in settings.items():
+        if _normalize_key(k) == _normalize_key(canonical):
+            vv = _f(v)
+            if vv is not None:
+                return float(vv)
+
+    # 2) Fuzzy: allt som innehåller "bucket{letter}" + "kind"
+    target1 = f"bucket{letter}"
+    target2 = kind
+    for k, v in settings.items():
+        nk = _normalize_key(k)
+        if target1 in nk and target2 in nk:
+            vv = _f(v)
+            if vv is not None:
+                return float(vv)
+
+    # 3) Om inget hittades → ingen cap (oändlig)
+    return float("inf")
 
 
 def _quick_pos_lookup(df: pd.DataFrame, fx_map: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
@@ -881,7 +928,8 @@ def build_buy_suggestions(
                 continue
 
             cap = _cap_for_bucket(bucket, settings)
-            if cap is None or cap <= 0:
+            # Om cap är 0 eller negativ (och finite) → hoppa
+            if cap is None or (math.isfinite(cap) and cap <= 0):
                 continue
 
             payload = compute_methods_for_row(r, settings, fx_map)
@@ -932,7 +980,8 @@ def build_buy_suggestions(
             fx = _fx_rate_to_sek(ccy, fx_map)
             value_sek = float((price or 0.0) * (qty or 0.0) * fx)
 
-            if _pos(value_sek) and value_sek >= cap:
+            # Om cap är oändlig → treat som obegränsad (ingen blockering)
+            if math.isfinite(cap) and _pos(value_sek) and value_sek >= cap:
                 continue
 
             up_pct: Optional[float] = None
@@ -953,7 +1002,7 @@ def build_buy_suggestions(
                 "Äger (antal)": qty or 0.0,
                 "Värde (SEK)": value_sek or 0.0,
                 "Cap per innehav (SEK)": cap,
-                "Slack till cap (SEK)": (cap - (value_sek or 0.0)),
+                "Slack till cap (SEK)": (cap - (value_sek or 0.0)) if math.isfinite(cap) else None,
             })
         except Exception:
             continue
@@ -1019,10 +1068,15 @@ def build_sell_suggestions(
                 continue
 
             cap = _cap_for_bucket(bucket, settings)
-            if cap is None or cap <= 0:
+            if cap is None or (math.isfinite(cap) and cap <= 0):
                 continue
 
             value_sek = _f(r.get("Värde (SEK)")) or 0.0
+
+            if not math.isfinite(cap):
+                # Oändlig cap → inget kan vara "över"
+                continue
+
             if value_sek <= cap:
                 continue
 
@@ -1097,7 +1151,8 @@ def page_buy_suggestions() -> None:
 
     st.caption(
         f"Köpförslag visar bolag där aktuell kurs är lägre än riktkurs för **vald horisont** "
-        f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket."
+        f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket. "
+        f"Om ingen cap hittas i Settings behandlas den bucketen som 'obegränsad'."
     )
 
     with st.spinner("Bygger köpförslag…"):
