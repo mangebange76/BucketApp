@@ -1,85 +1,31 @@
-# sheets_io.py — Google Sheets I/O, schema, Settings & FX
+# sheets_io.py – Google Sheets I/O + Settings + FX
 
 from __future__ import annotations
 
-import os, json, math
-from typing import Any, Dict, List, Optional
-from collections.abc import Mapping
+import json
+import math
+import os
+from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
 import gspread
 from gspread import Spreadsheet, Worksheet
 from gspread.exceptions import WorksheetNotFound, APIError
 from google.oauth2.service_account import Credentials
 
-from core_utils import _f, _nz
-
-
-# =========================
-# Globala konstanter
-# =========================
-
-# Google Sheet: titlar på flikar
-DATA_TITLE      = "Data"
-FX_TITLE        = "Valutakurser"
-SETTINGS_TITLE  = "Settings"
-SNAPSHOT_TITLE  = "Snapshot"
-
-# Settings-bladets kolumner (nyckel → värde)
-SETTINGS_COLUMNS: List[str] = ["Nyckel", "Värde"]
-
-# Data-bladets grundschema
-DATA_COLUMNS: List[str] = [
-    "Timestamp",
-    "Ticker",
-    "Bolagsnamn",
-    "Sektor",
-    "Bucket",
-    "Valuta",
-    "Antal aktier",
-    "GAV (SEK)",
-    "Aktuell kurs",
-    "Utestående aktier",
-    "Net debt",
-    "Rev TTM",
-    "EBITDA TTM",
-    "EPS TTM",
-    "PE TTM",
-    "PE FWD",
-    "EV/Revenue",
-    "EV/EBITDA",
-    "P/B",
-    "BVPS",
-    "Rev 1Y",
-    "Rev 2Y",
-    "Rev CAGR",
-    "EPS 1Y",
-    "EPS 2Y",
-    "EPS CAGR",
-    "Årlig utdelning",
-    "Utdelning CAGR",
-    "Riktkurs idag",
-    "Riktkurs 1 år",
-    "Riktkurs 2 år",
-    "Riktkurs 3 år",
-    "Bull 1 år",
-    "Bear 1 år",
-    "Senast auto uppdaterad",
-    "Auto källa",
-    "Senast manuellt uppdaterad",
-]
-
-# Standard-Buckets (används i editor/add-ticker)
-DEFAULT_BUCKETS: List[str] = [
-    "Bucket A tillväxt",
-    "Bucket B tillväxt",
-    "Bucket C tillväxt",
-    "Bucket A utdelning",
-    "Bucket B utdelning",
-    "Bucket C utdelning",
-]
+from core_utils import (
+    _f,
+    _nz,
+    now_stamp,
+    DATA_TITLE,
+    FX_TITLE,
+    SETTINGS_TITLE,
+    SNAPSHOT_TITLE,
+    SETTINGS_COLUMNS,
+    DATA_COLUMNS,
+)
 
 
 # =============================
@@ -101,7 +47,7 @@ def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     Letar efter en nyckel i både os.environ och st.secrets, med flera alias.
 
     Exempel:
-      - "SHEET_URL" → letar även efter GOOGLE_SHEET_URL, spreadsheet_url osv.
+      - "SHEET_URL" → letar även efter GOOGLE_SHEET_URL, SPREADSHEET_URL osv.
       - "SHEET_ID"  → letar även efter GOOGLE_SHEET_ID, SPREADSHEET_ID osv.
     """
     key_upper = key.upper()
@@ -171,7 +117,7 @@ def _get_gspread_client() -> gspread.Client:
     if raw is None:
         raise RuntimeError("Saknar GOOGLE_CREDENTIALS i Streamlit secrets.")
 
-    if isinstance(raw, Mapping):
+    if isinstance(raw, dict):
         creds_dict = dict(raw)
     else:
         # Förväntar oss JSON-sträng
@@ -196,7 +142,6 @@ def _open_spreadsheet() -> Spreadsheet:
     Öppnar kalkylarket med stöd för flera olika nycklar:
       - SHEET_URL / GOOGLE_SHEET_URL / spreadsheet_url
       - SHEET_ID  / GOOGLE_SHEET_ID  / SPREADSHEET_ID
-    Funkar därmed med samma secrets som din basversion.
     """
     # Först försök med URL
     sheet_url = _env_or_secret("SHEET_URL")
@@ -218,14 +163,11 @@ def _open_spreadsheet() -> Spreadsheet:
 
 
 def _open_worksheet(title: str) -> Worksheet:
-    """
-    Öppna (eller skapa) en flik i Spreadsheet med angivet title.
-    """
+    """Öppna (eller skapa) en flik i Spreadsheet med angivet title."""
     ss = _open_spreadsheet()
     try:
         return ss.worksheet(title)
     except WorksheetNotFound:
-        # Skapa ny med tomma kolumner
         ws = ss.add_worksheet(title=title, rows=200, cols=50)
         return ws
 
@@ -261,9 +203,7 @@ def _read_df(title: str) -> pd.DataFrame:
     rows = values[1:]
     if not header:
         return pd.DataFrame()
-
     df = pd.DataFrame(rows, columns=header)
-    # Trimma tomma rader
     df = df.dropna(how="all").reset_index(drop=True)
     return df
 
@@ -277,12 +217,10 @@ def _write_df(title: str, df: pd.DataFrame) -> None:
         df = pd.DataFrame()
     df = df.copy()
 
-    # Konvertera alla kolumner till str för Sheets-kompabilitet
     df = df.fillna("")
     df = df.astype(str)
 
     ws = _open_worksheet(title)
-    # Rensa och skriv om
     try:
         ws.clear()
         if df.empty:
@@ -311,25 +249,20 @@ def _ensure_data_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in DATA_COLUMNS:
         if col not in df.columns:
             df[col] = np.nan
-    # Behåll kolumnordning: DATA_COLUMNS först, sedan övriga
     extra = [c for c in df.columns if c not in DATA_COLUMNS]
     df = df[DATA_COLUMNS + extra]
     return df
 
 
 def read_data_df() -> pd.DataFrame:
-    """
-    Läs Data-bladet från Sheets och säkerställ kolumnschema.
-    """
+    """Läs Data-bladet från Sheets och säkerställ kolumnschema."""
     df = _read_df(DATA_TITLE)
     df = _ensure_data_columns(df)
     return df
 
 
 def write_data_df(df: pd.DataFrame) -> None:
-    """
-    Skriv Data-bladet till Sheets, med DATA_COLUMNS först.
-    """
+    """Skriv Data-bladet till Sheets, med DATA_COLUMNS först."""
     if df is None:
         df = pd.DataFrame(columns=DATA_COLUMNS)
     df = _ensure_data_columns(df)
@@ -363,7 +296,6 @@ def get_settings_map() -> Dict[str, str]:
             break
 
     if key_col is None or val_col is None:
-        # Försök tolka första två kolumner
         if len(df.columns) >= 2:
             key_col = df.columns[0]
             val_col = df.columns[1]
@@ -398,13 +330,12 @@ def get_fx_map() -> Dict[str, float]:
     if df is None or df.empty:
         return {}
 
-    # Hitta valuta-kolumn
     cur_col = None
     for cand in ("Valuta", "Currency", "CUR", "Fx", "FX"):
         if cand in df.columns:
             cur_col = cand
             break
-    # Hitta SEK-kolumn
+
     rate_col = None
     for cand in ("SEK", "Kurs", "Rate", "Fx-rate"):
         if cand in df.columns:
@@ -427,7 +358,6 @@ def get_fx_map() -> Dict[str, float]:
             continue
         out[code] = float(val)
 
-    # Bas: SEK = 1.0
     if "SEK" not in out:
         out["SEK"] = 1.0
     return out
@@ -437,10 +367,10 @@ def get_fx_map() -> Dict[str, float]:
 # Laddning av DATA i session
 # =============================
 
-def load_data_into_session() -> None:
+def _load_data_into_session() -> None:
     """
     Hjälpare som ser till att st.session_state["DATA"] är laddad.
-    Kan anropas från main() i app.py.
+    Kan anropas från main() eller andra moduler.
     """
     if "DATA" not in st.session_state or not isinstance(st.session_state["DATA"], pd.DataFrame):
         try:
