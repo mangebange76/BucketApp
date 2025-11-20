@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf  # 🔹 Nytt: direkt-yahoo för namn/sektor
 
 from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
 from sheets_io import (
@@ -45,6 +46,25 @@ def _safe_str_val(x: Any) -> str:
     if s.lower() in ("nan", "none"):
         return ""
     return s
+
+
+def _fetch_name_sector_from_yahoo(tkr: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Hämtar bolagsnamn och sektor direkt via yfinance.Ticker.info.
+    Används som fallback om fetch_from_yahoo inte exponerar dessa fält.
+    """
+    try:
+        info = yf.Ticker(tkr).info or {}
+    except Exception:
+        return None, None
+
+    name = info.get("longName") or info.get("shortName") or info.get("symbol")
+    sector = info.get("sector") or info.get("industry")
+
+    name = _safe_str_val(name)
+    sector = _safe_str_val(sector)
+
+    return (name or None, sector or None)
 
 
 # -------------------------
@@ -179,32 +199,39 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, Any]:
-    y = fetch_from_yahoo(tkr)
+    # Kan vara None → skydda
+    y = fetch_from_yahoo(tkr) or {}
 
-    # Fyll Bolagsnamn & Sektor – men bara om de inte redan har manuell text
+    # Befintliga (manuella) värden
     existing_name = _safe_str_val(existing_row.get("Bolagsnamn"))
-    if existing_name:
-        name = existing_name
-    else:
-        name = (
-            y.get("name")
-            or y.get("longName")
-            or y.get("shortName")
-        )
-
     existing_sector = _safe_str_val(existing_row.get("Sektor"))
-    if existing_sector:
-        sector = existing_sector
-    else:
-        sector = (
-            y.get("sector")
-            or y.get("industry")
-        )
+
+    # Försök först ur fetch_from_yahoo-responsen
+    name = (
+        existing_name
+        or _safe_str_val(y.get("name"))
+        or _safe_str_val(y.get("longName"))
+        or _safe_str_val(y.get("shortName"))
+    )
+    sector = (
+        existing_sector
+        or _safe_str_val(y.get("sector"))
+        or _safe_str_val(y.get("industry"))
+    )
+
+    # Om fortfarande tomt → hämta direkt via yfinance
+    if not name or not sector:
+        y_name, y_sector = _fetch_name_sector_from_yahoo(tkr)
+        if not name and y_name:
+            name = y_name
+        if not sector and y_sector:
+            sector = y_sector
 
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
     except Exception:
         est = {"eps_1y": None, "eps_2y": None}
+
     updates = {
         "Timestamp": now_stamp(),
         "Bolagsnamn": name,
@@ -395,26 +422,29 @@ def page_add_ticker() -> None:
 
             if do_prefill:
                 try:
-                    y = fetch_from_yahoo(tkr)
+                    y = fetch_from_yahoo(tkr) or {}
 
                     existing_name = _safe_str_val(new_row.get("Bolagsnamn"))
-                    if existing_name:
-                        name = existing_name
-                    else:
-                        name = (
-                            y.get("name")
-                            or y.get("longName")
-                            or y.get("shortName")
-                        )
-
                     existing_sector = _safe_str_val(new_row.get("Sektor"))
-                    if existing_sector:
-                        sector_y = existing_sector
-                    else:
-                        sector_y = (
-                            y.get("sector")
-                            or y.get("industry")
-                        )
+
+                    name = (
+                        existing_name
+                        or _safe_str_val(y.get("name"))
+                        or _safe_str_val(y.get("longName"))
+                        or _safe_str_val(y.get("shortName"))
+                    )
+                    sector_y = (
+                        existing_sector
+                        or _safe_str_val(y.get("sector"))
+                        or _safe_str_val(y.get("industry"))
+                    )
+
+                    if not name or not sector_y:
+                        y_name, y_sector = _fetch_name_sector_from_yahoo(tkr)
+                        if not name and y_name:
+                            name = y_name
+                        if not sector_y and y_sector:
+                            sector_y = y_sector
 
                     pre = {
                         "Bolagsnamn": name,
