@@ -6,6 +6,7 @@ import json
 import math
 import os
 from typing import Any, Dict, Optional
+from collections.abc import Mapping
 
 import pandas as pd
 import numpy as np
@@ -105,28 +106,77 @@ def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def _load_google_credentials_dict() -> Dict[str, Any]:
+    """
+    Försöker tolka GOOGLE_CREDENTIALS på flera sätt:
+
+    1) [GOOGLE_CREDENTIALS] som tabell i secrets.toml  → Mapping
+    2) GOOGLE_CREDENTIALS = "{...json...}"             → JSON-sträng
+    3) Service account-fälten på toppnivå i secrets    → type, project_id, private_key, client_email, ...
+    """
+    secrets_obj = getattr(st, "secrets", None)
+    if secrets_obj is None:
+        raise RuntimeError("Saknar Streamlit secrets – kunde inte hitta GOOGLE_CREDENTIALS.")
+
+    raw = None
+    try:
+        raw = secrets_obj.get("GOOGLE_CREDENTIALS", None)
+    except Exception:
+        raw = None
+
+    # 1) Tabell / dict: [GOOGLE_CREDENTIALS] i secrets.toml
+    if isinstance(raw, Mapping):
+        creds_dict = dict(raw)
+        return _normalize_private_key(creds_dict)
+
+    # 2) JSON-sträng: GOOGLE_CREDENTIALS = "{...}"
+    if isinstance(raw, str):
+        try:
+            creds_dict = json.loads(raw)
+            return _normalize_private_key(creds_dict)
+        except Exception:
+            # Fortsätt till fallback i stället för att kasta fel
+            pass
+
+    # 3) Service account-fält direkt på toppnivå i secrets.toml
+    if isinstance(secrets_obj, Mapping):
+        candidate_keys = [
+            "type",
+            "project_id",
+            "private_key_id",
+            "private_key",
+            "client_email",
+            "client_id",
+            "auth_uri",
+            "token_uri",
+            "auth_provider_x509_cert_url",
+            "client_x509_cert_url",
+        ]
+        if any(k in secrets_obj for k in candidate_keys):
+            creds_dict: Dict[str, Any] = {}
+            for k in candidate_keys:
+                if k in secrets_obj:
+                    creds_dict[k] = secrets_obj.get(k)
+            if "private_key" in creds_dict:
+                return _normalize_private_key(creds_dict)
+
+    raise RuntimeError(
+        "Kunde inte tolka GOOGLE_CREDENTIALS. Antingen:\n"
+        "  • lägg hela service account JSON i [GOOGLE_CREDENTIALS] som tabell i secrets.toml\n"
+        "  • eller lägg JSON-strängen som GOOGLE_CREDENTIALS = \"{...}\"\n"
+        "  • eller lägg service account-fälten (type, project_id, private_key, client_email, ...) på toppnivå."
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def _get_gspread_client() -> gspread.Client:
     """
-    Bygger en gspread-klient från st.secrets["GOOGLE_CREDENTIALS"].
-    Stöder:
-      - dict
-      - JSON-sträng
+    Bygger en gspread-klient från Streamlit secrets, med stöd för:
+      - [GOOGLE_CREDENTIALS] (toml-tabell)
+      - GOOGLE_CREDENTIALS = "{...json...}"
+      - service account-fält direkt på toppnivå i secrets.toml
     """
-    raw = st.secrets.get("GOOGLE_CREDENTIALS", None)
-    if raw is None:
-        raise RuntimeError("Saknar GOOGLE_CREDENTIALS i Streamlit secrets.")
-
-    if isinstance(raw, dict):
-        creds_dict = dict(raw)
-    else:
-        # Förväntar oss JSON-sträng
-        try:
-            creds_dict = json.loads(str(raw))
-        except Exception as e:
-            raise RuntimeError(f"Kunde inte tolka GOOGLE_CREDENTIALS som JSON: {e}") from e
-
-    creds_dict = _normalize_private_key(creds_dict)
+    creds_dict = _load_google_credentials_dict()
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
