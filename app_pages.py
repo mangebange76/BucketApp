@@ -161,12 +161,36 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, Any]:
     y = fetch_from_yahoo(tkr)
+
+    # --- NYTT: fyll Bolagsnamn & Sektor, men respektera manuell text ---
+    existing_name = str(existing_row.get("Bolagsnamn") or "").strip()
+    if existing_name:
+        name = existing_name
+    else:
+        name = (
+            y.get("name")
+            or y.get("longName")
+            or y.get("shortName")
+        )
+
+    existing_sector = str(existing_row.get("Sektor") or "").strip()
+    if existing_sector:
+        sector = existing_sector
+    else:
+        sector = (
+            y.get("sector")
+            or y.get("industry")
+        )
+    # -------------------------------------------------------------
+
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
     except Exception:
         est = {"eps_1y": None, "eps_2y": None}
     updates = {
         "Timestamp": now_stamp(),
+        "Bolagsnamn": name,
+        "Sektor": sector,
         "Aktuell kurs": _f(y.get("price")),
         "Valuta": (y.get("currency") or existing_row.get("Valuta")),
         "Utestående aktier": _f(y.get("shares_out")),
@@ -354,7 +378,31 @@ def page_add_ticker() -> None:
             if do_prefill:
                 try:
                     y = fetch_from_yahoo(tkr)
+
+                    # --- NYTT: fyll Bolagsnamn & Sektor om de saknas manuellt ---
+                    existing_name = str(new_row.get("Bolagsnamn") or "").strip()
+                    if existing_name:
+                        name = existing_name
+                    else:
+                        name = (
+                            y.get("name")
+                            or y.get("longName")
+                            or y.get("shortName")
+                        )
+
+                    existing_sector = str(new_row.get("Sektor") or "").strip()
+                    if existing_sector:
+                        sector_y = existing_sector
+                    else:
+                        sector_y = (
+                            y.get("sector")
+                            or y.get("industry")
+                        )
+                    # ------------------------------------------------------------
+
                     pre = {
+                        "Bolagsnamn": name,
+                        "Sektor": sector_y,
                         "Aktuell kurs": _f(y.get("price")),
                         "Valuta": y.get("currency") or valuta,
                         "Utestående aktier": _f(y.get("shares_out")),
@@ -1151,7 +1199,7 @@ def page_buy_suggestions() -> None:
         + [b for b in all_buckets if b not in DEFAULT_BUCKETS]
     )
 
-    # Här lägger vi in Fyndläge / Bra köp i samma rullista
+    # Rullista: Alla / Fyndläge / Bra köp + buckets
     bucket_zone_opts = ["Alla", "Fyndläge", "Bra köp"] + [b for b in bucket_opts if b != "Alla"]
 
     col_top1, col_top2, col_top3 = st.columns([2, 2, 2])
