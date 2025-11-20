@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
+from core_utils import _f, _pos, _nz, now_stamp
 from sheets_io import (
     _read_df,
     _write_df,
@@ -24,6 +24,7 @@ from sheets_io import (
     SETTINGS_COLUMNS,
     SETTINGS_TITLE,
     SNAPSHOT_TITLE,
+    DEFAULT_BUCKETS,
 )
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
 
@@ -99,7 +100,7 @@ def _show_df(df: pd.DataFrame, height: int = 360, use_container_width: bool = Tr
 def page_settings() -> None:
     st.header("⚙️ Settings")
     s_df = _read_df(SETTINGS_TITLE)
-    if s_df.empty:
+    if s_df is None or s_df.empty:
         s_df = pd.DataFrame(columns=SETTINGS_COLUMNS)
 
     st.caption("Redigera nedan och klicka **Spara**.")
@@ -112,7 +113,16 @@ def page_settings() -> None:
 
     if st.button("💾 Spara Settings"):
         try:
-            _write_df(SETTINGS_TITLE, edited[SETTINGS_COLUMNS])
+            # Skriv tillbaka exakt det som visas i editorn (oavsett kolumnnamn)
+            df_to_write = edited.copy()
+            if df_to_write is None:
+                df_to_write = pd.DataFrame(columns=SETTINGS_COLUMNS)
+            if df_to_write.empty and len(df_to_write.columns) == 0:
+                df_to_write = pd.DataFrame(columns=SETTINGS_COLUMNS)
+
+            _write_df(SETTINGS_TITLE, df_to_write)
+
+            # Töm cache så nya värden används direkt
             st.cache_data.clear()
             st.session_state["SETTINGS_MAP"] = get_settings_map()
             st.success("Settings sparade.")
@@ -408,9 +418,20 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         return pd.DataFrame(columns=cols)
 
     base = df_data.copy()
-    if "Antal aktier" in base.columns:
-        base["Antal aktier"] = pd.to_numeric(base["Antal aktier"], errors="coerce")
-    owned = base[(base.get("Antal aktier") > 0) if "Antal aktier" in base.columns else []].copy()
+
+    # Hitta rätt kvantitetskolumn (backwards-kompatibelt med gammal app)
+    qty_col = None
+    for cand in ("Antal aktier", "Antal", "Shares"):
+        if cand in base.columns:
+            qty_col = cand
+            break
+
+    if qty_col is None:
+        # Ingen kvantitet => inga innehav
+        return pd.DataFrame(columns=cols)
+
+    base[qty_col] = pd.to_numeric(base[qty_col], errors="coerce")
+    owned = base[base[qty_col] > 0].copy()
 
     for _, r in owned.iterrows():
         tkr = str(r.get("Ticker") or "").strip()
@@ -421,7 +442,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         ccy = str(_nz(r.get("Valuta"), "SEK")).upper()
 
         price = _f(r.get("Aktuell kurs"))
-        qty = _pos(r.get("Antal aktier")) or 0.0
+        qty = _pos(r.get(qty_col)) or 0.0
         fx = _fx_rate_to_sek(ccy, fx_map)
         val_ccy = (price or 0.0) * qty
         val_sek = val_ccy * fx
@@ -583,7 +604,7 @@ def build_next_dividends_table(
         code = (currency or "USD").upper()
         key = f"withholding_{code}"
         try:
-            wht = float(get_settings_map().get(key, "0.15"))
+            wht = float(settings.get(key, "0.15"))
         except Exception:
             wht = 0.15
 
@@ -608,7 +629,7 @@ def build_next_dividends_table(
 
     df = pd.DataFrame(
         rows,
-        columns[
+        columns=[
             "Datum",
             "Ticker",
             "Valuta",
@@ -940,10 +961,25 @@ def build_buy_suggestions(
         return pd.DataFrame(columns=cols_out)
 
     out = pd.DataFrame(rows, columns=cols_out)
-    out = out.sort_values(
-        ["Slack till cap (SEK)", "Uppsida (%)"],
-        ascending=[False, False],
-    ).reset_index(drop_due=True)
+
+    # Säker sortering: tvinga numeriska typer på sorteringskolumner
+    for col in ("Slack till cap (SEK)", "Uppsida (%)"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    sort_cols: List[str] = []
+    sort_asc: List[bool] = []
+    if "Slack till cap (SEK)" in out.columns:
+        sort_cols.append("Slack till cap (SEK)")
+        sort_asc.append(False)
+    if "Uppsida (%)" in out.columns:
+        sort_cols.append("Uppsida (%)")
+        sort_asc.append(False)
+
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=sort_asc, na_position="last")
+
+    out = out.reset_index(drop=True)
     return out
 
 
