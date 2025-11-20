@@ -12,7 +12,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core_utils import _f, _pos, _nz, now_stamp
+# ✅ DEFAULT_BUCKETS hämtas från core_utils (där den är definierad)
+from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
+
 from sheets_io import (
     _read_df,
     _write_df,
@@ -24,7 +26,6 @@ from sheets_io import (
     SETTINGS_COLUMNS,
     SETTINGS_TITLE,
     SNAPSHOT_TITLE,
-    DEFAULT_BUCKETS,
 )
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
 
