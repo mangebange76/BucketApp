@@ -6,7 +6,6 @@ import json
 import math
 import os
 from typing import Any, Dict, Optional
-from collections.abc import Mapping
 
 import pandas as pd
 import numpy as np
@@ -110,17 +109,15 @@ def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
 def _get_gspread_client() -> gspread.Client:
     """
     Bygger en gspread-klient från st.secrets["GOOGLE_CREDENTIALS"].
-
     Stöder:
-      - TOML-tabell / dict / SecretsDict  (t.ex. [GOOGLE_CREDENTIALS] i secrets.toml)
+      - dict
       - JSON-sträng
     """
     raw = st.secrets.get("GOOGLE_CREDENTIALS", None)
     if raw is None:
         raise RuntimeError("Saknar GOOGLE_CREDENTIALS i Streamlit secrets.")
 
-    # 🔑 Viktigt: acceptera alla Mapping-typer (SecretsDict, dict, osv)
-    if isinstance(raw, Mapping):
+    if isinstance(raw, dict):
         creds_dict = dict(raw)
     else:
         # Förväntar oss JSON-sträng
@@ -202,7 +199,7 @@ def _read_df(title: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    header = values[0]
+    header = [str(c) for c in values[0]]
     rows = values[1:]
     if not header:
         return pd.DataFrame()
@@ -327,11 +324,19 @@ def get_fx_map() -> Dict[str, float]:
     """
     Läser 'Valutakurser'-bladet och returnerar:
       { 'USD': 10.50, 'NOK': 1.02, ... }  (valuta → SEK-kurs)
-    Förväntar kolumner typ ['Valuta','SEK'] eller liknande.
+
+    Försöker först hitta rimliga kolumnnamn, annars fall-back:
+      - första kolumn = valuta
+      - andra kolumn = SEK-kurs
+
+    Stödjer även koder som 'USDSEK' → 'USD', 'NOKSEK' → 'NOK'.
     """
     df = _read_df(FX_TITLE)
     if df is None or df.empty:
         return {}
+
+    # Säkerställ str-kolumnnamn
+    df.columns = [str(c) for c in df.columns]
 
     cur_col = None
     for cand in ("Valuta", "Currency", "CUR", "Fx", "FX"):
@@ -345,8 +350,13 @@ def get_fx_map() -> Dict[str, float]:
             rate_col = cand
             break
 
+    # Fallback: använd första två kolumner
     if cur_col is None or rate_col is None:
-        return {}
+        if len(df.columns) >= 2:
+            cur_col = df.columns[0]
+            rate_col = df.columns[1]
+        else:
+            return {}
 
     out: Dict[str, float] = {}
     for _, r in df.iterrows():
@@ -359,7 +369,13 @@ def get_fx_map() -> Dict[str, float]:
         val = _f(r.get(rate_col))
         if val is None or not math.isfinite(val) or val <= 0:
             continue
+
+        # Direkt valuta-kod
         out[code] = float(val)
+        # Stöd för t.ex. "USDSEK" → "USD"
+        if len(code) == 6 and code.endswith("SEK"):
+            base = code[:3]
+            out[base] = float(val)
 
     if "SEK" not in out:
         out["SEK"] = 1.0
