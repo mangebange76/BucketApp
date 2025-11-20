@@ -1,37 +1,46 @@
 # ============================================================
-# app.py — Aktieanalys & investeringsförslag (modulversion)
-#
-#  - Minimal toppnivå som bara:
-#       • Sätter upp Streamlit-layout
-#       • Laddar data/fx in i session via sheets_io._load_data_into_session()
-#       • Visar sidomeny
-#       • Routar till sid-funktioner i app_pages.py
-#
-#  Alla tunga grejer ligger i:
-#    core_utils.py   – helpers, format mm.
-#    sheets_io.py    – Google Sheets I/O, settings, FX
-#    yahoo_fetch.py  – råhämtning från Yahoo Finance
-#    valuation.py    – fair value/riktkurs-beräkningar
-#    analysis_ui.py  – analys/ranking-komponenter
-#    app_pages.py    – page_*-funktioner (UI-sidor)
+# app.py — Aktieanalys & investeringsförslag (modulversion med fel-diagnostik)
 # ============================================================
 
 from __future__ import annotations
 
 import streamlit as st
 
-from sheets_io import _load_data_into_session
-from app_pages import (
-    page_analysis,
-    page_ranking,
-    page_buy_suggestions,
-    page_editor,
-    page_add_ticker,
-    page_portfolio,
-    page_batch,
-    page_settings,
-    page_snapshot,
-)
+# För att kunna visa riktiga fel istället för Streamlits maskning
+IMPORT_ERROR = None
+
+# Försök importera sheets_io
+try:
+    from sheets_io import _load_data_into_session
+except Exception as e:
+    _load_data_into_session = None
+    IMPORT_ERROR = e  # spara första felet
+
+# Försök importera sidorna
+try:
+    from app_pages import (
+        page_analysis,
+        page_ranking,
+        page_buy_suggestions,
+        page_editor,
+        page_add_ticker,
+        page_portfolio,
+        page_batch,
+        page_settings,
+        page_snapshot,
+    )
+except Exception as e:
+    # Om vi redan har ett import-fel, behåll det första;
+    # annars spara detta.
+    if IMPORT_ERROR is None:
+        IMPORT_ERROR = e
+
+    # Skapa dummy-funktioner så att namnen finns
+    def _page_stub():
+        st.error("Sidorna kunde inte importeras på grund av ett import-fel i modulerna.")
+    page_analysis = page_ranking = page_buy_suggestions = page_editor = \
+        page_add_ticker = page_portfolio = page_batch = page_settings = page_snapshot = _page_stub
+
 
 # =========================
 # Grundinställningar UI
@@ -41,7 +50,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Lite smalare mittkolumn (som i gamla appen)
 st.markdown(
     "<style>section.main > div {max-width: 1400px;}</style>",
     unsafe_allow_html=True,
@@ -54,12 +62,26 @@ st.markdown(
 def main() -> None:
     st.title("📈 Aktieanalys & investeringsförslag")
 
-    # Ladda in DATA, FX, SETTINGS m.m. till session om de saknas
-    _load_data_into_session()
+    # Om vi har ett import-fel i någon modul: visa det tydligt och stoppa
+    if IMPORT_ERROR is not None:
+        st.error(
+            "❌ Tekniskt fel vid import av moduler.\n\n"
+            "Exakt Python-fel var:\n\n"
+            f"`{repr(IMPORT_ERROR)}`\n\n"
+            "Kontrollera att alla filer (core_utils.py, sheets_io.py, yahoo_fetch.py, "
+            "valuation.py, analysis_ui.py, app_pages.py) finns i **samma mapp** som app.py "
+            "och att det inte finns några stavfel i filnamnen eller imports."
+        )
+        st.stop()
 
-    # -------------------------
+    # Ladda DATA via sheets_io
+    if _load_data_into_session is not None:
+        _load_data_into_session()
+    else:
+        st.error("Kunde inte ladda data eftersom _load_data_into_session saknas.")
+        st.stop()
+
     # Sidebar-navigering
-    # -------------------------
     st.sidebar.markdown("## 🧭 Navigering")
 
     page = st.sidebar.radio(
@@ -84,9 +106,7 @@ def main() -> None:
         "Riktkurser beräknas i handelsvalutan (ingen FX på EPS/targets)."
     )
 
-    # -------------------------
-    # Routing till sidorna
-    # -------------------------
+    # Routing
     if page == "📊 Analys":
         page_analysis()
     elif page == "🏆 Ranking":
@@ -106,7 +126,6 @@ def main() -> None:
     elif page == "🕒 Snapshot":
         page_snapshot()
     else:
-        # Fallback om något konstigt händer med sidnamnet
         page_analysis()
 
 
