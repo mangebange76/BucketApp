@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf  # 🔹 Nytt: direkt-yahoo för namn/sektor
 
 from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
 from sheets_io import (
@@ -46,25 +45,6 @@ def _safe_str_val(x: Any) -> str:
     if s.lower() in ("nan", "none"):
         return ""
     return s
-
-
-def _fetch_name_sector_from_yahoo(tkr: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Hämtar bolagsnamn och sektor direkt via yfinance.Ticker.info.
-    Används som fallback om fetch_from_yahoo inte exponerar dessa fält.
-    """
-    try:
-        info = yf.Ticker(tkr).info or {}
-    except Exception:
-        return None, None
-
-    name = info.get("longName") or info.get("shortName") or info.get("symbol")
-    sector = info.get("sector") or info.get("industry")
-
-    name = _safe_str_val(name)
-    sector = _safe_str_val(sector)
-
-    return (name or None, sector or None)
 
 
 # -------------------------
@@ -199,39 +179,32 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, Any]:
-    # Kan vara None → skydda
-    y = fetch_from_yahoo(tkr) or {}
+    y = fetch_from_yahoo(tkr)
 
-    # Befintliga (manuella) värden
+    # Fyll Bolagsnamn & Sektor – men bara om de inte redan har manuell text
     existing_name = _safe_str_val(existing_row.get("Bolagsnamn"))
+    if existing_name:
+        name = existing_name
+    else:
+        name = (
+            y.get("name")
+            or y.get("longName")
+            or y.get("shortName")
+        )
+
     existing_sector = _safe_str_val(existing_row.get("Sektor"))
-
-    # Försök först ur fetch_from_yahoo-responsen
-    name = (
-        existing_name
-        or _safe_str_val(y.get("name"))
-        or _safe_str_val(y.get("longName"))
-        or _safe_str_val(y.get("shortName"))
-    )
-    sector = (
-        existing_sector
-        or _safe_str_val(y.get("sector"))
-        or _safe_str_val(y.get("industry"))
-    )
-
-    # Om fortfarande tomt → hämta direkt via yfinance
-    if not name or not sector:
-        y_name, y_sector = _fetch_name_sector_from_yahoo(tkr)
-        if not name and y_name:
-            name = y_name
-        if not sector and y_sector:
-            sector = y_sector
+    if existing_sector:
+        sector = existing_sector
+    else:
+        sector = (
+            y.get("sector")
+            or y.get("industry")
+        )
 
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
     except Exception:
         est = {"eps_1y": None, "eps_2y": None}
-
     updates = {
         "Timestamp": now_stamp(),
         "Bolagsnamn": name,
@@ -422,29 +395,26 @@ def page_add_ticker() -> None:
 
             if do_prefill:
                 try:
-                    y = fetch_from_yahoo(tkr) or {}
+                    y = fetch_from_yahoo(tkr)
 
                     existing_name = _safe_str_val(new_row.get("Bolagsnamn"))
+                    if existing_name:
+                        name = existing_name
+                    else:
+                        name = (
+                            y.get("name")
+                            or y.get("longName")
+                            or y.get("shortName")
+                        )
+
                     existing_sector = _safe_str_val(new_row.get("Sektor"))
-
-                    name = (
-                        existing_name
-                        or _safe_str_val(y.get("name"))
-                        or _safe_str_val(y.get("longName"))
-                        or _safe_str_val(y.get("shortName"))
-                    )
-                    sector_y = (
-                        existing_sector
-                        or _safe_str_val(y.get("sector"))
-                        or _safe_str_val(y.get("industry"))
-                    )
-
-                    if not name or not sector_y:
-                        y_name, y_sector = _fetch_name_sector_from_yahoo(tkr)
-                        if not name and y_name:
-                            name = y_name
-                        if not sector_y and y_sector:
-                            sector_y = y_sector
+                    if existing_sector:
+                        sector_y = existing_sector
+                    else:
+                        sector_y = (
+                            y.get("sector")
+                            or y.get("industry")
+                        )
 
                     pre = {
                         "Bolagsnamn": name,
@@ -777,6 +747,311 @@ def render_portfolio_dividends_section(
             st.caption("Kunde inte göra månadssummering (saknade datum eller värden).")
 
 
+# ============================================================
+# 📆 Rullande 12 mån utdelningskalender (estimat + bekräftade)
+# ============================================================
+def _annual_dps(row: pd.Series) -> Optional[float]:
+    """
+    Försöker läsa årlig utdelning (per aktie) från vanliga kolumnnamn.
+    """
+    for c in ("Årlig utdelning", "Dividend (Annual)", "DPS Annual", "Årsutdelning"):
+        if c in row and _f(row.get(c)) is not None:
+            v = _f(row.get(c))
+            if v is not None and v > 0:
+                return float(v)
+    return None
+
+
+def build_dividend_rolling_12m(
+    data_df: pd.DataFrame,
+    fx_map: Dict[str, float],
+    settings: Dict[str, Any],
+) -> pd.DataFrame:
+    """
+    Bygger en lista av utdelningshändelser (bekräftade + estimerade)
+    för de kommande ~12 månaderna.
+    """
+    events: List[Dict[str, Any]] = []
+    if data_df is None or data_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Datum",
+                "Ticker",
+                "Bolag",
+                "Valuta",
+                "Antal",
+                "DPS",
+                "Brutto",
+                "Källskatt",
+                "Netto",
+                "Netto SEK",
+                "Status",
+            ]
+        )
+
+    today = dt.date.today()
+    horizon = today + dt.timedelta(days=365)
+
+    # Första passet: samla bekräftade kommande utdelningar
+    confirmed_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
+
+    for _, r in data_df.iterrows():
+        ticker = str(r.get("Ticker") or "").strip()
+        if not ticker:
+            continue
+
+        shares = _pos(_nz(r.get("Antal aktier"), r.get("Shares")))
+        if shares is None or shares <= 0:
+            continue
+
+        bolag = str(_nz(r.get("Bolagsnamn"), ""))
+        currency = str(_nz(r.get("Valuta"), "SEK")).upper()
+
+        pay_date = _pick_next_pay_date(r)
+        if pay_date is None or pay_date < today or pay_date > horizon:
+            continue
+
+        dps_next = _next_dps_per_share(r)
+        if dps_next is None or dps_next <= 0:
+            continue
+
+        code = (currency or "USD").upper()
+        key = f"withholding_{code}"
+        try:
+            wht = float(settings.get(key, "0.15"))
+        except Exception:
+            wht = 0.15
+
+        fx = _fx_rate_to_sek(currency, fx_map)
+
+        brutto = float(dps_next * shares)
+        kalls = float(brutto * wht)
+        netto = float(brutto - kalls)
+        netto_sek = float(netto * fx)
+
+        ev = {
+            "Datum": pay_date,
+            "Ticker": ticker,
+            "Bolag": bolag,
+            "Valuta": currency,
+            "Antal": float(shares),
+            "DPS": float(dps_next),
+            "Brutto": brutto,
+            "Källskatt": kalls,
+            "Netto": netto,
+            "Netto SEK": netto_sek,
+            "Status": "Bekräftad",
+        }
+        events.append(ev)
+        confirmed_by_ticker.setdefault(ticker, []).append(ev)
+
+    # Andra passet: estimera resterande utdelningar utifrån årlig utdelning + frekvens
+    for _, r in data_df.iterrows():
+        ticker = str(r.get("Ticker") or "").strip()
+        if not ticker:
+            continue
+
+        shares = _pos(_nz(r.get("Antal aktier"), r.get("Shares")))
+        if shares is None or shares <= 0:
+            continue
+
+        bolag = str(_nz(r.get("Bolagsnamn"), ""))
+        currency = str(_nz(r.get("Valuta"), "SEK")).upper()
+
+        annual_dps = _annual_dps(r)
+        if annual_dps is None or annual_dps <= 0:
+            # Ingen årlig utdelning – behåll ev. bekräftade events men estimera inget extra
+            continue
+
+        # Frekvens
+        freq = None
+        for c in ("Utdelningsfrekvens", "Frekvens", "Frequency", "Dividend Frequency"):
+            if c in r and r[c] is not None:
+                freq = _guess_frequency(r[c])
+                if freq:
+                    break
+        if not freq:
+            # Simple default: anta kvartalsvis om inget annat anges
+            freq = 4
+
+        if freq <= 0:
+            continue
+
+        code = (currency or "USD").upper()
+        key = f"withholding_{code}"
+        try:
+            wht = float(settings.get(key, "0.15"))
+        except Exception:
+            wht = 0.15
+
+        fx = _fx_rate_to_sek(currency, fx_map)
+
+        annual_brutto = float(annual_dps * (shares or 0.0))
+        annual_netto = float(annual_brutto * (1.0 - wht))
+        annual_netto_sek = float(annual_netto * fx)
+
+        # Summera redan bekräftade brutto inom perioden
+        confirmed_list = confirmed_by_ticker.get(ticker, [])
+        confirmed_brutto = sum(ev["Brutto"] for ev in confirmed_list)
+
+        remaining_brutto = max(annual_brutto - confirmed_brutto, 0.0)
+
+        # Om allt redan "förbrukat" via bekräftade events → ingen extra estimerad
+        if remaining_brutto <= 0.0:
+            continue
+
+        # Antal kvarvarande "slots" detta år
+        remaining_slots = max(freq - len(confirmed_list), 0)
+        if remaining_slots == 0:
+            # Inga "platser" kvar – vi låter bekräftade event representera hela årets utdelning
+            continue
+
+        # Generera ungefärliga datum jämnt fördelade under året
+        if confirmed_list:
+            # Starta runt tidigaste bekräftade datum om det finns
+            base_date = min(ev["Datum"] for ev in confirmed_list)
+            if base_date < today:
+                base_date = today
+        else:
+            base_date = today
+
+        existing_dates = [ev["Datum"] for ev in confirmed_list]
+        interval_days = int(round(365.0 / float(freq)))
+        est_dates: List[dt.date] = []
+
+        # Bygg datum framåt inom horisonten, undvik krock nära bekräftade datum
+        d0 = base_date
+        while d0 < today:
+            d0 = d0 + dt.timedelta(days=interval_days)
+
+        for k in range(freq * 2):  # lite slack
+            d = d0 + dt.timedelta(days=interval_days * k)
+            if d > horizon:
+                break
+            # hoppa om vi ligger väldigt nära en bekräftad utdelning
+            if any(abs((d - ed).days) <= 10 for ed in existing_dates):
+                continue
+            est_dates.append(d)
+            if len(est_dates) >= remaining_slots:
+                break
+
+        if not est_dates:
+            continue
+
+        brutto_per_event = remaining_brutto / float(len(est_dates))
+        dps_est_per_event = brutto_per_event / float(shares or 1.0)
+        netto_per_event = brutto_per_event * (1.0 - wht)
+        netto_sek_per_event = netto_per_event * fx
+
+        for d in est_dates:
+            ev = {
+                "Datum": d,
+                "Ticker": ticker,
+                "Bolag": bolag,
+                "Valuta": currency,
+                "Antal": float(shares),
+                "DPS": float(dps_est_per_event),
+                "Brutto": float(brutto_per_event),
+                "Källskatt": float(brutto_per_event * wht),
+                "Netto": float(netto_per_event),
+                "Netto SEK": float(netto_sek_per_event),
+                "Status": "Estimerad",
+            }
+            events.append(ev)
+
+    if not events:
+        return pd.DataFrame(
+            columns=[
+                "Datum",
+                "Ticker",
+                "Bolag",
+                "Valuta",
+                "Antal",
+                "DPS",
+                "Brutto",
+                "Källskatt",
+                "Netto",
+                "Netto SEK",
+                "Status",
+            ]
+        )
+
+    df = pd.DataFrame(events)
+    # Filtrera bara kommande 12 månader (säkerhetsbälte)
+    df = df[df["Datum"].between(today, horizon)]
+    df = df.sort_values(["Datum", "Ticker"]).reset_index(drop=True)
+    return df
+
+
+def render_dividend_rolling_12m_section(
+    data_df: pd.DataFrame,
+    fx_map: Dict[str, float],
+    settings: Dict[str, Any],
+) -> None:
+    st.subheader("📆 Utdelningskalender – rullande 12 månader (netto, SEK)")
+    df_events = build_dividend_rolling_12m(data_df, fx_map, settings)
+
+    if df_events.empty:
+        st.info("Ingen utdelningsdata att estimera kommande 12 månader från.")
+        st.caption(
+            "Tips: säkerställ att du har 'Årlig utdelning' och ev. 'Utdelningsfrekvens' ifyllda, "
+            "samt antal aktier för respektive innehav."
+        )
+        return
+
+    df_events = df_events.copy()
+    df_events["Månad"] = df_events["Datum"].astype(str).str.slice(0, 7)
+
+    agg = (
+        df_events.groupby("Månad", as_index=False)["Netto SEK"]
+        .sum()
+        .sort_values("Månad")
+        .reset_index(drop=True)
+    )
+    agg["Netto SEK"] = agg["Netto SEK"].map(
+        lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")
+    )
+
+    st.markdown("**Summering per månad (netto, SEK)**")
+    _show_df(agg, height=260, use_container_width=True)
+
+    with st.expander("Visa detaljer per månad (bolag + status)"):
+        months = agg["Månad"].tolist()
+        for m in months:
+            sub = df_events[df_events["Månad"] == m].copy()
+            if sub.empty:
+                continue
+            st.markdown(f"**{m}**")
+            sub = sub.sort_values(["Datum", "Ticker"])
+            sub["Datum"] = sub["Datum"].astype(str)
+            for c in ("Brutto", "Källskatt", "Netto", "Netto SEK"):
+                if c in sub.columns:
+                    sub[c] = sub[c].map(
+                        lambda v: f"{float(v):,.2f}".replace(",", " ").replace(".", ",")
+                        if v is not None
+                        else ""
+                    )
+            _show_df(
+                sub[
+                    [
+                        "Datum",
+                        "Ticker",
+                        "Bolag",
+                        "Valuta",
+                        "Antal",
+                        "DPS",
+                        "Brutto",
+                        "Källskatt",
+                        "Netto",
+                        "Netto SEK",
+                        "Status",
+                    ]
+                ],
+                height=260,
+                use_container_width=True,
+            )
+
+
 def render_bucket_expandables(pos_df: pd.DataFrame, settings: Dict[str, str]) -> None:
     if pos_df is None or pos_df.empty:
         return
@@ -827,6 +1102,8 @@ def page_portfolio() -> None:
     st.markdown("---")
     render_portfolio_dividends_section(df, fx_map, settings)
 
+    st.markdown("---")
+    render_dividend_rolling_12m_section(df, fx_map, settings)
 
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
