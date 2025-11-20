@@ -3,10 +3,10 @@
 #
 #  - fetch_from_yahoo(): wrapper runt yahoo_fetch_for_ticker
 #  - EPS-estimat från Yahoo (earnings_trend)
-#  - AUTO-PROFIL: väljer vilka metodfamiljer som passar (per sektor/mått)
+#  - AUTO-PROFIL: väljer P/E vs EV (per sektor/mått)
 #  - Metodpriser: PE, EV/S, EV/EBITDA, P/B (+ placeholders för struktur)
 #  - Multipel-decay & PE-ankare
-#  - Fair Value idag = PE-growth-hybrid (EPS-bas * fair PE)
+#  - Fair Value idag = PE/EV-hybrid (primär familj per bolag)
 #  - Riktkurser 1–3 år = “bästa scenario” med MoS per bucket (A 5%, B 8%, C 12%)
 #  - compute_methods_for_row() → DICT (targets + metadata + methods_df)
 #  - compute_fair_values_for_row() → kompakt DICT för UI
@@ -69,12 +69,6 @@ EPS_CAGR_MAX =  0.35   # +35 %
 # P/E-tak för cykliska/crypto (aktie-VALUTA, ingen FX)
 PE_CAP_CRYPTO    = 8.0   # t.ex. MARA, RIOT, WULF m.fl.
 PE_CAP_CYCLICAL  = 10.0  # shipping, tankers, energy, materials
-
-# BDC/mREIT-tickers där P/B ofta är viktigare än P/E
-BDC_MREIT_TICKERS = {
-    "AGNC", "ARR", "DX", "EFC", "NLY", "ORC", "RITM",
-    "CSWC", "PFLT", "HRZN", "ARCC", "MAIN"
-}
 
 
 # -------------------------
@@ -180,11 +174,6 @@ def _eps_path_fill(
     eps_cagr_long: Optional[float],
     rev_cagr_hist: Optional[float],
 ) -> Tuple[float, float, float, float]:
-    """
-    Bygger en enkel EPS-path (Idag, 1 år, 2 år, 3 år).
-
-    eps_ttm: basnivå (kan vara normaliserad EPS – inte nödvändigtvis ren TTM)
-    """
     e0 = _pos(eps_ttm) or 0.0
     e1 = _pos(eps_1y)
     e2 = _pos(eps_2y)
@@ -301,20 +290,17 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
 
 
 # -------------------------
-# AUTO-PROFIL: välj metodfamiljer som passar
+# AUTO-PROFIL: välj PE vs EV per bolag
 # -------------------------
 def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, Any]:
     """
     Returnerar vilka metodfamiljer som ska användas för FV-medianen.
     Familjer: 'pe', 'ev_s', 'ev_e', 'pb'
 
-    OBS:
-    - EV/S ('ev_s') och EV/EBITDA ('ev_e') är AVSTÄNGDA tills vi är säkra på enheter.
-    - Vi använder bara:
-        • 'pe' (P/E) där positiv EPS finns
-        • 'pb' (P/B) för finans/REIT/BDC m.m. om data finns
-    - För shipping/energy/materials/crypto sätts ett P/E-TAK (pe_cap) för att
-      undvika absurda FV på cykliska super-earnings.
+    Idé:
+      - Banker/finans/REIT/BDC → primärt P/B.
+      - Tech/health/growth med orimligt P/E men vettig EV/S → primärt EV/S.
+      - Övriga → primärt P/E om möjligt, annars EV/S/EV/EBITDA som fallback.
     """
     sektor = str(_nz(row.get("Sektor"), "")).lower()
     ticker = str(_nz(row.get("Ticker"), "")).upper()
@@ -346,7 +332,10 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     is_crypto   = any(k in sektor for k in ("crypto", "bitcoin", "blockchain", "digital asset")) or \
                   ticker in {"MARA", "RIOT", "WULF", "BITF", "BTBT", "HUT", "IREN", "CIFR"}
 
-    is_bdc_mreit = ticker in BDC_MREIT_TICKERS
+    growth_like = is_tech or is_health
+
+    # Tickers som ofta är BDC/mREIT (proxy → P/B)
+    bdc_mreit_tickers = {"AGNC","ARR","DX","EFC","NLY","ORC","RITM","CSWC","PFLT","HRZN","ARCC","MAIN"}
 
     # Grund-allow baserat på data
     allow = {
@@ -356,26 +345,29 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         "pb":   (p_b is not None) and (p_b > 0) and (bvps is not None) and (bvps > 0),
     }
 
-    # Sektor-skift (bara PE/PB är relevanta när EV är avstängt)
-    if is_financial or is_bdc_mreit:
+    # P/E-nivå (används för att avgöra om P/E är "orimligt högt")
+    pe_level = None
+    for cand in (pe_fwd, pe_ttm):
+        if cand is not None and cand > 0:
+            pe_level = cand
+            break
+
+    # Sektor-skift: finans/REIT/BDC → P/B-fokuserat
+    if is_financial or is_reit or ticker in bdc_mreit_tickers:
+        # EV/S och EV/EBITDA mindre relevanta för rena finans/REIT
         allow["ev_s"] = False
         allow["ev_e"] = False
-        allow["pe"] = allow["pe"] and (eps_ttm and eps_ttm > 0)
-    elif is_reit:
-        allow["ev_s"] = False
-        allow["ev_e"] = False
-    elif is_tech or is_health:
-        if not (eps_ttm and eps_ttm > 0):
-            allow["pe"] = False
 
-    # Fallback innan vi slår av EV helt: försök åtminstone PE
-    if not any(allow.values()):
-        if (eps_ttm is not None) and (eps_ttm > 0) and (pe_ttm is not None or pe_fwd is not None):
-            allow["pe"] = True
-
-    # EV-baserade familjer AVSTÄNGDA tills enheter är lösta
-    allow["ev_s"] = False
-    allow["ev_e"] = False
+    # EV/P-E-val för growth (tech/health m.m.)
+    # Om P/E saknas eller är väldigt högt, men EV/S finns → använd EV/S som primär.
+    if growth_like and allow["ev_s"]:
+        if (pe_level is None) or (pe_level >= 50.0):
+            # Låt EV/S vara primär – P/E får finnas kvar i tabellen men inte styra FV.
+            primary_family = "ev_s"
+        else:
+            primary_family = "pe" if allow["pe"] else "ev_s"
+    else:
+        primary_family = None  # sätts strax nedan
 
     # P/E-tak per profil (bara för tydligt cykliska/crypto)
     pe_cap: Optional[float] = None
@@ -384,47 +376,53 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     elif is_shipping or is_energy or is_materials:
         pe_cap = PE_CAP_CYCLICAL
 
-    # Primär (för etikett/diagnostik)
-    if is_financial or is_reit or is_bdc_mreit:
-        prefer_order = ["pb", "pe", "ev_e", "ev_s"]
-    else:
-        prefer_order = ["pe", "ev_s", "ev_e", "pb"]
-    primary = next((fam for fam in prefer_order if allow.get(fam)), None)
+    # Om vi inte redan valt primary_family via growth-logiken:
+    if primary_family is None:
+        if is_financial or is_reit or (ticker in bdc_mreit_tickers):
+            if allow["pb"]:
+                primary_family = "pb"
+            elif allow["pe"]:
+                primary_family = "pe"
+            elif allow["ev_e"]:
+                primary_family = "ev_e"
+            elif allow["ev_s"]:
+                primary_family = "ev_s"
+            else:
+                primary_family = None
+        else:
+            # Normalbolag: P/E om det går, annars EV-fallback.
+            if allow["pe"]:
+                primary_family = "pe"
+            elif allow["ev_s"]:
+                primary_family = "ev_s"
+            elif allow["ev_e"]:
+                primary_family = "ev_e"
+            elif allow["pb"]:
+                primary_family = "pb"
+            else:
+                primary_family = None
 
     # Diagnostiksträng
     allow_bits = ", ".join([f"{k}:{'yes' if v else 'no'}" for k, v in allow.items()])
     sektor_label = (sektor or "-")
-    primary_label = (primary or "-")
+    primary_label = (primary_family or "-")
     cap_str = f", pe_cap={pe_cap:.1f}" if pe_cap is not None else ""
     why = (
         f"auto_profile: sektor='{sektor_label}', ticker='{ticker}', allow={{"
         + allow_bits + f"}}, primary='{primary_label}'{cap_str}"
     )
 
-    tags = {
-        "is_financial": is_financial,
-        "is_reit": is_reit,
-        "is_utility": is_utility,
-        "is_energy": is_energy,
-        "is_industrial": is_industrial,
-        "is_tech": is_tech,
-        "is_health": is_health,
-        "is_materials": is_materials,
-        "is_shipping": is_shipping,
-        "is_crypto": is_crypto,
-        "is_bdc_mreit": is_bdc_mreit,
-    }
-
-    return {"allow": allow, "primary": primary, "why": why, "pe_cap": pe_cap, "tags": tags}
+    return {"allow": allow, "primary": primary_family, "why": why, "pe_cap": pe_cap}
 
 
 # -------------------------
-# Fair Value via familjemedian (v3 med filtrering)
+# Fair Value via familjemedian (v3 med filtrering + primary)
 # -------------------------
 def _compute_fair_value_row_v3(
     methods_df: pd.DataFrame,
     now_price: Optional[float],
     allow_fams: Dict[str, bool],
+    primary_fam: Optional[str] = None,
 ) -> Dict[str, Any]:
     fam_map = {
         "pe_hist_vs_eps": "pe",
@@ -448,6 +446,9 @@ def _compute_fair_value_row_v3(
                 continue
             if not allow_fams.get(fam, False):
                 continue
+            if primary_fam and fam != primary_fam:
+                # Endast primär familj får styra FV (PE *eller* EV/PB)
+                continue
             v = _f(r.get(c))
             if v is None:
                 continue
@@ -459,6 +460,7 @@ def _compute_fair_value_row_v3(
             vals.append(float(v))
 
         if not vals:
+            # Fallback: om PE är tillåten, försök med pe_hist_vs_eps
             try:
                 if allow_fams.get("pe", False):
                     row_pe = methods_df[methods_df["Metod"] == "pe_hist_vs_eps"].iloc[0]
@@ -486,7 +488,11 @@ def _mos_for_bucket(bucket_label: Any) -> float:
     return 0.08
 
 
-def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str, bool]) -> Dict[str, Any]:
+def _best_case_row(
+    methods_df: pd.DataFrame,
+    allow_fams: Dict[str, bool],
+    primary_fam: Optional[str] = None,
+) -> Dict[str, Any]:
     fam_ok = {
         "pe_hist_vs_eps": "pe",
         "ev_sales": "ev_s",
@@ -498,9 +504,24 @@ def _best_case_row(methods_df: pd.DataFrame, allow_fams: Dict[str, bool]) -> Dic
     base = {"Metod": "best_case"}
     if methods_df is None or (hasattr(methods_df, "empty") and methods_df.empty):
         return {**base, **{c: np.nan for c in cols}}
-    sub = methods_df[
-        methods_df["Metod"].map(lambda m: allow_fams.get(fam_ok.get(str(m), ""), False))
-    ].copy()
+
+    sub_rows: List[pd.Series] = []
+    for _, r in methods_df.iterrows():
+        m = str(r.get("Metod") or "")
+        fam = fam_ok.get(m, "")
+        if not fam:
+            continue
+        if not allow_fams.get(fam, False):
+            continue
+        if primary_fam and fam != primary_fam:
+            continue
+        sub_rows.append(r)
+
+    if not sub_rows:
+        return {**base, **{c: np.nan for c in cols}}
+
+    sub = pd.DataFrame(sub_rows)
+
     for c in cols:
         try:
             vals = [float(v) for v in sub[c].tolist() if _f(v) is not None]
@@ -530,7 +551,7 @@ def compute_methods_for_row(
     shares   = _pos(_nz(y.get("shares_out"), row.get("Utestående aktier")))
     net_debt = _nz(y.get("net_debt"), row.get("Net debt"))
 
-    rev_ttm    = _nz(y.get("rev_ttm"), y.get("Rev TTM") if "Rev TTM" in y else row.get("Rev TTM"))
+    rev_ttm    = _nz(y.get("rev_ttm"), row.get("Rev TTM"))
     ebitda_ttm = _nz(y.get("ebitda_ttm"), row.get("EBITDA TTM"))
     eps_ttm    = _nz(y.get("eps_ttm"), row.get("EPS TTM"))
 
@@ -563,74 +584,10 @@ def compute_methods_for_row(
     if eps_cagr_long is not None:
         eps_cagr_long = max(EPS_CAGR_MIN, min(EPS_CAGR_MAX, eps_cagr_long))
 
-    # --- Sektorklassificering för EPS-fallback ---
-    sektor = str(_nz(row.get("Sektor"), "")).lower()
-    tkr_u = ticker.upper()
-    is_financial  = any(k in sektor for k in ("finans", "financial", "bank", "insurance", "forsakring", "försäkring"))
-    is_reit       = any(k in sektor for k in ("reit", "fastighet", "real estate"))
-    is_utility    = any(k in sektor for k in ("utility", "verk", "kraft", "forsorjn", "försörjn"))
-    is_energy     = any(k in sektor for k in ("energy", "olja", "oil", "gas"))
-    is_tech       = any(k in sektor for k in ("tech", "software", "internet", "semiconductor", "it"))
-    is_health     = any(k in sektor for k in ("health", "biotech", "pharma", "medtech"))
-    is_materials  = any(k in sektor for k in ("material", "metals", "mining", "steel"))
-    is_shipping   = any(k in sektor for k in ("shipping", "tanker", "bulk", "marine")) or \
-                    tkr_u in {"MPCC.OL", "HAUTO.OL", "2020.OL", "HAFNI.OL", "BWO.OL", "FRO.OL"}
-    is_bdc_mreit  = tkr_u in BDC_MREIT_TICKERS
-
-    def _guess_margin() -> float:
-        """
-        För EPS-fallback från Revenue när EPS saknas.
-        REIT/BDC/finansiella får 0 (vi förlitar oss då på P/B i stället).
-        """
-        if is_financial or is_reit or is_bdc_mreit:
-            return 0.0
-        if is_tech or is_health:
-            m = 0.18
-        elif is_energy or is_materials or is_shipping or is_utility:
-            m = 0.12
-        else:
-            m = 0.10
-        # clamp 5–25 %
-        return max(0.05, min(0.25, m))
-
-    # --- EPS-baser: normaliserad EPS + fallback från revenue ---
-    eps_ttm_f = _f(eps_ttm)
-    eps_1y_f = _f(eps_1y_est)
-    eps_2y_f = _f(eps_2y_est)
-
-    eps_fwd_norm = None
-    if _pos(eps_1y_f) and _pos(eps_2y_f):
-        eps_fwd_norm = 0.6 * float(_pos(eps_1y_f)) + 0.4 * float(_pos(eps_2y_f))
-    elif _pos(eps_1y_f):
-        eps_fwd_norm = float(_pos(eps_1y_f))
-
-    eps_base_for_path: Optional[float] = None
-    eps_ttm_pos = _pos(eps_ttm_f)
-
-    # 1) Om TTM är positiv men väldigt låg jämfört med framtida EPS → använd normaliserad framtida EPS
-    if eps_ttm_pos is not None and eps_ttm_pos > 0:
-        if eps_fwd_norm is not None and eps_ttm_pos < 0.25 * eps_fwd_norm:
-            eps_base_for_path = eps_fwd_norm
-        else:
-            eps_base_for_path = eps_ttm_pos
-    # 2) Ingen rimlig TTM men vettig framtida EPS → använd den
-    elif eps_fwd_norm is not None:
-        eps_base_for_path = eps_fwd_norm
-
-    # 3) Ingen EPS-data alls → bygg en försiktig EPS från Revenue (ej för REIT/BDC/finans)
-    if eps_base_for_path is None:
-        r0_tmp = _pos(rev_ttm)
-        sh_tmp = _pos(shares)
-        mg = _guess_margin()
-        if r0_tmp is not None and sh_tmp is not None and r0_tmp > 0 and sh_tmp > 0 and mg > 0.0:
-            eps_base_for_path = (r0_tmp * mg) / sh_tmp
-
-    if eps_base_for_path is None:
-        eps_base_for_path = 0.0  # ger i praktiken ingen P/E-effekt om allt är skräp
-
     # AUTO-PROFIL: vilka familjer + ev. P/E-tak
     profile = _auto_method_profile(row, y)
     allow_fams = profile["allow"]
+    primary_fam = profile.get("primary")
     pe_cap = profile.get("pe_cap")
 
     # P/E-ankare + decay
@@ -647,48 +604,47 @@ def compute_methods_for_row(
 
     # --- Fair Value (PE-growth-hybrid) kandidat för "Idag" ---
     fv_today_pe = None
-    if allow_fams.get("pe", False):
-        try:
-            eps_base = _pos(eps_base_for_path)
-            if eps_base is not None and eps_base > 0:
-                g = None
-                for cand in (eps_cagr_long, eps_cagr_hist, rev_cagr_hist, 0.0):
-                    if cand is not None:
-                        g = float(cand)
-                        break
-                if g is None:
-                    g = 0.0
-                if g < 0.0:
-                    g = 0.0
-                if g > 0.30:
-                    g = 0.30
+    try:
+        eps_base = _pos(eps_1y_est) or _pos(eps_ttm)
+        if eps_base is not None and eps_base > 0:
+            g = None
+            for cand in (eps_cagr_long, eps_cagr_hist, rev_cagr_hist, 0.0):
+                if cand is not None:
+                    g = float(cand)
+                    break
+            if g is None:
+                g = 0.0
+            if g < 0.0:
+                g = 0.0
+            if g > 0.30:
+                g = 0.30
 
-                pe_growth = 15.0 + 50.0 * g
+            pe_growth = 15.0 + 50.0 * g
 
-                pe_mkt = None
-                for cand in (pe_fwd, pe_anchor, pe_ttm):
-                    c = _pos(cand)
-                    if c is not None:
-                        pe_mkt = c
-                        break
-                if pe_mkt is not None:
-                    try:
-                        pe_mkt = min(float(pe_mkt), 40.0)
-                    except Exception:
-                        pass
+            pe_mkt = None
+            for cand in (pe_fwd, pe_anchor, pe_ttm):
+                c = _pos(cand)
+                if c is not None:
+                    pe_mkt = c
+                    break
+            if pe_mkt is not None:
+                try:
+                    pe_mkt = min(float(pe_mkt), 40.0)
+                except Exception:
+                    pass
 
-                pe_fair_today = None
-                if pe_growth is not None and pe_mkt is not None:
-                    pe_fair_today = 0.5 * float(pe_growth) + 0.5 * float(pe_mkt)
-                elif pe_growth is not None:
-                    pe_fair_today = float(pe_growth)
-                elif pe_mkt is not None:
-                    pe_fair_today = float(pe_mkt)
+            pe_fair_today = None
+            if pe_growth is not None and pe_mkt is not None:
+                pe_fair_today = 0.5 * float(pe_growth) + 0.5 * float(pe_mkt)
+            elif pe_growth is not None:
+                pe_fair_today = float(pe_growth)
+            elif pe_mkt is not None:
+                pe_fair_today = float(pe_mkt)
 
-                if pe_fair_today is not None and pe_fair_today > 0:
-                    fv_today_pe = float(eps_base) * float(pe_fair_today)
-        except Exception:
-            fv_today_pe = None
+            if pe_fair_today is not None and pe_fair_today > 0:
+                fv_today_pe = float(eps_base) * float(pe_fair_today)
+    except Exception:
+        fv_today_pe = None
 
     # Revenue-path
     r0 = _pos(rev_ttm)
@@ -700,9 +656,9 @@ def compute_methods_for_row(
         r2 = r1 * (1.0 + g)
         r3 = r2 * (1.0 + g)
 
-    # EPS-path (baserad på normaliserad EPS)
+    # EPS-path
     e0, e1, e2, e3 = _eps_path_fill(
-        eps_base_for_path,
+        _f(eps_ttm),
         eps_1y_est,
         eps_2y_est,
         eps_cagr_hist,
@@ -771,17 +727,17 @@ def compute_methods_for_row(
     for m in ("p_nav", "p_tbv", "p_affo", "p_fcf", "ev_fcf", "p_nii"):
         methods.append({"Metod": m, "Idag": None, "1 år": None, "2 år": None, "3 år": None})
 
-    methods_df = pd.DataFrame(methods, columns=["Metod", "Idag", "1 år", "2 år", "3 år"])
+    methods_df = pd.DataFrame(methods, columns=["Metod","Idag","1 år","2 år","3 år"])
 
     # --- Fair Value (familjemedian, filtrerad av auto-profil) = bas ---
-    fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams)
+    fv_row = _compute_fair_value_row_v3(methods_df, price, allow_fams, primary_fam)
 
-    # P/E-hybrid override bara om P/E verkligen är en tillåten familj
-    if fv_today_pe is not None and allow_fams.get("pe", False):
+    # Om PE-FV finns och primär familj är PE → använd PE-hybriden för "Idag"
+    if fv_today_pe is not None and primary_fam == "pe":
         fv_row["Idag"] = fv_today_pe
 
-    # --- Bästa scenario ---
-    best_row = _best_case_row(methods_df, allow_fams)
+    # --- Bästa scenario (inom vald familj) ---
+    best_row = _best_case_row(methods_df, allow_fams, primary_fam)
 
     # --- Margin of Safety per bucket ---
     bucket_label = str(_nz(row.get("Bucket"), "") or "")
@@ -801,8 +757,7 @@ def compute_methods_for_row(
 
     sanity = (
         f"price={'ok' if price else '-'}, "
-        f"eps_ttm={'ok' if (eps_ttm or eps_ttm == 0) else '-'}, "
-        f"eps_base_norm={'ok' if _pos(eps_base_for_path) else '-'}, "
+        f"eps_ttm={'ok' if (eps_ttm or eps_ttm==0) else '-'}, "
         f"eps_1y={'ok' if eps_1y_est else '-'}, "
         f"eps_2y={'ok' if eps_2y_est else '-'}, "
         f"rev_ttm={'ok' if rev_ttm else '-'}, "
@@ -810,9 +765,9 @@ def compute_methods_for_row(
         f"(clamp={REV_CAGR_MIN*100:.0f}%..{REV_CAGR_MAX*100:.0f}%), "
         f"eps_cagr_hist={'ok' if _f(eps_cagr_hist) is not None else '-'}"
         f"(clamp={EPS_CAGR_MIN*100:.0f}%..{EPS_CAGR_MAX*100:.0f}%), "
-        f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm == 0) else '-'}, "
+        f"ebitda_ttm={'ok' if (ebitda_ttm or ebitda_ttm==0) else '-'}, "
         f"shares={'ok' if shares else '-'}, "
-        f"pe_anchor={round(pe_anchor, 2) if pe_anchor else '-'}, decay={decay}, "
+        f"pe_anchor={round(pe_anchor,2) if pe_anchor else '-'}, decay={decay}, "
         f"bucket='{bucket_label or '-'}' -> MoS={int(mos*100)}%, "
         f"{profile['why']}"
     )
