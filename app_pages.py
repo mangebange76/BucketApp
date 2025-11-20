@@ -29,6 +29,25 @@ from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_meth
 
 
 # -------------------------
+# Små helpers
+# -------------------------
+def _safe_str_val(x: Any) -> str:
+    """
+    Returnerar '' om värdet är None/NaN/'nan', annars strippad sträng.
+    Hindrar att vi får 'nan' som bolagsnamn/sektor och gör det lättare
+    att avgöra om fältet verkligen är tomt.
+    """
+    if x is None:
+        return ""
+    if isinstance(x, float) and (pd.isna(x) or math.isnan(x)):
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s
+
+
+# -------------------------
 # Små UI-hjälpare (sök + nav)
 # -------------------------
 def _names_map_from_df(df: pd.DataFrame) -> Dict[str, str]:
@@ -37,7 +56,7 @@ def _names_map_from_df(df: pd.DataFrame) -> Dict[str, str]:
         return out
     for _, r in df.iterrows():
         t = str(r.get("Ticker") or "").upper().strip()
-        n = str(r.get("Bolagsnamn") or "").strip()
+        n = _safe_str_val(r.get("Bolagsnamn"))
         if t:
             out[t] = f"{t} — {n}" if n else t
     return out
@@ -162,8 +181,8 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
 def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, Any]:
     y = fetch_from_yahoo(tkr)
 
-    # --- NYTT: fyll Bolagsnamn & Sektor, men respektera manuell text ---
-    existing_name = str(existing_row.get("Bolagsnamn") or "").strip()
+    # Fyll Bolagsnamn & Sektor – men bara om de inte redan har manuell text
+    existing_name = _safe_str_val(existing_row.get("Bolagsnamn"))
     if existing_name:
         name = existing_name
     else:
@@ -173,7 +192,7 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
             or y.get("shortName")
         )
 
-    existing_sector = str(existing_row.get("Sektor") or "").strip()
+    existing_sector = _safe_str_val(existing_row.get("Sektor"))
     if existing_sector:
         sector = existing_sector
     else:
@@ -181,7 +200,6 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
             y.get("sector")
             or y.get("industry")
         )
-    # -------------------------------------------------------------
 
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
@@ -379,8 +397,7 @@ def page_add_ticker() -> None:
                 try:
                     y = fetch_from_yahoo(tkr)
 
-                    # --- NYTT: fyll Bolagsnamn & Sektor om de saknas manuellt ---
-                    existing_name = str(new_row.get("Bolagsnamn") or "").strip()
+                    existing_name = _safe_str_val(new_row.get("Bolagsnamn"))
                     if existing_name:
                         name = existing_name
                     else:
@@ -390,7 +407,7 @@ def page_add_ticker() -> None:
                             or y.get("shortName")
                         )
 
-                    existing_sector = str(new_row.get("Sektor") or "").strip()
+                    existing_sector = _safe_str_val(new_row.get("Sektor"))
                     if existing_sector:
                         sector_y = existing_sector
                     else:
@@ -398,7 +415,6 @@ def page_add_ticker() -> None:
                             y.get("sector")
                             or y.get("industry")
                         )
-                    # ------------------------------------------------------------
 
                     pre = {
                         "Bolagsnamn": name,
