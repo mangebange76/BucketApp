@@ -6,6 +6,7 @@ import json
 import math
 import os
 from typing import Any, Dict, Optional
+from collections.abc import Mapping
 
 import pandas as pd
 import numpy as np
@@ -109,15 +110,17 @@ def _env_or_secret(key: str, default: Optional[str] = None) -> Optional[str]:
 def _get_gspread_client() -> gspread.Client:
     """
     Bygger en gspread-klient från st.secrets["GOOGLE_CREDENTIALS"].
+
     Stöder:
-      - dict
+      - TOML-tabell / dict / SecretsDict  (t.ex. [GOOGLE_CREDENTIALS] i secrets.toml)
       - JSON-sträng
     """
     raw = st.secrets.get("GOOGLE_CREDENTIALS", None)
     if raw is None:
         raise RuntimeError("Saknar GOOGLE_CREDENTIALS i Streamlit secrets.")
 
-    if isinstance(raw, dict):
+    # 🔑 Viktigt: acceptera alla Mapping-typer (SecretsDict, dict, osv)
+    if isinstance(raw, Mapping):
         creds_dict = dict(raw)
     else:
         # Förväntar oss JSON-sträng
