@@ -124,7 +124,6 @@ def page_settings() -> None:
             st.cache_data.clear()
             st.session_state["SETTINGS_MAP"] = get_settings_map()
             st.success("Settings sparade. Laddar om sidan…")
-            st.experimental_rerun()
         except Exception as e:
             st.error(f"Kunde inte spara: {e}")
 
