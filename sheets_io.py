@@ -12,10 +12,10 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import gspread
+import yfinance as yf
 from gspread import Spreadsheet, Worksheet
 from gspread.exceptions import WorksheetNotFound, APIError
 from google.oauth2.service_account import Credentials
-import yfinance as yf  # Live-FX via Yahoo
 
 from core_utils import (
     _f,
@@ -324,6 +324,66 @@ def write_data_df(df: pd.DataFrame) -> None:
 # Settings-hantering
 # =============================
 
+def _ensure_settings_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Säkerställ att Settings-bladet har åtminstone de kolumner som
+    SETTINGS_COLUMNS anger (oftast t.ex. ['Nyckel', 'Värde']).
+    """
+    if df is None or df.empty:
+        if SETTINGS_COLUMNS and len(SETTINGS_COLUMNS) >= 2:
+            df = pd.DataFrame(columns=SETTINGS_COLUMNS)
+        else:
+            df = pd.DataFrame(columns=["Nyckel", "Värde"])
+        return df
+
+    target_cols: list[str]
+    if SETTINGS_COLUMNS and len(SETTINGS_COLUMNS) >= 2:
+        target_cols = list(SETTINGS_COLUMNS)
+    else:
+        # Fallback: använd första två kolumner + behåll resten
+        if len(df.columns) < 2:
+            df = pd.DataFrame(columns=["Nyckel", "Värde"])
+            return df
+        target_cols = [df.columns[0], df.columns[1]]
+
+    for c in target_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    extra = [c for c in df.columns if c not in target_cols]
+    df = df[target_cols + extra]
+    return df
+
+
+def _upsert_setting(key: str, value: Any) -> None:
+    """
+    Skapar eller uppdaterar en rad i Settings-bladet med given nyckel.
+    Använder första kolumnen som 'nyckel', andra som 'värde'.
+    """
+    df = _read_df(SETTINGS_TITLE)
+    df = _ensure_settings_columns(df)
+
+    if len(df.columns) < 2:
+        # Kan inte göra så mycket utan minst två kolumner
+        return
+
+    key_col = df.columns[0]
+    val_col = df.columns[1]
+
+    if key_col not in df.columns or val_col not in df.columns:
+        return
+
+    mask = df[key_col].astype(str) == str(key)
+    if mask.any():
+        df.loc[mask, val_col] = str(value)
+    else:
+        new_row = {col: "" for col in df.columns}
+        new_row[key_col] = str(key)
+        new_row[val_col] = str(value)
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+    _write_df(SETTINGS_TITLE, df)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_settings_map() -> Dict[str, str]:
     """
@@ -366,103 +426,62 @@ def get_settings_map() -> Dict[str, str]:
     return settings
 
 
-def _set_settings_value(key: str, value: str) -> None:
-    """
-    Sätter/uppdaterar en rad i Settings-bladet:
-      Nyckel = key, Värde = value.
-
-    Försöker respektera befintlig struktur (Nyckel/Värde eller Key/Value).
-    """
-    df = _read_df(SETTINGS_TITLE)
-    if df is None or df.empty:
-        # Försök använda SETTINGS_COLUMNS om möjligt
-        if isinstance(SETTINGS_COLUMNS, (list, tuple)) and len(SETTINGS_COLUMNS) >= 2:
-            df = pd.DataFrame(columns=list(SETTINGS_COLUMNS))
-        else:
-            df = pd.DataFrame(columns=["Nyckel", "Värde"])
-
-    # Hitta key/value-kolumner
-    key_col = None
-    val_col = None
-    for cand in ("Nyckel", "Key", "Setting", "Inställning"):
-        if cand in df.columns:
-            key_col = cand
-            break
-    for cand in ("Värde", "Varde", "Value"):
-        if cand in df.columns:
-            val_col = cand
-            break
-
-    # Fallback: första två kolumner
-    if key_col is None or val_col is None:
-        cols = list(df.columns)
-        if len(cols) < 2:
-            # Skapa default-struktur
-            df = pd.DataFrame(columns=["Nyckel", "Värde"])
-            key_col = "Nyckel"
-            val_col = "Värde"
-        else:
-            key_col = cols[0]
-            val_col = cols[1]
-
-    # Uppdatera/befintlig rad eller lägg till ny
-    mask = df[key_col].astype(str).str.strip() == str(key).strip()
-    if mask.any():
-        idx = df.index[mask][0]
-        df.at[idx, key_col] = str(key)
-        df.at[idx, val_col] = str(value)
-    else:
-        new_row = {c: "" for c in df.columns}
-        new_row[key_col] = str(key)
-        new_row[val_col] = str(value)
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-    _write_df(SETTINGS_TITLE, df)
-    # Uppdatera session/ cache-indirekt
-    try:
-        st.session_state["SETTINGS_MAP"] = get_settings_map()
-    except Exception:
-        pass
-
-
 # =============================
 # FX-hantering (Valutakurser)
 # =============================
 
-def _fetch_live_fx_for_codes(codes: list[str]) -> Dict[str, float]:
+def _fx_df_to_map(df: pd.DataFrame) -> Dict[str, float]:
     """
-    Hämtar live FX mot SEK via Yahoo Finance för en lista med valutakoder.
-    Returnerar { 'USD': 10.50, 'NOK': 1.02, ... }.
+    Hjälpare: omvandlar en DataFrame från FX-bladet till dict {valuta → kurs}.
     """
+    if df is None or df.empty:
+        return {}
+
+    # Säkerställ str-kolumnnamn
+    df = df.copy()
+    df.columns = [str(c) for c in df.columns]
+
+    cur_col = None
+    for cand in ("Valuta", "Currency", "CUR", "Fx", "FX"):
+        if cand in df.columns:
+            cur_col = cand
+            break
+
+    rate_col = None
+    for cand in ("SEK", "Kurs", "Rate", "Fx-rate"):
+        if cand in df.columns:
+            rate_col = cand
+            break
+
+    # Fallback: använd första två kolumner
+    if cur_col is None or rate_col is None:
+        if len(df.columns) >= 2:
+            cur_col = df.columns[0]
+            rate_col = df.columns[1]
+        else:
+            return {}
+
     out: Dict[str, float] = {}
-    for code in codes:
-        if not code or code.upper() == "SEK":
+    for _, r in df.iterrows():
+        c = r.get(cur_col)
+        if c is None:
             continue
-        cur = code.upper().strip()
-        pair = f"{cur}SEK=X"
-        try:
-            t = yf.Ticker(pair)
-            px = None
-            # Försök fast_info först (snabbt)
-            try:
-                fi = getattr(t, "fast_info", None)
-                if fi is not None:
-                    px = getattr(fi, "last_price", None)
-            except Exception:
-                px = None
-            # Fallback: använd history om vi inte fick något
-            if px is None:
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    px = float(hist["Close"].iloc[-1])
-            if px is None:
-                continue
-            px_f = float(px)
-            if math.isfinite(px_f) and px_f > 0:
-                out[cur] = px_f
-        except Exception:
-            # Misslyckad kurs för en valuta ska inte krascha allt
+        code = str(c).strip().upper()
+        if not code:
             continue
+        val = _f(r.get(rate_col))
+        if val is None or not math.isfinite(val) or val <= 0:
+            continue
+
+        # Direkt valuta-kod
+        out[code] = float(val)
+        # Stöd för t.ex. "USDSEK" → "USD"
+        if len(code) == 6 and code.endswith("SEK"):
+            base = code[:3]
+            out[base] = float(val)
+
+    if "SEK" not in out:
+        out["SEK"] = 1.0
     return out
 
 
@@ -471,168 +490,148 @@ def get_fx_map() -> Dict[str, float]:
     """
     Läser 'Valutakurser'-bladet och returnerar:
       { 'USD': 10.50, 'NOK': 1.02, ... }  (valuta → SEK-kurs)
-
-    NYTT:
-      - Försöker automatiskt hämta live-kurser via Yahoo för saknade/ogiltiga valutor.
-      - Uppdaterar FX-bladet.
-      - Lägger timestamp i FX-bladet (kolumn 'Senast uppdaterad').
-      - Skriver timestamp 'FX_LAST_UPDATE_TS' till Settings-bladet.
-      - Lägger även ts i st.session_state['FX_TS'] som bevis i UI.
     """
     df = _read_df(FX_TITLE)
+    return _fx_df_to_map(df)
 
-    # Säkerställ str-kolumnnamn
-    if df is not None and not df.empty:
-        df.columns = [str(c) for c in df.columns]
 
-    cur_col = None
-    if df is not None and not df.empty:
-        for cand in ("Valuta", "Currency", "CUR", "Fx", "FX"):
-            if cand in df.columns:
-                cur_col = cand
-                break
+def _fetch_fx_to_sek(code: str) -> Optional[float]:
+    """
+    Hämtar live-kurs för <code>/SEK via Yahoo Finance, t.ex. USD → ticker 'USDSEK=X'.
+    Returnerar kurs (float) eller None vid fel.
+    """
+    cur = (code or "").strip().upper()
+    if not cur:
+        return None
+    if cur == "SEK":
+        return 1.0
 
-    rate_col = None
-    if df is not None and not df.empty:
-        for cand in ("SEK", "Kurs", "Rate", "Fx-rate"):
-            if cand in df.columns:
-                rate_col = cand
-                break
+    symbol = f"{cur}SEK=X"
+    try:
+        t = yf.Ticker(symbol)
+    except Exception:
+        return None
 
-    # Fallback: använd första två kolumner
-    if df is not None and not df.empty and (cur_col is None or rate_col is None):
-        if len(df.columns) >= 2:
-            cur_col = df.columns[0]
-            rate_col = df.columns[1]
+    price = None
 
-    out: Dict[str, float] = {}
+    # Försök först med fast_info
+    try:
+        fi = getattr(t, "fast_info", None)
+        if isinstance(fi, dict):
+            price = fi.get("last_price") or fi.get("lastPrice") or fi.get("last")
+    except Exception:
+        price = None
 
-    if df is not None and not df.empty and cur_col is not None and rate_col is not None:
-        for _, r in df.iterrows():
-            c = r.get(cur_col)
-            if c is None:
-                continue
-            code = str(c).strip().upper()
-            if not code:
-                continue
-            val = _f(r.get(rate_col))
-            if val is None or not math.isfinite(val) or val <= 0:
-                continue
+    # Fallback: history
+    if price is None:
+        try:
+            hist = t.history(period="5d")
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+        except Exception:
+            price = None
 
-            # Direkt valuta-kod
-            out[code] = float(val)
-            # Stöd för t.ex. "USDSEK" → "USD"
-            if len(code) == 6 and code.endswith("SEK"):
-                base = code[:3]
-                out[base] = float(val)
+    try:
+        if price is None:
+            return None
+        price_f = float(price)
+        if not math.isfinite(price_f) or price_f <= 0:
+            return None
+        return price_f
+    except Exception:
+        return None
 
-    # SEKmappning baseline
-    if "SEK" not in out:
-        out["SEK"] = 1.0
 
-    # Lista ut vilka valutor vi *behöver* baserat på Data-bladet
-    needed: set[str] = set()
+def refresh_fx_live() -> None:
+    """
+    Hämtar aktuella valutakurser via Yahoo Finance och skriver dem till FX-bladet.
+    - Valutor hämtas från:
+        • 'Valuta'-kolumnen i Data-bladet
+        • några standard: USD, EUR, NOK, CAD, GBP, DKK
+    - Skriver fliken 'Valutakurser' med kolumner:
+        ['Valuta', 'SEK', 'Senast uppdaterad']
+    - Skriver även 'FX_LAST_UPDATE_TS' + 'FX_LAST_SOURCE' i Settings-bladet.
+    """
+    # 1) Bestäm vilka valutor vi bryr oss om
     try:
         data_df = read_data_df()
-        if data_df is not None and not data_df.empty and "Valuta" in data_df.columns:
-            for v in data_df["Valuta"]:
-                if v is None:
-                    continue
-                s = str(v).strip().upper()
-                if s:
-                    needed.add(s)
     except Exception:
-        pass
+        data_df = pd.DataFrame()
 
-    # Lägg till några vanliga per default
-    needed.update({"USD", "NOK", "EUR", "CAD", "DKK", "GBP"})
-    if "SEK" in needed:
-        needed.discard("SEK")
+    codes: set[str] = set()
+    if data_df is not None and not data_df.empty and "Valuta" in data_df.columns:
+        for v in data_df["Valuta"].dropna().tolist():
+            s = str(v).strip().upper()
+            if len(s) == 3:
+                codes.add(s)
 
-    # Vilka saknar vi / är ogiltiga?
-    missing: list[str] = []
-    for c in sorted(needed):
-        v = out.get(c)
-        if v is None or not math.isfinite(v) or v <= 0:
-            missing.append(c)
+    # Grundvalutor vi nästan alltid vill ha
+    base_defaults = {"USD", "EUR", "NOK", "CAD", "GBP", "DKK"}
+    codes.update(base_defaults)
+    codes.add("SEK")
 
-    fx_live: Dict[str, float] = {}
-    if missing:
-        fx_live = _fetch_live_fx_for_codes(missing)
+    # 2) Existerande kurser (ifall någon ny hämtning misslyckas)
+    try:
+        df_old_fx = _read_df(FX_TITLE)
+        existing_map = _fx_df_to_map(df_old_fx)
+    except Exception:
+        existing_map = {}
 
-    # Om vi fått några livekurser: uppdatera både mapping + FX-bladet + timestamp
-    if fx_live:
-        # Uppdatera mapping
-        for k, v in fx_live.items():
-            if v is None or not math.isfinite(v) or v <= 0:
-                continue
-            out[k] = float(v)
+    # 3) Hämta livekurser
+    ts = now_stamp()
+    new_rates: Dict[str, float] = {}
+    failed: list[str] = []
 
-        # Uppdatera FX-bladet
-        # Om tomt: skapa enkel struktur 'Valuta' / 'SEK'
-        if df is None or df.empty:
-            df = pd.DataFrame(
-                {
-                    "Valuta": list(fx_live.keys()),
-                    "SEK": [float(v) for v in fx_live.values()],
-                }
-            )
-            cur_col = "Valuta"
-            rate_col = "SEK"
-        else:
-            # Se till att vi har rimliga kolumner
-            if cur_col is None or rate_col is None:
-                # Skapa enkel struktur från scratch
-                df = pd.DataFrame(
-                    {
-                        "Valuta": list(fx_live.keys()),
-                        "SEK": [float(v) for v in fx_live.values()],
-                    }
-                )
-                cur_col = "Valuta"
-                rate_col = "SEK"
+    for code in sorted(codes):
+        if code == "SEK":
+            new_rates["SEK"] = 1.0
+            continue
+
+        rate = _fetch_fx_to_sek(code)
+        if rate is None:
+            # fallback: gammal kurs om den finns
+            old = existing_map.get(code)
+            if old is not None and math.isfinite(old) and old > 0:
+                new_rates[code] = float(old)
             else:
-                df = df.copy()
-                df[cur_col] = df[cur_col].astype(str)
+                failed.append(code)
+        else:
+            new_rates[code] = float(rate)
 
-                for code, rate in fx_live.items():
-                    if rate is None or not math.isfinite(rate) or rate <= 0:
-                        continue
-                    mask = df[cur_col].astype(str).str.upper().str.strip() == str(code).upper()
-                    if mask.any():
-                        idx = df.index[mask][0]
-                        df.at[idx, rate_col] = str(float(rate))
-                    else:
-                        # Lägg till ny rad
-                        new_row = {c: "" for c in df.columns}
-                        new_row[cur_col] = str(code)
-                        new_row[rate_col] = str(float(rate))
-                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    # Om vi inte lyckades få nåt alls (förutom ev. SEK) → gör inget
+    if not new_rates:
+        return
 
-        # Timestamp för denna FX-uppdatering
-        ts = now_stamp()
+    # 4) Skriv tillbaka till FX-bladet
+    rows = []
+    for c, r in sorted(new_rates.items()):
+        rows.append(
+            {
+                "Valuta": c,
+                "SEK": r,
+                "Senast uppdaterad": ts,
+            }
+        )
+    df_fx = pd.DataFrame(rows, columns=["Valuta", "SEK", "Senast uppdaterad"])
+    _write_df(FX_TITLE, df_fx)
 
-        # Lägg in timestamp som kolumn i FX-bladet (syns direkt för dig)
-        df["Senast uppdaterad"] = ts
+    # 5) Sätt timestamp + källa i Settings
+    _upsert_setting("FX_LAST_UPDATE_TS", ts)
+    _upsert_setting("FX_LAST_SOURCE", "Yahoo Finance FX (XXXSEK=X)")
 
+    # 6) Invalidera cache så get_fx_map() läser in nya värden
+    try:
+        get_fx_map.clear()
+    except Exception:
         try:
-            _write_df(FX_TITLE, df)
-        except Exception as e:
-            st.error(f"Kunde inte skriva FX-bladet med timestamp: {e}")
+            st.cache_data.clear()
+        except Exception:
+            pass
 
-        # Sätt timestamp i Settings + session (bevis)
-        st.session_state["FX_TS"] = ts
-        try:
-            _set_settings_value("FX_LAST_UPDATE_TS", ts)
-        except Exception as e:
-            # Visa bara en varning – FX-funktionalitet ska inte krascha appen
-            st.warning(f"Kunde inte skriva FX_LAST_UPDATE_TS i Settings: {e}")
-
-    # Sista säkerhetsbälte
-    if "SEK" not in out:
-        out["SEK"] = 1.0
-
-    return out
+    # Ev. debug/info i logg (inte i UI)
+    if failed:
+        # Tyst logg, inte UI
+        print(f"[refresh_fx_live] Kunde inte uppdatera vissa valutor: {', '.join(failed)}")
 
 
 # =============================
