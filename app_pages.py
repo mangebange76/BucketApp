@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests  # 🌍 LIVE FX: behövs för att hämta valutakurser
+import yfinance as yf  # 🔹 för live FX-kurser
 
 from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
 from sheets_io import (
@@ -27,6 +27,168 @@ from sheets_io import (
     SNAPSHOT_TITLE,
 )
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
+
+
+# ============================================================
+# 💱 Live FX-kurser (uppdateras vid appstart / första anrop)
+# ============================================================
+
+SUPPORTED_FX_PAIRS: Dict[str, str] = {
+    "USD": "USDSEK=X",
+    "EUR": "EURSEK=X",
+    "NOK": "NOKSEK=X",
+    "CAD": "CADSEK=X",
+    "GBP": "GBPSEK=X",
+}
+
+
+def get_live_fx_map() -> Dict[str, float]:
+    """
+    Bygger en FX-karta med utgångspunkt i get_fx_map() (Valutakurser-bladet)
+    och försöker sedan hämta livekurser via Yahoo Finance.
+
+    - Uppdaterar bara koder där vi har definierade FX-par i SUPPORTED_FX_PAIRS.
+    - Alltid SEK = 1.0
+    - Sparar resultatet i st.session_state["FX"] så det delas mellan vyer.
+    """
+    base: Dict[str, float] = {}
+    try:
+        base_raw = get_fx_map() or {}
+        base = {str(k).upper(): float(v) for k, v in base_raw.items() if v is not None}
+    except Exception:
+        base = {}
+
+    # Alltid SEK = 1.0
+    base["SEK"] = 1.0
+
+    # Försök lista vilka valutor som faktiskt används i DATA
+    try:
+        df = st.session_state.get("DATA")
+        used: set[str] = set()
+        if isinstance(df, pd.DataFrame) and not df.empty and "Valuta" in df.columns:
+            used.update(
+                str(v).upper().strip()
+                for v in df["Valuta"].dropna().unique().tolist()
+            )
+        # Lägg även till alla kända för säkerhets skull
+        used.update(SUPPORTED_FX_PAIRS.keys())
+        used.discard("SEK")
+
+        pairs: Dict[str, str] = {
+            code: SUPPORTED_FX_PAIRS[code]
+            for code in used
+            if code in SUPPORTED_FX_PAIRS
+        }
+        if not pairs:
+            st.session_state["FX"] = base
+            return base
+
+        tickers_str = " ".join(sorted(set(pairs.values())))
+        try:
+            data = yf.download(
+                tickers_str,
+                period="1d",
+                interval="1d",
+                progress=False,
+            )
+        except Exception:
+            data = None
+
+        if data is not None and not isinstance(data, (float, int)):
+            # yfinance returnerar DataFrame med "Close"
+            try:
+                close = data["Close"].iloc[-1]
+            except Exception:
+                close = None
+
+            if isinstance(close, pd.Series):
+                for code, pair in pairs.items():
+                    if pair in close.index and pd.notna(close[pair]):
+                        try:
+                            base[code] = float(close[pair])
+                        except Exception:
+                            continue
+            else:
+                # Specialfall: bara ett par
+                pair_list = list(pairs.items())
+                if close is not None and not pd.isna(close) and pair_list:
+                    code, _pair = pair_list[0]
+                    try:
+                        base[code] = float(close)
+                    except Exception:
+                        pass
+    except Exception:
+        # Vid fel behåll bara befintlig karta
+        pass
+
+    st.session_state["FX"] = base
+    return base
+
+
+# -------------------------
+# Snapshot-hantering (auto + manuell)
+# -------------------------
+def _append_snapshot(ts: Optional[str] = None) -> None:
+    """
+    Skapar/append:ar en snapshot av Data-bladet till SNAPSHOT_TITLE.
+
+    - Läser 'Data' via read_data_df()
+    - Lägger in kolumn 'Snapshot TS' med tidsstämpel
+    - Append:ar till SNAPSHOT_TITLE-bladet
+    - Behåller max 10 unika snapshot-tidsstämplar (äldsta tas bort)
+    """
+    try:
+        df = read_data_df()
+        if df is None or df.empty:
+            return
+
+        if ts is None:
+            ts = now_stamp()
+
+        df_add = df.copy()
+        df_add.insert(0, "Snapshot TS", ts)
+
+        try:
+            snap_old = _read_df(SNAPSHOT_TITLE)
+        except Exception:
+            snap_old = None
+
+        if snap_old is None or snap_old.empty:
+            snap_new = df_add
+        else:
+            snap_new = pd.concat([snap_old, df_add], ignore_index=True)
+
+            # Säkerställ kolumnen finns
+            if "Snapshot TS" not in snap_new.columns:
+                snap_new.insert(0, "Snapshot TS", ts)
+
+            # Behåll max 10 snapshots baserat på unika "Snapshot TS"
+            ts_list = snap_new["Snapshot TS"].astype(str).tolist()
+            seen: List[str] = []
+            for v in ts_list:
+                if v not in seen:
+                    seen.append(v)
+
+            if len(seen) > 10:
+                keep_ts = set(seen[-10:])  # behåll de 10 senaste
+                snap_new = snap_new[snap_new["Snapshot TS"].astype(str).isin(keep_ts)].copy()
+
+        _write_df(SNAPSHOT_TITLE, snap_new)
+    except Exception:
+        # Snapshot får aldrig krascha appen – svälj ev. fel tyst.
+        pass
+
+
+def _auto_snapshot_on_import() -> None:
+    """
+    Skapar en snapshot av Data-bladet vid första import av denna modul.
+    Körs EN gång per Python-process (modul-import), vilket i Streamlit
+    motsvarar "appstart" snarare än varje rerun.
+    """
+    _append_snapshot()
+
+
+_auto_snapshot_on_import()
 
 
 # -------------------------
@@ -149,12 +311,17 @@ def page_settings() -> None:
 
 
 # ============================================================
-# 🕒 Snapshot (read-only)
+# 🕒 Snapshot (read-only + manuell trigger)
 # ============================================================
 def page_snapshot() -> None:
     st.header("🕒 Snapshot")
+
+    if st.button("📸 Skapa snapshot nu"):
+        _append_snapshot()
+        st.success("Ny snapshot skapad från aktuellt Data-blad.")
+
     snap = _read_df(SNAPSHOT_TITLE)
-    if snap.empty:
+    if snap is None or snap.empty:
         st.info("Inga snapshots ännu.")
         return
     _show_df(snap, height=420, use_container_width=True)
@@ -465,49 +632,6 @@ def _fx_rate_to_sek(currency: str, fx_map: Dict[str, float]) -> float:
         return 1.0
 
 
-# 🌍 LIVE FX: hämta livekurser (USD/EUR/NOK/CAD/GBP) och kombinera med Valutakurser-bladet
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_live_fx_map() -> Dict[str, float]:
-    """
-    Hämtar grundkartan från get_fx_map() (Valutakurser-bladet)
-    och försöker sedan skriva över USD/EUR/NOK/CAD/GBP med live-kurser
-    från en extern FX-tjänst. Cacheas i 1 timme.
-    """
-    base = get_fx_map() or {}
-    fx: Dict[str, float] = dict(base)
-
-    # Säkerställ SEK = 1.0
-    fx.setdefault("SEK", 1.0)
-
-    try:
-        # exchangerate.host: base=SEK → rates[USD] = hur många USD man får för 1 SEK.
-        # Vi vill ha SEK per 1 USD, så vi inverterar.
-        url = "https://api.exchangerate.host/latest"
-        resp = requests.get(url, params={"base": "SEK"}, timeout=5)
-        if not resp.ok:
-            return fx
-        data = resp.json()
-        rates = data.get("rates", {}) or {}
-
-        wanted = ["USD", "EUR", "NOK", "CAD", "GBP"]
-        for code in wanted:
-            raw = rates.get(code)
-            try:
-                if raw is None:
-                    continue
-                # raw = foreign per 1 SEK → 1 foreign = 1/raw SEK
-                v = 1.0 / float(raw)
-                if math.isfinite(v) and v > 0:
-                    fx[code] = float(v)
-            except Exception:
-                continue
-    except Exception:
-        # Vid problem: använd bara base-uppsättningen från sheet
-        return fx
-
-    return fx
-
-
 def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> pd.DataFrame:
     cols = [
         "Ticker",
@@ -790,6 +914,7 @@ def render_portfolio_dividends_section(
         except Exception:
             st.caption("Kunde inte göra månadssummering (saknade datum eller värden).")
 
+
 # ============================================================
 # 📆 Rullande 12 mån utdelningskalender (estimat + bekräftade)
 # ============================================================
@@ -1070,7 +1195,7 @@ def render_dividend_rolling_12m_section(
             for c in ("Brutto", "Källskatt", "Netto", "Netto SEK"):
                 if c in sub.columns:
                     sub[c] = sub[c].map(
-                        lambda v: f"{float(v):,.2f}".replace(",", " ").replace(".", ",")
+                        lambda v: f"{float(v):, .2f}".replace(",", " ").replace(".", ",")
                         if v is not None
                         else ""
                     )
@@ -1127,10 +1252,8 @@ def page_portfolio() -> None:
         st.warning("Ingen data laddad.")
         return
 
-    # 🔄 Använd livekurser vid start
-    fx_map = get_live_fx_map()
-    st.session_state["FX"] = fx_map
-
+    # 🔄 Hämta live FX vid första anrop, återanvänd annars från session
+    fx_map = st.session_state.get("FX") or get_live_fx_map()
     settings = get_settings_map()
 
     pos = _position_value_tables(df, fx_map)
@@ -1152,9 +1275,9 @@ def page_portfolio() -> None:
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
 
-
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
+#    med urval: alla / endast innehav / valda Buckets
 # ============================================================
 def page_batch() -> None:
     st.header("🧩 Massuppdatering (Yahoo) — 1s per bolag")
@@ -1163,12 +1286,77 @@ def page_batch() -> None:
         st.info("Data-bladet är tomt.")
         return
 
-    tickers = sorted(df["Ticker"].dropna().astype(str).unique().tolist())
-    sel = st.multiselect("Välj tickers (tom = alla)", options=tickers, default=[])
-    target = tickers if len(sel) == 0 else sel
+    base = df.copy()
+    if "Antal aktier" in base.columns:
+        base["Antal aktier"] = pd.to_numeric(base["Antal aktier"], errors="coerce")
+
+    # Urval: alla / endast innehav / valda buckets
+    st.markdown("### Urval att uppdatera")
+    mode = st.radio(
+        "Välj vilka rader som ska ingå i massuppdateringen:",
+        ["Alla bolag", "Endast innehav", "Välj Buckets"],
+        index=0,
+        horizontal=True,
+    )
+
+    subset = base
+    selected_buckets: List[str] = []
+
+    if mode == "Endast innehav":
+        if "Antal aktier" not in base.columns:
+            st.warning("Kolumnen 'Antal aktier' saknas – kan inte filtrera på innehav.")
+        else:
+            subset = base[base["Antal aktier"] > 0].copy()
+    elif mode == "Välj Buckets":
+        all_buckets = (
+            base.get("Bucket", pd.Series([], dtype=object))
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        all_buckets = sorted([b for b in all_buckets if b])
+        selected_buckets = st.multiselect(
+            "Välj en eller flera Buckets",
+            options=all_buckets,
+            default=all_buckets,
+        )
+        if not selected_buckets:
+            st.info("Välj minst en Bucket för att fortsätta.")
+            return
+        subset = base[base["Bucket"].astype(str).str.strip().isin(selected_buckets)].copy()
+
+    if subset.empty:
+        st.info("Inga rader matchar urvalet.")
+        return
+
+    # Nuvarande universum av tickers inom urvalet
+    tickers_universe = (
+        subset["Ticker"]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+    tickers_universe = sorted(tickers_universe)
+
+    st.markdown("### Finjustera (valfritt)")
+    sel_tickers = st.multiselect(
+        "Begränsa till specifika tickers (tom = alla i urvalet)",
+        options=tickers_universe,
+        default=tickers_universe,
+    )
+    target = sel_tickers if sel_tickers else tickers_universe
+
+    if not target:
+        st.info("Inga tickers valda.")
+        return
 
     delay = st.slider("Fördröjning per bolag (sek)", 0.5, 5.0, 1.0, 0.5)
-    go = st.button("🚀 Starta")
+    go = st.button("🚀 Starta massuppdatering")
 
     if not go:
         return
@@ -1199,10 +1387,10 @@ def page_batch() -> None:
                     df_cur.at[idx, k] = v
                     changed_total += 1
             else:
-                base = {c: np.nan for c in DATA_COLUMNS}
-                base.update({"Timestamp": now_stamp(), "Ticker": tkr})
-                base.update(updates)
-                df_cur = pd.concat([df_cur, pd.DataFrame([base])], ignore_index=True)
+                base_row = {c: np.nan for c in DATA_COLUMNS}
+                base_row.update({"Timestamp": now_stamp(), "Ticker": tkr})
+                base_row.update(updates)
+                df_cur = pd.concat([df_cur, pd.DataFrame([base_row])], ignore_index=True)
                 changed_total += len(updates)
         except Exception as e:
             st.error(f"{tkr}: {e}")
@@ -1213,13 +1401,16 @@ def page_batch() -> None:
     st.session_state["DATA"] = df_cur
     progress.empty()
     status.empty()
-    st.success(f"Klar. {len(target)} bolag uppdaterade. {changed_total} fält ändrades.")
+    st.success(
+        f"Klar. {len(target)} tickers uppdaterade inom urvalet "
+        f"({mode.lower()}{' / buckets: ' + ', '.join(selected_buckets) if selected_buckets else ''}). "
+        f"{changed_total} fält ändrades."
+    )
 
 
 # ============================================================
 # 🛒 Köpförslag + Säljförslag
 # ============================================================
-
 def _normalize_key(s: str) -> str:
     return (
         (s or "")
@@ -1460,7 +1651,7 @@ def build_buy_suggestions(
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    sort_cols: List[bool] = []
+    sort_cols: List[str] = []
     sort_asc: List[bool] = []
     if "Slack till cap (SEK)" in out.columns:
         sort_cols.append("Slack till cap (SEK)")
@@ -1555,7 +1746,8 @@ def page_buy_suggestions() -> None:
         return
 
     settings = get_settings_map()
-    fx_map = get_fx_map()
+    # 🔄 Använd samma live-FX som portföljvyn
+    fx_map = st.session_state.get("FX") or get_live_fx_map()
 
     all_buckets = sorted(
         {
