@@ -15,7 +15,7 @@ import gspread
 from gspread import Spreadsheet, Worksheet
 from gspread.exceptions import WorksheetNotFound, APIError
 from google.oauth2.service_account import Credentials
-import yfinance as yf  # <-- NYTT: används för live-FX
+import yfinance as yf  # Live-FX via Yahoo
 
 from core_utils import (
     _f,
@@ -475,6 +475,7 @@ def get_fx_map() -> Dict[str, float]:
     NYTT:
       - Försöker automatiskt hämta live-kurser via Yahoo för saknade/ogiltiga valutor.
       - Uppdaterar FX-bladet.
+      - Lägger timestamp i FX-bladet (kolumn 'Senast uppdaterad').
       - Skriver timestamp 'FX_LAST_UPDATE_TS' till Settings-bladet.
       - Lägger även ts i st.session_state['FX_TS'] som bevis i UI.
     """
@@ -576,6 +577,8 @@ def get_fx_map() -> Dict[str, float]:
                     "SEK": [float(v) for v in fx_live.values()],
                 }
             )
+            cur_col = "Valuta"
+            rate_col = "SEK"
         else:
             # Se till att vi har rimliga kolumner
             if cur_col is None or rate_col is None:
@@ -590,7 +593,6 @@ def get_fx_map() -> Dict[str, float]:
                 rate_col = "SEK"
             else:
                 df = df.copy()
-                # Konvertera ev. kolumner till str så vi kan matcha
                 df[cur_col] = df[cur_col].astype(str)
 
                 for code, rate in fx_live.items():
@@ -607,19 +609,24 @@ def get_fx_map() -> Dict[str, float]:
                         new_row[rate_col] = str(float(rate))
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
+        # Timestamp för denna FX-uppdatering
+        ts = now_stamp()
+
+        # Lägg in timestamp som kolumn i FX-bladet (syns direkt för dig)
+        df["Senast uppdaterad"] = ts
+
         try:
             _write_df(FX_TITLE, df)
-        except Exception:
-            # FX-bladsskrivning får inte fälla hela appen
-            pass
+        except Exception as e:
+            st.error(f"Kunde inte skriva FX-bladet med timestamp: {e}")
 
-        # Sätt timestamp i Settings + session (bevis att uppdatering skett)
-        ts = now_stamp()
+        # Sätt timestamp i Settings + session (bevis)
         st.session_state["FX_TS"] = ts
         try:
             _set_settings_value("FX_LAST_UPDATE_TS", ts)
-        except Exception:
-            pass
+        except Exception as e:
+            # Visa bara en varning – FX-funktionalitet ska inte krascha appen
+            st.warning(f"Kunde inte skriva FX_LAST_UPDATE_TS i Settings: {e}")
 
     # Sista säkerhetsbälte
     if "SEK" not in out:
