@@ -34,10 +34,6 @@ from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_meth
 def _auto_snapshot_on_import() -> None:
     """
     Skapar en snapshot av Data-bladet vid första import av denna modul.
-    - Läser 'Data' via read_data_df()
-    - Lägger in kolumn 'Snapshot TS' med tidsstämpel
-    - Append:ar till SNAPSHOT_TITLE-bladet
-    - Behåller max 10 unika snapshot-tidsstämplar (äldsta tas bort)
     Körs EN gång per Python-process (modul-import), vilket i Streamlit
     motsvarar "appstart" snarare än varje rerun.
     """
@@ -62,19 +58,17 @@ def _auto_snapshot_on_import() -> None:
 
             # Säkerställ kolumnen finns
             if "Snapshot TS" not in snap_new.columns:
-                # Om äldre schema saknade kolumnen – sätt allt till första värdet
                 snap_new.insert(0, "Snapshot TS", ts)
 
             # Behåll max 10 snapshots baserat på unika "Snapshot TS"
             ts_list = snap_new["Snapshot TS"].astype(str).tolist()
-            # Bevara ordning: första förekommer = äldst
             seen = []
             for v in ts_list:
                 if v not in seen:
                     seen.append(v)
 
             if len(seen) > 10:
-                keep_ts = set(seen[-10:])  # behåll de 10 senaste
+                keep_ts = set(seen[-10:])
                 snap_new = snap_new[snap_new["Snapshot TS"].astype(str).isin(keep_ts)].copy()
 
         _write_df(SNAPSHOT_TITLE, snap_new)
@@ -92,8 +86,6 @@ _auto_snapshot_on_import()
 def _safe_str_val(x: Any) -> str:
     """
     Returnerar '' om värdet är None/NaN/'nan', annars strippad sträng.
-    Hindrar att vi får 'nan' som bolagsnamn/sektor och gör det lättare
-    att avgöra om fältet verkligen är tomt.
     """
     if x is None:
         return ""
@@ -528,7 +520,6 @@ def page_add_ticker() -> None:
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
 
-
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
 # ============================================================
@@ -869,7 +860,7 @@ def build_dividend_rolling_12m(
     today = dt.date.today()
     horizon = today + dt.timedelta(days=365)
 
-    # Första passet: samla bekräftade kommande utdelningar
+    # Första passet: bekräftade kommande utdelningar
     confirmed_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
 
     for _, r in data_df.iterrows():
@@ -922,7 +913,7 @@ def build_dividend_rolling_12m(
         events.append(ev)
         confirmed_by_ticker.setdefault(ticker, []).append(ev)
 
-    # Andra passet: estimera resterande utdelningar utifrån årlig utdelning + frekvens
+    # Andra passet: estimera resterande utdelningar utifrån årlig utd + frekvens
     for _, r in data_df.iterrows():
         ticker = str(r.get("Ticker") or "").strip()
         if not ticker:
@@ -937,7 +928,6 @@ def build_dividend_rolling_12m(
 
         annual_dps = _annual_dps(r)
         if annual_dps is None or annual_dps <= 0:
-            # Ingen årlig utdelning – behåll ev. bekräftade events men estimera inget extra
             continue
 
         # Frekvens
@@ -948,9 +938,7 @@ def build_dividend_rolling_12m(
                 if freq:
                     break
         if not freq:
-            # Simple default: anta kvartalsvis om inget annat anges
             freq = 4
-
         if freq <= 0:
             continue
 
@@ -967,25 +955,17 @@ def build_dividend_rolling_12m(
         annual_netto = float(annual_brutto * (1.0 - wht))
         annual_netto_sek = float(annual_netto * fx)
 
-        # Summera redan bekräftade brutto inom perioden
         confirmed_list = confirmed_by_ticker.get(ticker, [])
         confirmed_brutto = sum(ev["Brutto"] for ev in confirmed_list)
-
         remaining_brutto = max(annual_brutto - confirmed_brutto, 0.0)
-
-        # Om allt redan "förbrukat" via bekräftade events → ingen extra estimerad
         if remaining_brutto <= 0.0:
             continue
 
-        # Antal kvarvarande "slots" detta år
         remaining_slots = max(freq - len(confirmed_list), 0)
         if remaining_slots == 0:
-            # Inga "platser" kvar – vi låter bekräftade event representera hela årets utdelning
             continue
 
-        # Generera ungefärliga datum jämnt fördelade under året
         if confirmed_list:
-            # Starta runt tidigaste bekräftade datum om det finns
             base_date = min(ev["Datum"] for ev in confirmed_list)
             if base_date < today:
                 base_date = today
@@ -996,16 +976,14 @@ def build_dividend_rolling_12m(
         interval_days = int(round(365.0 / float(freq)))
         est_dates: List[dt.date] = []
 
-        # Bygg datum framåt inom horisonten, undvik krock nära bekräftade datum
         d0 = base_date
         while d0 < today:
             d0 = d0 + dt.timedelta(days=interval_days)
 
-        for k in range(freq * 2):  # lite slack
+        for k in range(freq * 2):
             d = d0 + dt.timedelta(days=interval_days * k)
             if d > horizon:
                 break
-            # hoppa om vi ligger väldigt nära en bekräftad utdelning
             if any(abs((d - ed).days) <= 10 for ed in existing_dates):
                 continue
             est_dates.append(d)
@@ -1054,7 +1032,6 @@ def build_dividend_rolling_12m(
         )
 
     df = pd.DataFrame(events)
-    # Filtrera bara kommande 12 månader (säkerhetsbälte)
     df = df[df["Datum"].between(today, horizon)]
     df = df.sort_values(["Datum", "Ticker"]).reset_index(drop=True)
     return df
@@ -1179,6 +1156,7 @@ def page_portfolio() -> None:
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
 
+
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
 #    med urval: alla / endast innehav / valda Buckets
@@ -1235,7 +1213,7 @@ def page_batch() -> None:
         st.info("Inga rader matchar urvalet.")
         return
 
-    # Nuvarande universum av tickers inom urvalet
+    # Universum av tickers inom urvalet
     tickers_universe = (
         subset["Ticker"]
         .dropna()
@@ -1313,7 +1291,7 @@ def page_batch() -> None:
 
 
 # ============================================================
-# 🛒 Köpförslag + Säljförslag
+# 🛒 Köpförslag + Säljförslag – helpers
 # ============================================================
 def _normalize_key(s: str) -> str:
     return (
@@ -1436,7 +1414,6 @@ def build_buy_suggestions(
             if not bucket:
                 continue
 
-            # Bucket-filter (om vi inte kör ren zon-filtrering)
             if bucket_filter and bucket_filter != "Alla" and bucket != bucket_filter:
                 continue
 
@@ -1468,7 +1445,6 @@ def build_buy_suggestions(
 
             if not _pos(fv_active):
                 continue
-
             if not (price < fv_active):
                 continue
 
@@ -1499,7 +1475,6 @@ def build_buy_suggestions(
             if _pos(price) and _pos(fv_active):
                 up_pct = (fv_active - price) / price * 100.0
 
-            # Bra köp / fyndläge-nivåer + zon
             bra_level: Optional[float] = None
             fynd_level: Optional[float] = None
             zone: str = ""
@@ -1518,7 +1493,6 @@ def build_buy_suggestions(
                     else:
                         zone = "Under FV"
 
-            # Zon-filter (Fyndläge / Bra köp) om valt
             if zone_filter == "Fyndläge" and zone != "Fyndläge":
                 continue
             if zone_filter == "Bra köp" and zone != "Bra köp":
@@ -1613,7 +1587,6 @@ def build_sell_suggestions(
 
             if not math.isfinite(cap):
                 continue
-
             if value_sek <= cap:
                 continue
 
@@ -1639,6 +1612,220 @@ def build_sell_suggestions(
     out = out.sort_values("Över cap (SEK)", ascending=False).reset_index(drop=True)
     return out
 
+
+# 🔽 NYTT: Hjälpare för sida (Tillväxt/Utdelning) + bucket-algoritm
+def _bucket_side(label: str) -> str | None:
+    """
+    Försöker avgöra om en bucket hör till Tillväxt eller Utdelning
+    baserat på namnet.
+    """
+    if not label:
+        return None
+    s = str(label).strip().lower()
+    if any(word in s for word in ("tillv", "growth")):
+        return "Tillväxt"
+    if any(word in s for word in ("utdel", "div")):
+        return "Utdelning"
+    return None
+
+
+def compute_recommended_buy(
+    df_data: pd.DataFrame,
+    settings: Dict[str, str],
+    fx_map: Dict[str, float],
+    available_sek: float,
+    bucket_a_label: str,
+    bucket_b_label: Optional[str],
+    bucket_c_label: Optional[str],
+    b_ratio: float,
+    c_ratio: float,
+    fv_horizon: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Implementerar köpalgoritmen:
+
+    1) Räkna värde i SEK per bucket (A/B/C) inom vald sida.
+    2) Sätt målnivåer för B/C som procent av A.
+    3) Välj vilken bucket som ska få kapitalet (B eller C om de ligger under mål, annars A).
+    4) Inom den bucketen:
+        - titta på innehav (Antal > 0)
+        - räkna lika-stor-nivå (bucketvärde / antal innehav)
+        - ta fram kandidater från build_buy_suggestions (undervärderade, pris < FV)
+        - välj minsta innehavet relativt lika-stor-nivån (gap mot mål)
+          – fallback: högst uppsida
+    5) Räkna hur många aktier som kan köpas givet available_sek och cap per innehav.
+    """
+
+    if available_sek is None or available_sek <= 0:
+        return None
+    if not bucket_a_label:
+        return None
+
+    pos_df = _position_value_tables(df_data, fx_map)
+    if pos_df is None or pos_df.empty:
+        return None
+
+    def _bucket_value(label: Optional[str]) -> float:
+        if not label:
+            return 0.0
+        sub = pos_df[pos_df["Bucket"].astype(str) == str(label)]
+        if sub.empty:
+            return 0.0
+        try:
+            return float(sub["Värde (SEK)"].sum())
+        except Exception:
+            return 0.0
+
+    value_a = _bucket_value(bucket_a_label)
+    value_b = _bucket_value(bucket_b_label)
+    value_c = _bucket_value(bucket_c_label)
+
+    if value_a <= 0:
+        return None
+
+    b_ratio = max(b_ratio or 0.0, 0.0)
+    c_ratio = max(c_ratio or 0.0, 0.0)
+
+    target_b = value_a * b_ratio if bucket_b_label else 0.0
+    target_c = value_a * c_ratio if bucket_c_label else 0.0
+
+    gap_b = max(target_b - value_b, 0.0)
+    gap_c = max(target_c - value_c, 0.0)
+
+    chosen_bucket = bucket_a_label
+    bucket_reason = "Bucket A (ankare): B/C ligger nära eller över sina målnivåer."
+    if (gap_b > 0 or gap_c > 0) and (bucket_b_label or bucket_c_label):
+        if gap_b >= gap_c and bucket_b_label:
+            chosen_bucket = bucket_b_label
+            bucket_reason = "Bucket B ligger under sin målnivå relativt A."
+        elif bucket_c_label:
+            chosen_bucket = bucket_c_label
+            bucket_reason = "Bucket C ligger under sin målnivå relativt A."
+
+    bucket_pos = pos_df[pos_df["Bucket"].astype(str) == str(chosen_bucket)].copy()
+    if bucket_pos.empty:
+        return None
+
+    bucket_pos = bucket_pos[pd.to_numeric(bucket_pos["Antal"], errors="coerce") > 0]
+    if bucket_pos.empty:
+        return None
+
+    try:
+        bucket_total = float(bucket_pos["Värde (SEK)"].sum())
+        n_holdings = len(bucket_pos)
+    except Exception:
+        return None
+
+    if bucket_total <= 0 or n_holdings <= 0:
+        return None
+
+    equal_target = bucket_total / float(n_holdings)
+
+    buy_candidates = build_buy_suggestions(
+        df_data,
+        settings,
+        fx_map,
+        own_filter="Endast innehav",
+        fv_horizon=fv_horizon,
+        bucket_filter=chosen_bucket,
+        zone_filter="Alla",
+    )
+    if buy_candidates is None or buy_candidates.empty:
+        return None
+
+    merge_cols = ["Ticker", "Värde (SEK)", "Antal", "Aktuell kurs", "Valuta"]
+    bucket_pos_merged = bucket_pos[merge_cols].rename(
+        columns={"Värde (SEK)": "Värde (SEK)_pos"}
+    )
+
+    merged = buy_candidates.merge(bucket_pos_merged, on="Ticker", how="inner")
+    if merged.empty:
+        return None
+
+    merged["Current value (SEK)"] = pd.to_numeric(
+        merged["Värde (SEK)_pos"], errors="coerce"
+    ).fillna(0.0)
+    merged["Gap to equal"] = equal_target - merged["Current value (SEK)"]
+
+    positive_gap = merged[merged["Gap to equal"] > 0].copy()
+    if not positive_gap.empty:
+        positive_gap = positive_gap.sort_values(
+            ["Gap to equal", "Uppsida (%)"], ascending=[False, False]
+        )
+        chosen = positive_gap.iloc[0]
+        gap_mode = "gap"
+    else:
+        merged = merged.sort_values("Uppsida (%)", ascending=False)
+        chosen = merged.iloc[0]
+        gap_mode = "upside"
+
+    ticker = str(chosen["Ticker"]).upper()
+    name = str(chosen.get("Bolagsnamn") or "")
+    ccy = str(chosen.get("Valuta") or "SEK").upper()
+
+    price = _f(chosen.get("Kurs"))
+    if price is None:
+        price = _f(chosen.get("Aktuell kurs"))
+    if price is None or price <= 0:
+        return None
+
+    fx_rate = _fx_rate_to_sek(ccy, fx_map)
+    price_sek = float(price) * fx_rate
+    if price_sek <= 0:
+        return None
+
+    max_shares_capital = int(available_sek // price_sek)
+
+    slack_cap_sek = _f(chosen.get("Slack till cap (SEK)"))
+    if slack_cap_sek is not None and slack_cap_sek > 0:
+        max_shares_cap = int(slack_cap_sek // price_sek)
+    else:
+        max_shares_cap = max_shares_capital
+
+    max_shares = min(max_shares_capital, max_shares_cap)
+
+    current_value_sek = _f(chosen.get("Current value (SEK)")) or 0.0
+
+    if max_shares <= 0:
+        return {
+            "ticker": ticker,
+            "name": name,
+            "bucket": chosen_bucket,
+            "bucket_reason": bucket_reason,
+            "can_buy": False,
+            "shares_to_buy": 0,
+            "note": (
+                "Kapitalet räcker inte till minst 1 aktie inom cap-gräns "
+                "för det innehav algoritmen valt."
+            ),
+            "equal_target_sek": float(equal_target),
+            "current_value_sek": float(current_value_sek),
+        }
+
+    current_qty = _f(chosen.get("Äger (antal)")) or _f(chosen.get("Antal")) or 0.0
+    buy_cost_sek = max_shares * price_sek
+    new_value_sek = current_value_sek + buy_cost_sek
+
+    return {
+        "ticker": ticker,
+        "name": name,
+        "bucket": chosen_bucket,
+        "bucket_reason": bucket_reason,
+        "gap_mode": gap_mode,
+        "can_buy": True,
+        "shares_to_buy": int(max_shares),
+        "price_ccy": float(price),
+        "currency": ccy,
+        "fx_rate": float(fx_rate),
+        "price_sek": float(price_sek),
+        "buy_cost_sek": float(buy_cost_sek),
+        "current_qty": float(current_qty),
+        "current_value_sek": float(current_value_sek),
+        "new_value_sek": float(new_value_sek),
+        "equal_target_sek": float(equal_target),
+        "gap_before_sek": float(equal_target - current_value_sek),
+        "gap_after_sek": float(equal_target - new_value_sek),
+    }
 
 def page_buy_suggestions() -> None:
     st.header("🛒 Köp-/säljförslag (läser Data-bladet)")
@@ -1675,7 +1862,7 @@ def page_buy_suggestions() -> None:
         + [b for b in all_buckets if b not in DEFAULT_BUCKETS]
     )
 
-    # Rullista: Alla / Fyndläge / Bra köp + buckets
+    # Bucket-/zon-val för köpförslagstabellen längre ned
     bucket_zone_opts = ["Alla", "Fyndläge", "Bra köp"] + [b for b in bucket_opts if b != "Alla"]
 
     col_top1, col_top2, col_top3 = st.columns([2, 2, 2])
@@ -1707,6 +1894,161 @@ def page_buy_suggestions() -> None:
         zone_filter = "Alla"
         bucket_filter_buy = bucket_or_zone
 
+    # ---------------------------
+    # 🎯 Automatisk köp-rekommendation (Bucket-balans)
+    # ---------------------------
+    # Bygg upp mapping sida (Tillväxt/Utdelning) → A/B/C bucket labels
+    side_letters: Dict[str, Dict[str, str]] = {}
+    for b in all_buckets:
+        side = _bucket_side(b)
+        if not side:
+            continue
+        s = str(b).lower()
+        letter = None
+        if "bucket a" in s:
+            letter = "A"
+        elif "bucket b" in s:
+            letter = "B"
+        elif "bucket c" in s:
+            letter = "C"
+        if not letter:
+            continue
+        side_letters.setdefault(side, {})
+        side_letters[side].setdefault(letter, b)
+
+    available_sides = sorted(side_letters.keys())
+    with st.expander("🎯 Automatisk köp-rekommendation (Bucket-balans)", expanded=False):
+        if not available_sides:
+            st.info(
+                "Inga buckets hittades som tydligt tillhör Tillväxt/Utdelning med A/B/C-namn. "
+                "Exempel på namn: 'Bucket A tillväxt', 'Bucket B utdelning', etc."
+            )
+        else:
+            side_sel = st.selectbox(
+                "Välj sida",
+                available_sides,
+                index=0,
+                key="buyalgo_side",
+            )
+            mapping = side_letters.get(side_sel, {})
+            bucket_a_label = mapping.get("A")
+            bucket_b_label = mapping.get("B")
+            bucket_c_label = mapping.get("C")
+
+            if not bucket_a_label:
+                st.warning(
+                    "Hittar ingen 'Bucket A' för vald sida. Döp exempelvis en bucket till "
+                    "'Bucket A tillväxt' eller 'Bucket A utdelning'."
+                )
+            else:
+                col_rat1, col_rat2 = st.columns(2)
+                with col_rat1:
+                    b_ratio_pct = st.number_input(
+                        "Målstorlek Bucket B relativt A (%)",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=40.0,
+                        step=1.0,
+                        key="buyalgo_b_ratio_pct",
+                    )
+                with col_rat2:
+                    c_ratio_pct = st.number_input(
+                        "Målstorlek Bucket C relativt A (%)",
+                        min_value=0.0,
+                        max_value=300.0,
+                        value=20.0,
+                        step=1.0,
+                        key="buyalgo_c_ratio_pct",
+                    )
+
+                available_sek = st.number_input(
+                    "Tillgängligt belopp att investera (SEK)",
+                    min_value=0.0,
+                    step=100.0,
+                    value=0.0,
+                    key="buyalgo_available_sek",
+                )
+
+                st.caption(
+                    "Algoritmen försöker:\n"
+                    "1) Hålla B/C i rätt storlek relativt A (enligt procentmålen ovan)\n"
+                    "2) Inom vald bucket välja **minsta innehavet** relativt lika-stor-nivå\n"
+                    "3) Bara välja bolag där priset är **lägre än riktkurs** (FV) för vald horisont "
+                    f"({fv_horizon})\n"
+                    "4) Respektera cap per innehav från Settings."
+                )
+
+                if st.button("🔍 Beräkna rekommenderat köp", key="buyalgo_btn"):
+                    if available_sek <= 0:
+                        st.warning("Ange ett tillgängligt belopp i SEK > 0.")
+                    else:
+                        b_ratio = b_ratio_pct / 100.0
+                        c_ratio = c_ratio_pct / 100.0
+                        rec = compute_recommended_buy(
+                            df_data=df,
+                            settings=settings,
+                            fx_map=fx_map,
+                            available_sek=available_sek,
+                            bucket_a_label=bucket_a_label,
+                            bucket_b_label=bucket_b_label,
+                            bucket_c_label=bucket_c_label,
+                            b_ratio=b_ratio,
+                            c_ratio=c_ratio,
+                            fv_horizon=fv_horizon,
+                        )
+                        if rec is None:
+                            st.info("Ingen tydlig rekommendation kunde beräknas med nuvarande data.")
+                        else:
+                            if not rec.get("can_buy", False):
+                                st.warning(
+                                    f"Förslag: {rec.get('ticker', '')} i {rec.get('bucket', '')}, "
+                                    "men kapitalet räcker inte till minst 1 aktie inom cap-gräns."
+                                )
+                                if "note" in rec:
+                                    st.caption(rec["note"])
+                                st.caption(
+                                    f"Lika-stor-mål: ~{_fmt_sek(rec.get('equal_target_sek'))} SEK per innehav "
+                                    f"(nuvarande värde: {_fmt_sek(rec.get('current_value_sek'))} SEK)."
+                                )
+                            else:
+                                st.success(
+                                    f"Rekommenderat köp: {rec['ticker']} ({rec['name']}) "
+                                    f"i {rec['bucket']} – köp {rec['shares_to_buy']} st."
+                                )
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    st.metric(
+                                        "Pris per aktie (valuta)",
+                                        f"{rec['price_ccy']:.2f} {rec['currency']}",
+                                    )
+                                    st.metric(
+                                        "Pris per aktie (SEK)",
+                                        _fmt_sek(rec["price_sek"]),
+                                    )
+                                with c2:
+                                    st.metric(
+                                        "Kostnad för köpet (SEK)",
+                                        _fmt_sek(rec["buy_cost_sek"]),
+                                    )
+                                    st.metric(
+                                        "Aktier efter köp",
+                                        f"{int(rec['current_qty'])} ➜ {int(rec['current_qty'] + rec['shares_to_buy'])}",
+                                    )
+
+                                st.caption(
+                                    f"Bucket-val: {rec['bucket_reason']}\n\n"
+                                    f"Lika-stor-mål per innehav i bucketen: "
+                                    f"{_fmt_sek(rec['equal_target_sek'])} SEK\n"
+                                    f"Gap före köp: {_fmt_sek(rec['gap_before_sek'])} SEK\n"
+                                    f"Gap efter köp: {_fmt_sek(rec['gap_after_sek'])} SEK\n"
+                                    f"Värde i denna bucket efter köp: {_fmt_sek(rec['new_value_sek'])} SEK"
+                                )
+
+    st.markdown("---")
+
+    # ---------------------------
+    # Klassiska köpförslag (tabell)
+    # ---------------------------
     st.caption(
         f"Köpförslag visar bolag där aktuell kurs är lägre än riktkurs för **vald horisont** "
         f"(**{fv_horizon}**) och där innehavet inte är större än maxvärdet (cap) för respektive Bucket.\n\n"
