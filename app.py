@@ -21,7 +21,7 @@ import streamlit as st
 
 # Egna moduler
 from core_utils import get_fx_map, _load_data_into_session  # wrappers mot sheets_io
-from sheets_io import read_data_df, get_settings_map
+from sheets_io import read_data_df, get_settings_map, refresh_fx_live
 from analysis_ui import render_analysis_view, render_ranking_view
 from app_pages import (
     page_buy_suggestions,
@@ -51,9 +51,7 @@ def page_analysis() -> None:
         st.warning("Ingen data att analysera. Fyll på Data-bladet först.")
         return
 
-    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
-    st.session_state["SETTINGS_MAP"] = settings
-
+    settings = get_settings_map()
     fx_map = st.session_state.get("FX") or get_fx_map()
     st.session_state["FX"] = fx_map
 
@@ -73,9 +71,7 @@ def page_ranking() -> None:
         st.warning("Ingen data att ranka. Fyll på Data-bladet först.")
         return
 
-    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
-    st.session_state["SETTINGS_MAP"] = settings
-
+    settings = get_settings_map()
     fx_map = st.session_state.get("FX") or get_fx_map()
     st.session_state["FX"] = fx_map
 
@@ -98,17 +94,19 @@ def main() -> None:
     # Se till att DATA finns i session
     _load_data_into_session()
 
-    # 🔄 Hämta Settings + FX vid appstart
-    settings = get_settings_map()
-    st.session_state["SETTINGS_MAP"] = settings
+    # Uppdatera valutakurser EN gång per session (hämtar live från Yahoo + skriver till Sheets)
+    if not st.session_state.get("FX_REFRESHED", False):
+        try:
+            refresh_fx_live()
+            st.session_state["FX_REFRESHED"] = True
+        except Exception as e:
+            # Visa bara lite info i sidopanelen – appen ska inte krascha p.g.a. FX
+            st.sidebar.error(f"Valutakurser kunde inte uppdateras automatiskt: {e}")
 
-    fx_map = get_fx_map()          # triggar ev. livehämtning + timestamp-skrivning
+    # Läs Settings + FX-karta efter ev. uppdatering
+    settings: Dict[str, Any] = get_settings_map()
+    fx_map = get_fx_map()
     st.session_state["FX"] = fx_map
-
-    # Försök plocka fram en timestamp för senaste FX-uppdatering
-    fx_ts = st.session_state.get("FX_TS")
-    if not fx_ts and isinstance(settings, dict):
-        fx_ts = settings.get("FX_LAST_UPDATE_TS") or settings.get("fx_last_update_ts")
 
     # Sidebar-navigering
     st.sidebar.markdown("## 🧭 Navigering")
@@ -135,6 +133,7 @@ def main() -> None:
         "Riktkurser beräknas i handelsvalutan (ingen FX på EPS/targets)."
     )
 
+    fx_ts = settings.get("FX_LAST_UPDATE_TS")
     if fx_ts:
         st.sidebar.caption(f"Valutakurser uppdaterade senast: {fx_ts}")
 
