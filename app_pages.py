@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf  # 🔹 för live FX-kurser
 
 from core_utils import _f, _pos, _nz, now_stamp, DEFAULT_BUCKETS
 from sheets_io import (
@@ -29,122 +28,25 @@ from sheets_io import (
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
 
 
-# ============================================================
-# 💱 Live FX-kurser (uppdateras vid appstart / första anrop)
-# ============================================================
-
-SUPPORTED_FX_PAIRS: Dict[str, str] = {
-    "USD": "USDSEK=X",
-    "EUR": "EURSEK=X",
-    "NOK": "NOKSEK=X",
-    "CAD": "CADSEK=X",
-    "GBP": "GBPSEK=X",
-}
-
-
-def get_live_fx_map() -> Dict[str, float]:
-    """
-    Bygger en FX-karta med utgångspunkt i get_fx_map() (Valutakurser-bladet)
-    och försöker sedan hämta livekurser via Yahoo Finance.
-
-    - Uppdaterar bara koder där vi har definierade FX-par i SUPPORTED_FX_PAIRS.
-    - Alltid SEK = 1.0
-    - Sparar resultatet i st.session_state["FX"] så det delas mellan vyer.
-    """
-    base: Dict[str, float] = {}
-    try:
-        base_raw = get_fx_map() or {}
-        base = {str(k).upper(): float(v) for k, v in base_raw.items() if v is not None}
-    except Exception:
-        base = {}
-
-    # Alltid SEK = 1.0
-    base["SEK"] = 1.0
-
-    # Försök lista vilka valutor som faktiskt används i DATA
-    try:
-        df = st.session_state.get("DATA")
-        used: set[str] = set()
-        if isinstance(df, pd.DataFrame) and not df.empty and "Valuta" in df.columns:
-            used.update(
-                str(v).upper().strip()
-                for v in df["Valuta"].dropna().unique().tolist()
-            )
-        # Lägg även till alla kända för säkerhets skull
-        used.update(SUPPORTED_FX_PAIRS.keys())
-        used.discard("SEK")
-
-        pairs: Dict[str, str] = {
-            code: SUPPORTED_FX_PAIRS[code]
-            for code in used
-            if code in SUPPORTED_FX_PAIRS
-        }
-        if not pairs:
-            st.session_state["FX"] = base
-            return base
-
-        tickers_str = " ".join(sorted(set(pairs.values())))
-        try:
-            data = yf.download(
-                tickers_str,
-                period="1d",
-                interval="1d",
-                progress=False,
-            )
-        except Exception:
-            data = None
-
-        if data is not None and not isinstance(data, (float, int)):
-            # yfinance returnerar DataFrame med "Close"
-            try:
-                close = data["Close"].iloc[-1]
-            except Exception:
-                close = None
-
-            if isinstance(close, pd.Series):
-                for code, pair in pairs.items():
-                    if pair in close.index and pd.notna(close[pair]):
-                        try:
-                            base[code] = float(close[pair])
-                        except Exception:
-                            continue
-            else:
-                # Specialfall: bara ett par
-                pair_list = list(pairs.items())
-                if close is not None and not pd.isna(close) and pair_list:
-                    code, _pair = pair_list[0]
-                    try:
-                        base[code] = float(close)
-                    except Exception:
-                        pass
-    except Exception:
-        # Vid fel behåll bara befintlig karta
-        pass
-
-    st.session_state["FX"] = base
-    return base
-
-
 # -------------------------
-# Snapshot-hantering (auto + manuell)
+# Autosnapshot vid appstart (max 10 snapshots)
 # -------------------------
-def _append_snapshot(ts: Optional[str] = None) -> None:
+def _auto_snapshot_on_import() -> None:
     """
-    Skapar/append:ar en snapshot av Data-bladet till SNAPSHOT_TITLE.
-
+    Skapar en snapshot av Data-bladet vid första import av denna modul.
     - Läser 'Data' via read_data_df()
     - Lägger in kolumn 'Snapshot TS' med tidsstämpel
     - Append:ar till SNAPSHOT_TITLE-bladet
     - Behåller max 10 unika snapshot-tidsstämplar (äldsta tas bort)
+    Körs EN gång per Python-process (modul-import), vilket i Streamlit
+    motsvarar "appstart" snarare än varje rerun.
     """
     try:
         df = read_data_df()
         if df is None or df.empty:
             return
 
-        if ts is None:
-            ts = now_stamp()
-
+        ts = now_stamp()
         df_add = df.copy()
         df_add.insert(0, "Snapshot TS", ts)
 
@@ -160,11 +62,13 @@ def _append_snapshot(ts: Optional[str] = None) -> None:
 
             # Säkerställ kolumnen finns
             if "Snapshot TS" not in snap_new.columns:
+                # Om äldre schema saknade kolumnen – sätt allt till första värdet
                 snap_new.insert(0, "Snapshot TS", ts)
 
             # Behåll max 10 snapshots baserat på unika "Snapshot TS"
             ts_list = snap_new["Snapshot TS"].astype(str).tolist()
-            seen: List[str] = []
+            # Bevara ordning: första förekommer = äldst
+            seen = []
             for v in ts_list:
                 if v not in seen:
                     seen.append(v)
@@ -177,15 +81,6 @@ def _append_snapshot(ts: Optional[str] = None) -> None:
     except Exception:
         # Snapshot får aldrig krascha appen – svälj ev. fel tyst.
         pass
-
-
-def _auto_snapshot_on_import() -> None:
-    """
-    Skapar en snapshot av Data-bladet vid första import av denna modul.
-    Körs EN gång per Python-process (modul-import), vilket i Streamlit
-    motsvarar "appstart" snarare än varje rerun.
-    """
-    _append_snapshot()
 
 
 _auto_snapshot_on_import()
@@ -208,6 +103,27 @@ def _safe_str_val(x: Any) -> str:
     if s.lower() in ("nan", "none"):
         return ""
     return s
+
+
+def _fmt_sek(v: Any) -> str:
+    """
+    Robust formattering till svenskt talformat '1 234,56'.
+    Om v inte går att tolkas som tal → ''.
+    """
+    try:
+        if v is None:
+            return ""
+        if isinstance(v, (float, int)):
+            if isinstance(v, float) and (pd.isna(v) or math.isnan(v)):
+                return ""
+            val = float(v)
+        else:
+            val = float(v)
+        if not math.isfinite(val):
+            return ""
+        return f"{val:,.2f}".replace(",", " ").replace(".", ",")
+    except Exception:
+        return ""
 
 
 # -------------------------
@@ -311,17 +227,12 @@ def page_settings() -> None:
 
 
 # ============================================================
-# 🕒 Snapshot (read-only + manuell trigger)
+# 🕒 Snapshot (read-only)
 # ============================================================
 def page_snapshot() -> None:
     st.header("🕒 Snapshot")
-
-    if st.button("📸 Skapa snapshot nu"):
-        _append_snapshot()
-        st.success("Ny snapshot skapad från aktuellt Data-blad.")
-
     snap = _read_df(SNAPSHOT_TITLE)
-    if snap is None or snap.empty:
+    if snap.empty:
         st.info("Inga snapshots ännu.")
         return
     _show_df(snap, height=420, use_container_width=True)
@@ -895,7 +806,7 @@ def render_portfolio_dividends_section(
     tot_netto_sek = float(nxt["Netto SEK"].sum())
     st.metric(
         "Summa netto kommande (SEK)",
-        f"{tot_netto_sek:,.2f}".replace(",", " ").replace(".", ","),
+        _fmt_sek(tot_netto_sek),
     )
 
     df_show = nxt.copy()
@@ -907,9 +818,7 @@ def render_portfolio_dividends_section(
             g = nxt.copy()
             g["YYYY-MM"] = g["Datum"].astype(str).str.slice(0, 7)
             agg = g.groupby("YYYY-MM", as_index=False)["Netto SEK"].sum().sort_values("YYYY-MM")
-            agg["Netto SEK"] = agg["Netto SEK"].map(
-                lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")
-            )
+            agg["Netto SEK"] = agg["Netto SEK"].map(_fmt_sek)
             _show_df(agg, height=240, use_container_width=True)
         except Exception:
             st.caption("Kunde inte göra månadssummering (saknade datum eller värden).")
@@ -1176,9 +1085,7 @@ def render_dividend_rolling_12m_section(
         .sort_values("Månad")
         .reset_index(drop=True)
     )
-    agg["Netto SEK"] = agg["Netto SEK"].map(
-        lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")
-    )
+    agg["Netto SEK"] = agg["Netto SEK"].map(_fmt_sek)
 
     st.markdown("**Summering per månad (netto, SEK)**")
     _show_df(agg, height=260, use_container_width=True)
@@ -1194,11 +1101,7 @@ def render_dividend_rolling_12m_section(
             sub["Datum"] = sub["Datum"].astype(str)
             for c in ("Brutto", "Källskatt", "Netto", "Netto SEK"):
                 if c in sub.columns:
-                    sub[c] = sub[c].map(
-                        lambda v: f"{float(v):, .2f}".replace(",", " ").replace(".", ",")
-                        if v is not None
-                        else ""
-                    )
+                    sub[c] = sub[c].map(_fmt_sek)
             _show_df(
                 sub[
                     [
@@ -1252,8 +1155,8 @@ def page_portfolio() -> None:
         st.warning("Ingen data laddad.")
         return
 
-    # 🔄 Hämta live FX vid första anrop, återanvänd annars från session
-    fx_map = st.session_state.get("FX") or get_live_fx_map()
+    # Använd live-FX från session om satt, annars läs från Valutakurser-bladet
+    fx_map = st.session_state.get("FX", {}) or get_fx_map()
     settings = get_settings_map()
 
     pos = _position_value_tables(df, fx_map)
@@ -1265,6 +1168,7 @@ def page_portfolio() -> None:
             "Totalt portföljvärde (SEK)",
             f"{tot_sek:,.0f}".replace(",", " "),
         )
+        st.caption(f"{len(fx_map)} valutakurser i FX-kartan i denna session.")
         _show_df(pos.sort_values(["Bucket", "Värde (SEK)"]), height=320, use_container_width=True)
         st.markdown("#### Hinkar (Bucket) – innehåll")
         render_bucket_expandables(pos, settings)
@@ -1746,8 +1650,17 @@ def page_buy_suggestions() -> None:
         return
 
     settings = get_settings_map()
-    # 🔄 Använd samma live-FX som portföljvyn
-    fx_map = st.session_state.get("FX") or get_live_fx_map()
+    fx_map = get_fx_map()
+
+    # Visuell "bevis"-rad för FX-uppdatering om vi har någon timestamp lagrad
+    fx_ts = (
+        settings.get("FX_LAST_UPDATE_TS")
+        or settings.get("FX last update")
+        or settings.get("FX senast uppdaterad")
+        or st.session_state.get("FX_TS")
+    )
+    if fx_ts:
+        st.caption(f"Senaste valutauppdatering (enligt Sheets/session): {fx_ts}")
 
     all_buckets = sorted(
         {
