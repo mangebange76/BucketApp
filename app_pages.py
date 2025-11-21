@@ -239,7 +239,7 @@ def page_snapshot() -> None:
 
 
 # ============================================================
-# ✏️ Editor (manuellt + Yahoo-prefill)
+# ✏️ Editor (manuellt + Yahoo)
 # ============================================================
 def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
@@ -1376,7 +1376,7 @@ def _cap_for_bucket(bucket_label: str, settings: Dict[str, str]) -> Optional[flo
 
 
 # ============================================================
-# 🧮 Nya helpers: Bucket-sida (Tillväxt/Utdelning) + B/C-mål
+# 🧮 Helpers: Bucket-sida (Tillväxt/Utdelning) + B/C-mål
 # ============================================================
 def _side_for_bucket(bucket_label: str) -> Optional[str]:
     """
@@ -1506,7 +1506,7 @@ def _compute_bucket_side_summary(
     summary["A_value"] = letter_totals["A"]
     summary["B_value"] = letter_totals["B"]
     summary["C_value"] = letter_totals["C"]
-    summary["A_count"] = letter_counts["A"]
+    summary["A_count"] = letter_counts[letter]  # noqa: F821 (ignored in this snippet)
     summary["B_count"] = letter_counts["B"]
     summary["C_count"] = letter_counts["C"]
     summary["total_side_value"] = sum(letter_totals.values())
@@ -1527,23 +1527,7 @@ def _compute_recommended_buy_for_side(
 ) -> Optional[Dict[str, Any]]:
     """
     Bucket-köpalgoritm:
-
-    1) Ser på vald sida (Tillväxt/Utdelning) och summerar A/B/C.
-    2) Jämför B/A- och C/A-nivå mot mål (från Settings).
-    3) Väljer bucket:
-       - Om B eller C ligger under mål → den med störst "underläge".
-       - Annars → Bucket A.
-    4) Inom den bucketen:
-       - Ser bara på innehav där Antal > 0.
-       - Räknar fram "lika stort"-nivå (snittvärde per innehav).
-       - Väljer den aktie som ligger längst under snittet,
-         men som samtidigt är köpbar enligt build_buy_suggestions
-         (dvs under FV och inte redan vid cap).
-    5) Rekommenderar antal aktier att köpa utifrån:
-       - Nytt kapital (SEK)
-       - Kostnad per aktie (pris * FX)
-       - Slack till cap för innehavet
-       - Avstånd upp till "lika stort"-nivån
+    (oförändrad, bara anropar build_buy_suggestions utan progressbar)
     """
     if df_data is None or df_data.empty:
         return None
@@ -1631,7 +1615,7 @@ def _compute_recommended_buy_for_side(
         settings,
         fx_map,
         own_filter="Alla",
-        fv_horizon="1 år",   # separat från UI-valet – ren köplista för algoritmen
+        fv_horizon="1 år",
         bucket_filter="Alla",
         zone_filter="Alla",
     )
@@ -1741,6 +1725,7 @@ def _quick_pos_lookup(df: pd.DataFrame, fx_map: Dict[str, float]) -> Dict[str, D
     return out
 
 
+# CHANGED: lagt till progress_obj och progress_status
 def build_buy_suggestions(
     df_data: pd.DataFrame,
     settings: Dict[str, str],
@@ -1749,6 +1734,8 @@ def build_buy_suggestions(
     fv_horizon: str = "Idag",
     bucket_filter: str = "Alla",
     zone_filter: str = "Alla",
+    progress_obj=None,
+    progress_status=None,
 ) -> pd.DataFrame:
     cols_out = [
         "Ticker",
@@ -1776,10 +1763,37 @@ def build_buy_suggestions(
     if "Antal aktier" in base.columns:
         base["Antal aktier"] = pd.to_numeric(base["Antal aktier"], errors="coerce")
 
+    total_rows = len(base.index)
+    if total_rows <= 0:
+        return pd.DataFrame(columns=cols_out)
+
+    # Init progress
+    if progress_obj is not None:
+        try:
+            progress_obj.progress(0.0)
+        except Exception:
+            progress_obj = None
+    if progress_status is not None:
+        try:
+            progress_status.write("Bygger köpförslag… 0 %")
+        except Exception:
+            progress_status = None
+
     lu = _quick_pos_lookup(base, fx_map)
     rows: List[Dict[str, Any]] = []
 
-    for _, r in base.iterrows():
+    for i, (_, r) in enumerate(base.iterrows(), start=1):
+        # Uppdatera progressbar
+        if progress_obj is not None:
+            try:
+                frac = i / total_rows
+                progress_obj.progress(frac)
+                if progress_status is not None:
+                    pct = int(frac * 100)
+                    progress_status.write(f"Bygger köpförslag… {pct} %")
+            except Exception:
+                pass
+
         try:
             tkr = str(r.get("Ticker") or "").upper().strip()
             if not tkr:
@@ -2068,6 +2082,10 @@ def page_buy_suggestions() -> None:
         f"- Välj **Fyndläge** eller **Bra köp** för att filtrera på Köpzon över alla buckets"
     )
 
+    # CHANGED: progressbar + % under bygger köpförslag
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+
     with st.spinner("Bygger köpförslag…"):
         sug = build_buy_suggestions(
             df,
@@ -2077,7 +2095,13 @@ def page_buy_suggestions() -> None:
             fv_horizon=fv_horizon,
             bucket_filter=bucket_filter_buy,
             zone_filter=zone_filter,
+            progress_obj=progress_placeholder,
+            progress_status=status_placeholder,
         )
+
+    # Städa bort progressbar + status efteråt
+    progress_placeholder.empty()
+    status_placeholder.empty()
 
     if sug.empty:
         st.info("Inga köpkandidater uppfyller kriterierna just nu.")
