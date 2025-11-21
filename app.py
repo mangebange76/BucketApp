@@ -51,7 +51,9 @@ def page_analysis() -> None:
         st.warning("Ingen data att analysera. Fyll på Data-bladet först.")
         return
 
-    settings = get_settings_map()
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    st.session_state["SETTINGS_MAP"] = settings
+
     fx_map = st.session_state.get("FX") or get_fx_map()
     st.session_state["FX"] = fx_map
 
@@ -71,7 +73,9 @@ def page_ranking() -> None:
         st.warning("Ingen data att ranka. Fyll på Data-bladet först.")
         return
 
-    settings = get_settings_map()
+    settings = st.session_state.get("SETTINGS_MAP") or get_settings_map()
+    st.session_state["SETTINGS_MAP"] = settings
+
     fx_map = st.session_state.get("FX") or get_fx_map()
     st.session_state["FX"] = fx_map
 
@@ -93,8 +97,18 @@ def main() -> None:
 
     # Se till att DATA finns i session
     _load_data_into_session()
-    if "FX" not in st.session_state:
-        st.session_state["FX"] = get_fx_map()
+
+    # 🔄 Hämta Settings + FX vid appstart
+    settings = get_settings_map()
+    st.session_state["SETTINGS_MAP"] = settings
+
+    fx_map = get_fx_map()          # triggar ev. livehämtning + timestamp-skrivning
+    st.session_state["FX"] = fx_map
+
+    # Försök plocka fram en timestamp för senaste FX-uppdatering
+    fx_ts = st.session_state.get("FX_TS")
+    if not fx_ts and isinstance(settings, dict):
+        fx_ts = settings.get("FX_LAST_UPDATE_TS") or settings.get("fx_last_update_ts")
 
     # Sidebar-navigering
     st.sidebar.markdown("## 🧭 Navigering")
@@ -120,6 +134,9 @@ def main() -> None:
         "Data hämtas från Google Sheets + Yahoo Finance.\n"
         "Riktkurser beräknas i handelsvalutan (ingen FX på EPS/targets)."
     )
+
+    if fx_ts:
+        st.sidebar.caption(f"Valutakurser uppdaterade senast: {fx_ts}")
 
     # Routing
     if page == "📊 Analys":
