@@ -345,12 +345,26 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
         "pb":   (p_b is not None) and (p_b > 0) and (bvps is not None) and (bvps > 0),
     }
 
-    # P/E-nivå (används för att avgöra om P/E är "orimligt högt")
+    # P/E-nivå (används både för growth-logik och spärr)
     pe_level = None
     for cand in (pe_fwd, pe_ttm):
         if cand is not None and cand > 0:
             pe_level = cand
             break
+
+    # ---------- P/E-SPÄRR: stäng av PE-familjen vid extrema värden ----------
+    # Exempel: RGEN – mikroskopisk EPS TTM och P/E TTM på tusentals → använd EV/S istället.
+    pe_ok = True
+    if eps_ttm is None or not math.isfinite(eps_ttm) or eps_ttm <= 0.1:
+        pe_ok = False
+    elif pe_level is None or not math.isfinite(pe_level):
+        pe_ok = False
+    elif pe_level > 150.0 or pe_level < 0.0:
+        pe_ok = False
+
+    if not pe_ok:
+        allow["pe"] = False
+    # ----------------------------------------------------------------------
 
     # Sektor-skift: finans/REIT/BDC → P/B-fokuserat
     if is_financial or is_reit or ticker in bdc_mreit_tickers:
@@ -361,7 +375,7 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     # EV/P-E-val för growth (tech/health m.m.)
     # Om P/E saknas eller är väldigt högt, men EV/S finns → använd EV/S som primär.
     if growth_like and allow["ev_s"]:
-        if (pe_level is None) or (pe_level >= 50.0):
+        if (pe_level is None) or (pe_level >= 50.0) or (not allow["pe"]):
             # Låt EV/S vara primär – P/E får finnas kvar i tabellen men inte styra FV.
             primary_family = "ev_s"
         else:
@@ -407,9 +421,10 @@ def _auto_method_profile(row: pd.Series, y_snap: Dict[str, Any]) -> Dict[str, An
     sektor_label = (sektor or "-")
     primary_label = (primary_family or "-")
     cap_str = f", pe_cap={pe_cap:.1f}" if pe_cap is not None else ""
+    pe_flag = ", pe_spärr=aktiv" if not pe_ok else ""
     why = (
         f"auto_profile: sektor='{sektor_label}', ticker='{ticker}', allow={{"
-        + allow_bits + f"}}, primary='{primary_label}'{cap_str}"
+        + allow_bits + f"}}, primary='{primary_label}'{cap_str}{pe_flag}"
     )
 
     return {"allow": allow, "primary": primary_family, "why": why, "pe_cap": pe_cap}
@@ -459,18 +474,13 @@ def _compute_fair_value_row_v3(
             used_fams.add(fam)
             vals.append(float(v))
 
+        # ---------- ÄNDRAT: ingen P/E-fallback längre ----------
         if not vals:
-            # Fallback: om PE är tillåten, försök med pe_hist_vs_eps
-            try:
-                if allow_fams.get("pe", False):
-                    row_pe = methods_df[methods_df["Metod"] == "pe_hist_vs_eps"].iloc[0]
-                    out[c] = _f(row_pe.get(c))
-                else:
-                    out[c] = np.nan
-            except Exception:
-                out[c] = np.nan
+            out[c] = np.nan
         else:
             out[c] = float(np.median(vals))
+        # -------------------------------------------------------
+
     return out
 
 
