@@ -35,8 +35,23 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     """
     Mappa yahoo_fetch_for_ticker() till stabila nycklar för beräkningsmotorn.
     Alla värden är i aktiens handelsvaluta.
+    Tar nu även med namn & sektor så Editor/massuppdatering kan fylla Bolagsnamn/Sektor.
     """
     snap = yahoo_fetch_for_ticker(ticker)
+
+    # Namn/sektor från Yahoo-paketet
+    name = (
+        snap.get("Bolagsnamn")
+        or snap.get("name")
+        or snap.get("shortName")
+        or snap.get("longName")
+    )
+    sector = (
+        snap.get("Sektor")
+        or snap.get("sector")
+        or snap.get("industry")
+    )
+
     return {
         "price":            _f(snap.get("Aktuell kurs")),
         "currency":         (snap.get("Valuta") or "USD"),
@@ -55,6 +70,12 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
         # Historiska CAGRs kan saknas; beräkningsmotor hanterar None.
         "rev_cagr_hist":    _f(snap.get("Rev CAGR")),
         "eps_cagr_hist":    _f(snap.get("EPS CAGR")),
+        # Extra fält för UI/Editor/massuppdatering
+        "name":             name,
+        "shortName":        snap.get("shortName"),
+        "longName":         snap.get("longName"),
+        "sector":           sector,
+        "industry":         snap.get("industry"),
     }
 
 
