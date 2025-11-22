@@ -321,6 +321,55 @@ def _yf_eps_cagr_hist(tkr) -> Optional[float]:
         return None
 
 
+def _yf_name(tkr, sym: str) -> str:
+    """
+    Hämtar bolagsnamn med bra fallback:
+    shortName → longName → name → TICKER.
+    """
+    if tkr is None:
+        return str(sym).upper()
+    try:
+        info = tkr.info or {}
+    except Exception:
+        info = {}
+    name = (
+        info.get("shortName")
+        or info.get("longName")
+        or info.get("name")
+        or str(sym).upper()
+    )
+    try:
+        s = str(name).strip()
+        return s if s else str(sym).upper()
+    except Exception:
+        return str(sym).upper()
+
+
+def _yf_sector(tkr) -> str:
+    """
+    Hämtar sektor/industri med fallback:
+    sector → industry → category → "".
+    """
+    if tkr is None:
+        return ""
+    try:
+        info = tkr.info or {}
+    except Exception:
+        info = {}
+    sektor = (
+        info.get("sector")
+        or info.get("industry")
+        or info.get("category")
+        or info.get("industryDisp")
+        or ""
+    )
+    try:
+        s = str(sektor).strip()
+        return s
+    except Exception:
+        return ""
+
+
 # ------------------------------
 # Hämta ett paket för en ticker
 # ------------------------------
@@ -343,6 +392,9 @@ def yahoo_fetch_for_ticker(sym: str) -> Dict[str, Any]:
         # Dessa fylls nu direkt från Yahoo (revenueGrowth / earningsGrowth)
         "Rev CAGR": _yf_rev_cagr_hist(tkr),
         "EPS CAGR": _yf_eps_cagr_hist(tkr),
+        # Bolagsnamn & sektor
+        "Bolagsnamn": _yf_name(tkr, sym),
+        "Sektor": _yf_sector(tkr),
         # Resterande kan hämtas från andra källor / manuellt:
         "Net debt": None,
         "EPS 1Y": None,
@@ -357,10 +409,43 @@ def yahoo_fetch_for_ticker(sym: str) -> Dict[str, Any]:
 # --------------------------------------------
 # Försiktig skrivning till Data-blad per rad
 # --------------------------------------------
+def _is_meaningful_value(val: Any) -> bool:
+    """
+    Returnerar True om värdet är 'meningsfullt' (ska få skriva över befintligt).
+    - None → False
+    - NaN/inf → False
+    - Tomma strängar / 'nan' / 'none' / 'null' → False
+    - 0 (noll) är OK
+    """
+    if val is None:
+        return False
+    # Numeriskt
+    if isinstance(val, (int, float)):
+        try:
+            f = float(val)
+            if not math.isfinite(f):
+                return False
+            return True
+        except Exception:
+            return False
+    # Strängar
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return False
+        if s.lower() in ("nan", "none", "null"):
+            return False
+        return True
+    # Annat (dict, list etc) – normalt inte i vårt flöde, men räkna som meningsfullt
+    return True
+
+
 def _apply_fetch_to_row(row: pd.Series, fetched: Dict[str, Any]) -> pd.Series:
     """
     Endast skriva över de fält som har icke-None och meningsfulla värden.
     Respekterar principen: skriv över endast det som kunde hämtas.
+    Tar också hänsyn till att vi INTE vill skriva över manuellt ifyllt
+    bolagsnamn/sektor med tomma värden.
     """
     if not isinstance(row, pd.Series):
         row = pd.Series(row)
@@ -368,10 +453,7 @@ def _apply_fetch_to_row(row: pd.Series, fetched: Dict[str, Any]) -> pd.Series:
     for key, val in fetched.items():
         if key not in row.index:
             continue
-        if val is None:
-            continue
-        # Om numeriskt: NaN/None-skydd
-        if isinstance(val, (int, float)) and not math.isfinite(float(val)):
+        if not _is_meaningful_value(val):
             continue
         row[key] = val
 
