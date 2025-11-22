@@ -324,6 +324,34 @@ def write_data_df(df: pd.DataFrame) -> None:
 # Settings-hantering
 # =============================
 
+# Standard-nycklar som alltid ska finnas i Settings-bladet.
+# Dessa används bl.a. för FX, bucket-max och FV-logiken.
+DEFAULT_SETTINGS: Dict[str, str] = {
+    # FX-status (fylls automatiskt, men nycklarna ska alltid finnas)
+    "FX_LAST_UPDATE_TS": "",
+    "FX_LAST_SOURCE": "",
+
+    # Fair value / multipel-logik (valuation.py)
+    "pe_anchor_weight_ttm": "0.50",
+    "multiple_decay": "0.08",
+
+    # Bucket max – nivåer i SEK (kan du justera fritt i Settings-vyn)
+    "BUCKET_A_TILLV_MAX_SEK": "20000",
+    "BUCKET_A_UTDEL_MAX_SEK": "10000",
+    "BUCKET_B_TILLV_MAX_SEK": "10000",
+    "BUCKET_B_UTDEL_MAX_SEK": "7000",
+    "BUCKET_C_TILLV_MAX_SEK": "6000",
+    "BUCKET_C_UTDEL_MAX_SEK": "4000",
+
+    # Källskatt per valuta (för utdelningsberäkningar)
+    "WITHHOLDING_TAX_SEK": "0.00",
+    "WITHHOLDING_TAX_USD": "0.15",
+    "WITHHOLDING_TAX_NOK": "0.25",
+    "WITHHOLDING_TAX_CAD": "0.15",
+    "WITHHOLDING_TAX_EUR": "0.15",
+}
+
+
 def _ensure_settings_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Säkerställ att Settings-bladet har åtminstone de kolumner som
@@ -384,46 +412,121 @@ def _upsert_setting(key: str, value: Any) -> None:
     _write_df(SETTINGS_TITLE, df)
 
 
+def _ensure_default_settings_in_sheet(current_settings: Dict[str, str]) -> None:
+    """
+    Ser till att alla DEFAULT_SETTINGS finns som rader i Settings-bladet.
+    Skriver endast IN nya rader – rör inte befintliga värden.
+    Detta gör att om någon rad (t.ex. bucket-max eller källskatt)
+    råkar försvinna, så läggs den tillbaka automatiskt.
+    """
+    if not DEFAULT_SETTINGS:
+        return
+
+    df = _read_df(SETTINGS_TITLE)
+    df = _ensure_settings_columns(df)
+
+    if len(df.columns) < 2:
+        return
+
+    key_col = df.columns[0]
+    val_col = df.columns[1]
+
+    # Befintliga nycklar i bladet
+    try:
+        existing_keys = set(
+            str(x).strip()
+            for x in df[key_col].dropna().astype(str).tolist()
+            if str(x).strip()
+        )
+    except Exception:
+        existing_keys = set()
+
+    rows_to_add = []
+    for key, default_val in DEFAULT_SETTINGS.items():
+        if not key:
+            continue
+        if key in existing_keys:
+            continue  # redan i bladet
+
+        # Använd current_settings (som redan innehåller ev. befintligt värde)
+        val = current_settings.get(key, default_val)
+        new_row = {col: "" for col in df.columns}
+        new_row[key_col] = str(key)
+        new_row[val_col] = "" if val is None else str(val)
+        rows_to_add.append(new_row)
+
+    if rows_to_add:
+        df = pd.concat([df, pd.DataFrame(rows_to_add)], ignore_index=True)
+        _write_df(SETTINGS_TITLE, df)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_settings_map() -> Dict[str, str]:
     """
     Läser Settings-bladet och returnerar en dict:
       { 'nyckel': 'värde', ... }
+
     Stöder både 'Nyckel'/'Värde' och 'Key'/'Value'.
+
+    Nytt:
+      - Fyller på saknade DEFAULT_SETTINGS i den returnerade dicten.
+      - Ser till att saknade DEFAULT_SETTINGS också skrivs tillbaka
+        till Google Sheets, så att Settings-fliken inte kan bli
+        "halv-tom" av misstag.
     """
     df = _read_df(SETTINGS_TITLE)
-    if df is None or df.empty:
-        return {}
-
-    key_col = None
-    val_col = None
-    for cand in ("Nyckel", "Key", "Setting", "Inställning"):
-        if cand in df.columns:
-            key_col = cand
-            break
-    for cand in ("Värde", "Varde", "Value"):
-        if cand in df.columns:
-            val_col = cand
-            break
-
-    if key_col is None or val_col is None:
-        if len(df.columns) >= 2:
-            key_col = df.columns[0]
-            val_col = df.columns[1]
-        else:
-            return {}
-
     settings: Dict[str, str] = {}
-    for _, r in df.iterrows():
-        k_raw = r.get(key_col)
-        if k_raw is None:
-            continue
-        k = str(k_raw).strip()
-        if not k:
-            continue
-        v = r.get(val_col)
-        settings[k] = "" if v is None else str(v).strip()
-    return settings
+
+    if df is not None and not df.empty:
+        key_col = None
+        val_col = None
+        for cand in ("Nyckel", "Key", "Setting", "Inställning"):
+            if cand in df.columns:
+                key_col = cand
+                break
+        for cand in ("Värde", "Varde", "Value"):
+            if cand in df.columns:
+                val_col = cand
+                break
+
+        if key_col is None or val_col is None:
+            if len(df.columns) >= 2:
+                key_col = df.columns[0]
+                val_col = df.columns[1]
+            else:
+                key_col = None
+                val_col = None
+
+        if key_col is not None and val_col is not None:
+            for _, r in df.iterrows():
+                k_raw = r.get(key_col)
+                if k_raw is None:
+                    continue
+                k = str(k_raw).strip()
+                if not k:
+                    continue
+                v = r.get(val_col)
+                settings[k] = "" if v is None else str(v).strip()
+
+    # Lägg på default-värden för alla kända nycklar
+    full_settings: Dict[str, str] = {}
+
+    # 1) Defaults
+    for k, v in DEFAULT_SETTINGS.items():
+        full_settings[k] = "" if v is None else str(v)
+
+    # 2) Befintliga värden från bladet (överstyr defaults)
+    for k, v in settings.items():
+        full_settings[k] = v
+
+    # Se till att saknade DEFAULT_SETTINGS skrivs tillbaka till bladet
+    try:
+        _ensure_default_settings_in_sheet(full_settings)
+    except Exception:
+        # Vi vill inte krascha appen om något går fel här
+        pass
+
+    return full_settings
 
 
 # =============================
