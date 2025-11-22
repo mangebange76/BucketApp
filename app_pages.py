@@ -402,6 +402,7 @@ def page_editor() -> None:
     st.subheader("Förhandsgranskning")
     _show_df(df.loc[[idx]], height=240, use_container_width=True)
 
+
 # ============================================================
 # ➕ Lägg till ticker (med valfri Yahoo-prefill)
 # ============================================================
@@ -487,16 +488,16 @@ def page_add_ticker() -> None:
 
                     existing_sector = _safe_str_val(new_row.get("Sektor"))
                     if existing_sector:
-                        sector_y = existing_sector
+                        sektor_y = existing_sector
                     else:
-                        sector_y = (
+                        sektor_y = (
                             y.get("sector")
                             or y.get("industry")
                         )
 
                     pre = {
                         "Bolagsnamn": name,
-                        "Sektor": sector_y,
+                        "Sektor": sektor_y,
                         "Aktuell kurs": _f(y.get("price")),
                         "Valuta": y.get("currency") or valuta,
                         "Utestående aktier": _f(y.get("shares_out")),
@@ -527,7 +528,6 @@ def page_add_ticker() -> None:
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
 
-
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
 # ============================================================
@@ -543,9 +543,24 @@ def _fx_rate_to_sek(currency: str, fx_map: Dict[str, float]) -> float:
 
 
 def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> pd.DataFrame:
+    """
+    Bygger en positions-tabell för alla innehav (Antal > 0).
+
+    Kolumner:
+      - Ticker
+      - Bolagsnamn
+      - Sektor
+      - Bucket
+      - Valuta
+      - Antal
+      - Aktuell kurs
+      - Värde (valuta)
+      - Värde (SEK)
+    """
     cols = [
         "Ticker",
         "Bolagsnamn",
+        "Sektor",
         "Bucket",
         "Valuta",
         "Antal",
@@ -577,6 +592,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         if not tkr:
             continue
         name = str(_nz(r.get("Bolagsnamn"), ""))
+        sector = str(_nz(r.get("Sektor"), "") or "")
         bucket = str(_nz(r.get("Bucket"), "") or "")
         ccy = str(_nz(r.get("Valuta"), "SEK")).upper()
 
@@ -589,6 +605,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         rows.append({
             "Ticker": tkr,
             "Bolagsnamn": name,
+            "Sektor": sector,
             "Bucket": bucket,
             "Valuta": ccy,
             "Antal": float(qty),
@@ -596,6 +613,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
             "Värde (valuta)": float(val_ccy),
             "Värde (SEK)": float(val_sek),
         })
+
     out = pd.DataFrame(rows, columns=cols)
     return out
 
@@ -1122,6 +1140,38 @@ def render_dividend_rolling_12m_section(
             )
 
 
+# ============================================================
+# 🧩 Sektor-sammanställning (totalt + del av sektor)
+# ============================================================
+def _build_sector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summerar värde per Sektor baserat på positions-tabellen.
+    """
+    if pos_df is None or pos_df.empty or "Sektor" not in pos_df.columns:
+        return pd.DataFrame(columns=["Sektor", "Totalt värde (SEK)", "Antal innehav", "Tickers"])
+
+    df = pos_df.copy()
+    df["Sektor"] = df["Sektor"].fillna("").replace("", "Okänd/Övrigt")
+
+    def _join_tickers(s: pd.Series) -> str:
+        vals = sorted({str(x) for x in s if str(x).strip()})
+        return ", ".join(vals)
+
+    agg = (
+        df.groupby("Sektor", as_index=False)
+        .agg(
+            **{
+                "Totalt värde (SEK)": ("Värde (SEK)", "sum"),
+                "Antal innehav": ("Ticker", "nunique"),
+                "Tickers": ("Ticker", _join_tickers),
+            }
+        )
+        .sort_values("Totalt värde (SEK)", ascending=False)
+        .reset_index(drop=True)
+    )
+    return agg
+
+
 def render_bucket_expandables(pos_df: pd.DataFrame, settings: Dict[str, str]) -> None:
     if pos_df is None or pos_df.empty:
         return
@@ -1169,6 +1219,68 @@ def page_portfolio() -> None:
         )
         st.caption(f"{len(fx_map)} valutakurser i FX-kartan i denna session.")
         _show_df(pos.sort_values(["Bucket", "Värde (SEK)"]), height=320, use_container_width=True)
+
+        # -------------------------
+        # Sektor-sammanställning
+        # -------------------------
+        st.markdown("#### Sektor-sammanställning (värde per sektor)")
+        sector_df = _build_sector_overview(pos)
+        if sector_df.empty:
+            st.info("Ingen sektordata hittades (kolumnen 'Sektor' verkar saknas eller är tom).")
+        else:
+            show_sector = sector_df.copy()
+            if "Totalt värde (SEK)" in show_sector.columns:
+                show_sector["Totalt värde (SEK)"] = show_sector["Totalt värde (SEK)"].map(_fmt_sek)
+            _show_df(show_sector, height=260, use_container_width=True)
+
+            with st.expander("Filtrera på del av sektor / tema (t.ex. 'ai', 'semi')"):
+                q = st.text_input(
+                    "Fritextfilter – matchar mot Sektor, Bolagsnamn och Ticker",
+                    key="sector_filter_q",
+                )
+                if q:
+                    ql = q.lower().strip()
+                    mask = (
+                        pos.get("Sektor", pd.Series("", index=pos.index))
+                        .astype(str)
+                        .str.lower()
+                        .str.contains(ql, na=False)
+                    ) | (
+                        pos.get("Bolagsnamn", pd.Series("", index=pos.index))
+                        .astype(str)
+                        .str.lower()
+                        .str.contains(ql, na=False)
+                    ) | (
+                        pos.get("Ticker", pd.Series("", index=pos.index))
+                        .astype(str)
+                        .str.lower()
+                        .str.contains(ql, na=False)
+                    )
+
+                    sub = pos[mask].copy()
+                    if sub.empty:
+                        st.info("Inga innehav matchade det filtret.")
+                    else:
+                        tot_sub = float(sub["Värde (SEK)"].sum())
+                        st.metric(
+                            "Totalt värde i urvalet (SEK)",
+                            _fmt_sek(tot_sub),
+                        )
+                        show_sub = sub[
+                            [
+                                "Ticker",
+                                "Bolagsnamn",
+                                "Sektor",
+                                "Bucket",
+                                "Valuta",
+                                "Antal",
+                                "Aktuell kurs",
+                                "Värde (SEK)",
+                            ]
+                        ].copy()
+                        show_sub["Värde (SEK)"] = show_sub["Värde (SEK)"].map(_fmt_sek)
+                        _show_df(show_sub, height=260, use_container_width=True)
+
         st.markdown("#### Hinkar (Bucket) – innehåll")
         render_bucket_expandables(pos, settings)
 
@@ -1177,7 +1289,6 @@ def page_portfolio() -> None:
 
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
-
 
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
@@ -1506,7 +1617,7 @@ def _compute_bucket_side_summary(
     summary["A_value"] = letter_totals["A"]
     summary["B_value"] = letter_totals["B"]
     summary["C_value"] = letter_totals["C"]
-    summary["A_count"] = letter_counts[letter]  # noqa: F821 (ignored in this snippet)
+    summary["A_count"] = letter_counts["A"]  # oförändrad logik i övrigt
     summary["B_count"] = letter_counts["B"]
     summary["C_count"] = letter_counts["C"]
     summary["total_side_value"] = sum(letter_totals.values())
