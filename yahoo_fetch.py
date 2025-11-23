@@ -338,20 +338,28 @@ def yahoo_fetch_for_ticker(sym: str) -> Dict[str, Any]:
     long_name = None
     sector = None
     industry = None
+    industry_disp = None
+    industry_key = None
 
     if isinstance(info, dict):
         short_name = info.get("shortName")
         long_name = info.get("longName")
         sector = info.get("sector")
         industry = info.get("industry")
+        industry_disp = info.get("industryDisp")
+        industry_key = info.get("industryKey")
 
     company_name = short_name or long_name or sym
     company_sector = sector or industry
+    # CHANGED: använd "industry" (m.fl.) som Sub-sektor / bransch
+    company_subsector = industry or industry_disp or industry_key
 
     out: Dict[str, Any] = {
         # Namn/sektor till Data-bladet
         "Bolagsnamn": company_name,
         "Sektor": company_sector,
+        "Subsektor": company_subsector,  # CHANGED: ny kolumn för subsektor
+
         # Samma info även i "råa" fält (för valuation.fetch_from_yahoo m.m.)
         "name": company_name,
         "shortName": short_name,
