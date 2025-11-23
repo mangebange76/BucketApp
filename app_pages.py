@@ -1344,6 +1344,7 @@ def page_portfolio() -> None:
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
 
+
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
 #    med urval: alla / endast innehav / valda Buckets
