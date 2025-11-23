@@ -280,6 +280,13 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
             or y.get("industry")
         )
 
+    # NYTT: Sektor-detalj fylls alltid från kolumnen om den finns, annars Yahoo industry
+    existing_sector_detail = _safe_str_val(existing_row.get("Sektor-detalj"))
+    if existing_sector_detail:
+        sector_detail = existing_sector_detail
+    else:
+        sector_detail = y.get("industry")
+
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
     except Exception:
@@ -288,6 +295,7 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
         "Timestamp": now_stamp(),
         "Bolagsnamn": name,
         "Sektor": sector,
+        "Sektor-detalj": sector_detail,
         "Aktuell kurs": _f(y.get("price")),
         "Valuta": (y.get("currency") or existing_row.get("Valuta")),
         "Utestående aktier": _f(y.get("shares_out")),
@@ -495,9 +503,17 @@ def page_add_ticker() -> None:
                             or y.get("industry")
                         )
 
+                    # NYTT: Sektor-detalj fylls från kolumnen om den finns, annars Yahoo industry
+                    existing_sector_detail = _safe_str_val(new_row.get("Sektor-detalj"))
+                    if existing_sector_detail:
+                        sektor_det_y = existing_sector_detail
+                    else:
+                        sektor_det_y = y.get("industry")
+
                     pre = {
                         "Bolagsnamn": name,
                         "Sektor": sektor_y,
+                        "Sektor-detalj": sektor_det_y,
                         "Aktuell kurs": _f(y.get("price")),
                         "Valuta": y.get("currency") or valuta,
                         "Utestående aktier": _f(y.get("shares_out")),
@@ -528,6 +544,7 @@ def page_add_ticker() -> None:
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
 
+
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
 # ============================================================
@@ -550,6 +567,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
       - Ticker
       - Bolagsnamn
       - Sektor
+      - Sektor-detalj
       - Bucket
       - Valuta
       - Antal
@@ -561,6 +579,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         "Ticker",
         "Bolagsnamn",
         "Sektor",
+        "Sektor-detalj",
         "Bucket",
         "Valuta",
         "Antal",
@@ -593,6 +612,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
             continue
         name = str(_nz(r.get("Bolagsnamn"), ""))
         sector = str(_nz(r.get("Sektor"), "") or "")
+        sector_detail = str(_nz(r.get("Sektor-detalj"), "") or "")
         bucket = str(_nz(r.get("Bucket"), "") or "")
         ccy = str(_nz(r.get("Valuta"), "SEK")).upper()
 
@@ -606,6 +626,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
             "Ticker": tkr,
             "Bolagsnamn": name,
             "Sektor": sector,
+            "Sektor-detalj": sector_detail,
             "Bucket": bucket,
             "Valuta": ccy,
             "Antal": float(qty),
@@ -716,7 +737,6 @@ def _next_dps_per_share(row: pd.Series) -> Optional[float]:
         return annual / float(freq) if float(freq) > 0 else None
     except Exception:
         return None
-
 
 def build_next_dividends_table(
     data_df: pd.DataFrame,
@@ -1289,6 +1309,7 @@ def page_portfolio() -> None:
 
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
+
 
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
