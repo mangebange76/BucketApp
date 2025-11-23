@@ -324,8 +324,7 @@ def write_data_df(df: pd.DataFrame) -> None:
 # Settings-hantering
 # =============================
 
-# Standard-nycklar som alltid ska finnas i Settings-bladet.
-# Dessa används bl.a. för FX, bucket-max och FV-logiken.
+# CHANGED: defaults anpassade till hur appen faktiskt läser värden
 DEFAULT_SETTINGS: Dict[str, str] = {
     # FX-status (fylls automatiskt, men nycklarna ska alltid finnas)
     "FX_LAST_UPDATE_TS": "",
@@ -335,20 +334,21 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "pe_anchor_weight_ttm": "0.50",
     "multiple_decay": "0.08",
 
-    # Bucket max – nivåer i SEK (kan du justera fritt i Settings-vyn)
-    "BUCKET_A_TILLV_MAX_SEK": "20000",
-    "BUCKET_A_UTDEL_MAX_SEK": "10000",
-    "BUCKET_B_TILLV_MAX_SEK": "10000",
-    "BUCKET_B_UTDEL_MAX_SEK": "7000",
-    "BUCKET_C_TILLV_MAX_SEK": "6000",
-    "BUCKET_C_UTDEL_MAX_SEK": "4000",
+    # Bucket max – nivåer i SEK (används av _cap_for_bucket i app_pages.py)
+    # Nycklarna följer mönstret: bucket_cap_{a|b|c}_{tillvaxt|utdelning}
+    "bucket_cap_a_tillvaxt": "20000",
+    "bucket_cap_a_utdelning": "10000",
+    "bucket_cap_b_tillvaxt": "10000",
+    "bucket_cap_b_utdelning": "7000",
+    "bucket_cap_c_tillvaxt": "6000",
+    "bucket_cap_c_utdelning": "4000",
 
-    # Källskatt per valuta (för utdelningsberäkningar)
-    "WITHHOLDING_TAX_SEK": "0.00",
-    "WITHHOLDING_TAX_USD": "0.15",
-    "WITHHOLDING_TAX_NOK": "0.25",
-    "WITHHOLDING_TAX_CAD": "0.15",
-    "WITHHOLDING_TAX_EUR": "0.15",
+    # Källskatt per valuta (för utdelningsberäkningar, används med 'withholding_{VALUTA}')
+    "withholding_SEK": "0.00",
+    "withholding_USD": "0.15",
+    "withholding_NOK": "0.25",
+    "withholding_CAD": "0.15",
+    "withholding_EUR": "0.15",
 }
 
 
@@ -473,6 +473,8 @@ def get_settings_map() -> Dict[str, str]:
       - Ser till att saknade DEFAULT_SETTINGS också skrivs tillbaka
         till Google Sheets, så att Settings-fliken inte kan bli
         "halv-tom" av misstag.
+      - CHANGED: migrerar gamla nycklar (BUCKET_A_TILLV_MAX_SEK,
+        WITHHOLDING_TAX_USD, osv) till de nya som appen använder.
     """
     df = _read_df(SETTINGS_TITLE)
     settings: Dict[str, str] = {}
@@ -507,6 +509,28 @@ def get_settings_map() -> Dict[str, str]:
                     continue
                 v = r.get(val_col)
                 settings[k] = "" if v is None else str(v).strip()
+
+    # CHANGED: Backwards-kompatibel migrering av gamla nycklar → nya
+    migration_pairs = [
+        # Bucket caps gamla → nya
+        ("BUCKET_A_TILLV_MAX_SEK", "bucket_cap_a_tillvaxt"),
+        ("BUCKET_A_UTDEL_MAX_SEK", "bucket_cap_a_utdelning"),
+        ("BUCKET_B_TILLV_MAX_SEK", "bucket_cap_b_tillvaxt"),
+        ("BUCKET_B_UTDEL_MAX_SEK", "bucket_cap_b_utdelning"),
+        ("BUCKET_C_TILLV_MAX_SEK", "bucket_cap_c_tillvaxt"),
+        ("BUCKET_C_UTDEL_MAX_SEK", "bucket_cap_c_utdelning"),
+        # Källskatt gamla → nya
+        ("WITHHOLDING_TAX_SEK", "withholding_SEK"),
+        ("WITHHOLDING_TAX_USD", "withholding_USD"),
+        ("WITHHOLDING_TAX_NOK", "withholding_NOK"),
+        ("WITHHOLDING_TAX_CAD", "withholding_CAD"),
+        ("WITHHOLDING_TAX_EUR", "withholding_EUR"),
+    ]
+    migrated = dict(settings)
+    for old_key, new_key in migration_pairs:
+        if new_key not in migrated and old_key in settings:
+            migrated[new_key] = settings[old_key]
+    settings = migrated
 
     # Lägg på default-värden för alla kända nycklar
     full_settings: Dict[str, str] = {}
