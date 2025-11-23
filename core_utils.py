@@ -30,6 +30,7 @@ DATA_COLUMNS: List[str] = [
     "Ticker",
     "Bolagsnamn",
     "Sektor",
+    "Sektor-detalj",          # NY: t.ex. 'Semiconductors', 'REIT—Residential'
     "Bucket",
     "Valuta",
     "Antal aktier",
