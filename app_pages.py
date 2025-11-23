@@ -550,7 +550,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
       - Ticker
       - Bolagsnamn
       - Sektor
-      - Subsektor  (om kolumnen finns i Data-bladet)
+      - Subsektor  (hämtas från 'Subsektor' eller 'Sektor-detalj' i Data-bladet)
       - Bucket
       - Valuta
       - Antal
@@ -586,6 +586,13 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
     if qty_col is None:
         return pd.DataFrame(columns=cols)
 
+    # CHANGED: hitta källa för subsektor (Subsektor eller Sektor-detalj)
+    subsector_src_col: Optional[str] = None
+    if "Subsektor" in base.columns:
+        subsector_src_col = "Subsektor"
+    elif "Sektor-detalj" in base.columns:
+        subsector_src_col = "Sektor-detalj"
+
     base[qty_col] = pd.to_numeric(base[qty_col], errors="coerce")
     owned = base[base[qty_col] > 0].copy()
 
@@ -595,7 +602,13 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
             continue
         name = str(_nz(r.get("Bolagsnamn"), ""))
         sector = str(_nz(r.get("Sektor"), "") or "")
-        subsector = str(_nz(r.get("Subsektor"), "") or "") if "Subsektor" in owned.columns else ""
+
+        # CHANGED: läs subsektor från vald källkolumn om den finns
+        if subsector_src_col is not None:
+            subsector = str(_nz(r.get(subsector_src_col), "") or "")
+        else:
+            subsector = ""
+
         bucket = str(_nz(r.get("Bucket"), "") or "")
         ccy = str(_nz(r.get("Valuta"), "SEK")).upper()
 
@@ -1179,7 +1192,8 @@ def _build_sector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
 def _build_subsector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
     """
     Summerar värde per Subsektor baserat på positions-tabellen.
-    Använder kolumnen 'Subsektor' om den finns, annars blir tabellen tom.
+    Använder kolumnen 'Subsektor' i positions-tabellen, som i sin tur kommer
+    från 'Subsektor' ELLER 'Sektor-detalj' i Data-bladet.
     """
     if (
         pos_df is None
@@ -1326,8 +1340,8 @@ def page_portfolio() -> None:
         subsector_df = _build_subsector_overview(pos)
         if subsector_df.empty:
             st.info(
-                "Ingen subsektordata hittades (kolumnen 'Subsektor' saknas eller är tom). "
-                "Lägg till kolumnen i Data-bladet om du vill använda detta."
+                "Ingen subsektordata hittades. Lägg till kolumnen 'Subsektor' "
+                "eller 'Sektor-detalj' i Data-bladet om du vill använda detta."
             )
         else:
             show_subsector = subsector_df.copy()
@@ -1343,7 +1357,6 @@ def page_portfolio() -> None:
 
     st.markdown("---")
     render_dividend_rolling_12m_section(df, fx_map, settings)
-
 
 # ============================================================
 # 🧩 Massuppdatering (Yahoo) — 1s per bolag
