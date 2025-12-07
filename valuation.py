@@ -1,68 +1,95 @@
+# valuation.py — DCF-baserad FV idag + P/E-baserade framtida riktkurser
+
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from core_utils import _f, _pos, _nz
+from core_utils import _f, _nz
 
 
-# ============================================================
-# Yahoo-hämtning (oförändrat interface)
-# ============================================================
+# ============================
+# Yahoo-hämtning (robust)
+# ============================
+
+def _safe_float(x: Any) -> Optional[float]:
+    v = _f(x)
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        if not math.isfinite(fv):
+            return None
+        return fv
+    except Exception:
+        return None
+
+
+def _safe_dict(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+    
 
 def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     """
-    Hämtar grunddata för ett bolag från Yahoo Finance.
+    Hämtar nyckeldata för ett bolag från Yahoo Finance.
+    Returnerar en dict med fält som används av appen.
 
-    Returnerar en dict med nycklar som används i appen, t.ex.:
-      name, sector, industry, price, currency, shares_out, net_debt,
-      rev_ttm, ebitda_ttm, eps_ttm, pe_ttm, pe_fwd, ev_rev, ev_ebitda,
-      p_b, bvps, rev_cagr_hist, eps_cagr_hist, dps_annual
+    OBS: Körs bara vid explicit uppdatering / massuppdatering,
+    inte inne i själva fair value-beräkningen (compute_methods_for_row).
     """
-    t = yf.Ticker(str(ticker).strip())
-
-    out: Dict[str, Any] = {}
-
-    # -----------------------
-    # Meta / info
-    # -----------------------
-    try:
-        info = t.fast_info or {}
-    except Exception:
-        info = {}
+    tkr = (ticker or "").strip()
+    if not tkr:
+        return {}
 
     try:
-        # Nyare Yahoo-versioner har "get_info"
-        long_info = t.get_info()
+        t = yf.Ticker(tkr)
     except Exception:
-        long_info = {}
+        return {}
 
-    def _g(*keys, src=None):
-        src_dict = info if src == "fast" else long_info
-        for k in keys:
-            if src_dict and k in src_dict and src_dict[k] not in (None, "", "None"):
-                return src_dict[k]
-        return None
+    info: Dict[str, Any] = {}
+    try:
+        info = _safe_dict(t.get_info())
+    except Exception:
+        # vissa versioner: .info istället
+        try:
+            info = _safe_dict(getattr(t, "info", {}))
+        except Exception:
+            info = {}
 
-    out["name"] = _g("longName", "shortName", "symbol")
-    out["longName"] = _g("longName")
-    out["shortName"] = _g("shortName")
-    out["sector"] = _g("sector")
-    out["industry"] = _g("industry")
-
-    # -----------------------
     # Pris & valuta
-    # -----------------------
     price = None
+    currency = None
     try:
-        if isinstance(info, dict):
-            price = info.get("last_price") or info.get("lastPrice") or info.get("last")
+        fi = getattr(t, "fast_info", None)
+        if fi is not None:
+            # fast_info kan vara ett objekt eller dict
+            if isinstance(fi, dict):
+                currency = fi.get("currency") or currency
+                price = (
+                    fi.get("last_price")
+                    or fi.get("lastPrice")
+                    or fi.get("last")
+                    or price
+                )
+            else:
+                currency = getattr(fi, "currency", None) or currency
+                price = (
+                    getattr(fi, "last_price", None)
+                    or getattr(fi, "lastPrice", None)
+                    or getattr(fi, "last", None)
+                    or price
+                )
     except Exception:
-        price = None
+        pass
 
     if price is None:
         try:
@@ -72,340 +99,381 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
         except Exception:
             price = None
 
-    out["price"] = _f(price)
+    if currency is None:
+        currency = info.get("currency")
 
-    cur = _g("currency", src="fast") or _g("currency")
-    out["currency"] = cur
-
-    # -----------------------
-    # Aktier & skulder
-    # -----------------------
-    shares_out = _g("sharesOutstanding", "impliedSharesOutstanding")
-    out["shares_out"] = _f(shares_out)
-
+    # Utestående aktier & nettoskuld
+    shares_out = info.get("sharesOutstanding")
+    total_debt = info.get("totalDebt")
+    cash = info.get("totalCash")
     net_debt = None
     try:
-        bs = t.balance_sheet
-        if bs is not None and not bs.empty:
-            # Yahoo-balansräkning är kolumn per period, ta senaste
-            col = bs.columns[0]
-            tot_debt = _f(bs.loc.get("TotalDebt", {}).get(col)) or 0.0
-            cash = _f(bs.loc.get("CashAndCashEquivalents", {}).get(col)) or 0.0
-            net_debt = tot_debt - cash
+        if total_debt is not None and cash is not None:
+            net_debt = float(total_debt) - float(cash)
     except Exception:
         net_debt = None
-    out["net_debt"] = _f(net_debt)
 
-    # -----------------------
-    # Resultaträkning / multiplar
-    # -----------------------
-    try:
-        fin = t.get_financials()
-    except Exception:
-        fin = None
+    rev_ttm = info.get("totalRevenue")
+    ebitda_ttm = info.get("ebitda")
+    eps_ttm = info.get("trailingEps")
+    pe_ttm = info.get("trailingPE")
+    pe_fwd = info.get("forwardPE")
 
-    rev_ttm = None
-    ebitda_ttm = None
-    eps_ttm = None
+    ev_rev = info.get("enterpriseToRevenue")
+    ev_ebitda = info.get("enterpriseToEbitda")
+    p_b = info.get("priceToBook")
+    bvps = info.get("bookValue")
 
-    try:
-        if fin is not None and not fin.empty:
-            col = fin.columns[0]
-            rev_ttm = _f(fin.loc.get("TotalRevenue", {}).get(col))
-            ebitda_ttm = _f(fin.loc.get("Ebitda", {}).get(col))
-    except Exception:
-        pass
+    # Historisk CAGR (om det finns)
+    rev_cagr_hist = info.get("revenueGrowth")  # ofta QoQ eller YoY, men bättre än inget
+    eps_cagr_hist = info.get("earningsQuarterlyGrowth")
 
-    try:
-        eps_hist = t.get_earnings_history()
-        if eps_hist is not None and len(eps_hist) > 0:
-            eps_vals = [x.get("epsactual") for x in eps_hist if x.get("epsactual") is not None]
-            if eps_vals:
-                eps_ttm = float(np.mean(eps_vals[-4:]))
-    except Exception:
-        eps_ttm = None
+    dps_annual = info.get("dividendRate")
 
-    out["rev_ttm"] = rev_ttm
-    out["ebitda_ttm"] = ebitda_ttm
-    out["eps_ttm"] = eps_ttm
+    out = {
+        "name": info.get("longName") or info.get("shortName") or info.get("name"),
+        "longName": info.get("longName"),
+        "shortName": info.get("shortName"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
 
-    if _pos(price) and _pos(eps_ttm):
-        out["pe_ttm"] = float(price) / float(eps_ttm)
-    else:
-        out["pe_ttm"] = None
+        "price": _safe_float(price),
+        "currency": currency,
+        "shares_out": _safe_float(shares_out),
+        "net_debt": _safe_float(net_debt),
 
-    try:
-        pe_fwd = _g("forwardPE")
-    except Exception:
-        pe_fwd = None
-    out["pe_fwd"] = _f(pe_fwd)
+        "rev_ttm": _safe_float(rev_ttm),
+        "ebitda_ttm": _safe_float(ebitda_ttm),
+        "eps_ttm": _safe_float(eps_ttm),
+        "pe_ttm": _safe_float(pe_ttm),
+        "pe_fwd": _safe_float(pe_fwd),
 
-    # EV / Sales & EV / EBITDA från info om de finns
-    out["ev_rev"] = _f(_g("enterpriseToRevenue", src="fast") or _g("enterpriseToRevenue"))
-    out["ev_ebitda"] = _f(_g("enterpriseToEbitda", src="fast") or _g("enterpriseToEbitda"))
+        "ev_rev": _safe_float(ev_rev),
+        "ev_ebitda": _safe_float(ev_ebitda),
+        "p_b": _safe_float(p_b),
+        "bvps": _safe_float(bvps),
 
-    # P/B & BVPS
-    out["p_b"] = _f(_g("priceToBook", src="fast") or _g("priceToBook"))
-    out["bvps"] = _f(_g("bookValue", src="fast") or _g("bookValue"))
-
-    # Utdelning
-    out["dps_annual"] = _f(
-        _g("dividendsPerShare", src="fast")
-        or _g("dividendsPerShare", "trailingAnnualDividendRate")
-    )
-
-    # Historiska CAGR (lämnas None så länge)
-    out["rev_cagr_hist"] = None
-    out["eps_cagr_hist"] = None
-
+        "rev_cagr_hist": _safe_float(rev_cagr_hist),
+        "eps_cagr_hist": _safe_float(eps_cagr_hist),
+        "dps_annual": _safe_float(dps_annual),
+    }
     return out
 
 
+# ============================
+# EPS-estimat från Yahoo
+# ============================
+
 def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
     """
-    Försöker hämta EPS-estimat 1Y och 2Y från Yahoo.
-    Returnerar {"eps_1y": float|None, "eps_2y": float|None}
+    Försöker plocka EPS-estimat för 1Y och 2Y framåt.
+    Returnerar { 'eps_1y': float | None, 'eps_2y': float | None }.
     """
-    t = yf.Ticker(str(ticker).strip())
+    tkr = (ticker or "").strip()
+    if not tkr:
+        return {"eps_1y": None, "eps_2y": None}
+
+    try:
+        t = yf.Ticker(tkr)
+    except Exception:
+        return {"eps_1y": None, "eps_2y": None}
+
     eps_1y = None
     eps_2y = None
-    try:
-        est = t.get_earnings_trend()
-    except Exception:
-        est = None
 
-    if est is not None and not est.empty:
-        try:
-            # Yahoo brukar ha rader "0y", "1y", "2y" etc
-            for _, r in est.iterrows():
-                p = str(r.get("period") or "").lower()
-                eps_val = _f(
-                    r.get("epsTrend")
-                    or r.get("epsHigh")
-                    or r.get("epsLow")
-                    or r.get("epsMean")
-                )
-                if eps_val is None:
+    # Nyare yfinance: get_earnings_trend()
+    try:
+        trend = t.get_earnings_trend()
+        if isinstance(trend, pd.DataFrame) and not trend.empty:
+            # Leta efter rader '0y', '+1y', '+2y' osv
+            for _, row in trend.iterrows():
+                per = str(row.get("period") or "").lower()
+                eps = _safe_float(row.get("epsForward") or row.get("epsTrend"))
+                if eps is None:
                     continue
-                if "1y" in p and eps_1y is None:
-                    eps_1y = eps_val
-                elif "2y" in p and eps_2y is None:
-                    eps_2y = eps_val
+                if "0y" in per or "current" in per:
+                    # ofta innevarande år
+                    eps_1y = eps_1y or eps
+                elif "1y" in per:
+                    eps_1y = eps
+                elif "2y" in per:
+                    eps_2y = eps
+    except Exception:
+        pass
+
+    # Fallback: analysis-tabellen
+    if eps_1y is None or eps_2y is None:
+        try:
+            ana = t.analysis
+            if isinstance(ana, pd.DataFrame) and not ana.empty:
+                # Förväntad EPS i nästa år finns ibland i 'EPS' på raden 'Year Ago EPS', etc.
+                # Det här är mest "best effort" – inte kritiskt för logiken.
+                pass
         except Exception:
             pass
 
     return {"eps_1y": eps_1y, "eps_2y": eps_2y}
 
 
-# ============================================================
-# Fair value-beräkning – fokus FV IDAG
-# ============================================================
+# ============================
+# DCF-metod för FV idag
+# ============================
 
-def _pick_price_and_currency(row: pd.Series) -> Tuple[Optional[float], str]:
-    """Plocka aktuell kurs + valuta från raden."""
-    price = None
-    for c in ("Aktuell kurs", "Price", "Senaste kurs", "Kurs"):
-        if c in row and _f(row.get(c)) is not None:
-            price = _f(row.get(c))
-            break
-
-    cur = None
-    for c in ("Valuta", "Currency", "CUR"):
-        if c in row and row.get(c) not in (None, "", "nan"):
-            cur = str(row.get(c)).upper().strip()
-            break
-    if not cur:
-        cur = "SEK"
-    return price, cur
-
-
-def _eps_inputs_from_row(row: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[float]:
     """
-    Returnerar (eps_ttm, eps_1y, eps_2y) från raden med rimliga fallbacks.
+    Strikt DCF per aktie för FV idag.
+
+    Logik:
+      - Bas-cashflow = EPS 1Y (estimat). Om saknas → försöker EPS 2Y,
+        annars EPS TTM. Om vi fortfarande inte har positiv EPS → None.
+      - Tillväxt g beräknas primärt från EPS 1Y → EPS 2Y:
+            g = (eps2 / eps1) - 1
+        Om eps2 saknas ⇒ försök 'EPS CAGR' på raden, annars settings:
+            dcf_default_growth (t.ex. 0.08 = 8 %).
+      - Diskonteringsränta, antal hög-tillväxtår samt terminaltillväxt
+        läses från Settings:
+            dcf_discount_rate      (default 0.10 = 10 %)
+            dcf_high_growth_years  (default 5)
+            dcf_terminal_growth    (default 0.02 = 2 %)
+      - Ingen clamp på g eller värden – om datan är extrem blir FV extrem.
     """
-    eps_ttm = _f(row.get("EPS TTM"))
-    eps_1y = _f(row.get("EPS 1Y"))
-    eps_2y = _f(row.get("EPS 2Y"))
-
-    # Fallbacks
-    if eps_1y is None and eps_ttm is not None:
-        eps_1y = eps_ttm
-    if eps_2y is None and eps_1y is not None:
-        # default ~10% tillväxt om inget bättre
-        eps_2y = eps_1y * 1.10
-
-    return eps_ttm, eps_1y, eps_2y
-
-
-def _derive_growth(eps_1y: Optional[float], eps_2y: Optional[float]) -> float:
-    """
-    Grovt EPS-tillväxtantagande från 1Y → 2Y.
-    Clampas till [-40 %, +60 %] för att undvika extremfall.
-    """
-    if not _pos(eps_1y) or not _pos(eps_2y):
-        return 0.0
+    # Parametrar från Settings
     try:
-        g = eps_2y / eps_1y - 1.0
+        disc = float(settings.get("dcf_discount_rate", 0.10))
     except Exception:
-        g = 0.0
-    if not math.isfinite(g):
-        return 0.0
-    g = max(-0.40, min(0.60, g))
-    return float(g)
-
-
-def _pe_anchor_from_row(row: pd.Series, settings: Dict[str, str]) -> float:
-    """
-    Bygger ett P/E-ankare för FV **idag**.
-    Blandar observerat P/E (ttm/fwd) med en "normal" multipel ~20x.
-
-    Nycklar i Settings:
-      - pe_anchor_weight_ttm (0–1, default 0.50)
-    """
-    pe_ttm = _f(row.get("PE TTM"))
-    pe_fwd = _f(row.get("PE FWD"))
-
-    base_normal = 20.0
-    obs = None
-    if _pos(pe_fwd):
-        obs = pe_fwd
-    elif _pos(pe_ttm):
-        obs = pe_ttm
-
-    if obs is None:
-        return base_normal
+        disc = 0.10
 
     try:
-        w = float(settings.get("pe_anchor_weight_ttm", "0.50"))
+        years = int(float(settings.get("dcf_high_growth_years", 5)))
     except Exception:
-        w = 0.5
-    w = max(0.0, min(1.0, w))
+        years = 5
 
-    pe_anchor = w * obs + (1.0 - w) * base_normal
-    # Rimliga gränser
-    pe_anchor = max(8.0, min(40.0, pe_anchor))
-    return float(pe_anchor)
-
-
-def _multiple_for_year(pe_anchor: float, year: int, settings: Dict[str, str]) -> float:
-    """
-    Justerar multipeln längre ut i tiden via 'multiple_decay'.
-
-    multiple_decay i Settings är per år, t.ex. 0.08 → -8 %-enheter per år.
-    """
     try:
-        decay = float(settings.get("multiple_decay", "0.08"))
+        term_g = float(settings.get("dcf_terminal_growth", 0.02))
+    except Exception:
+        term_g = 0.02
+
+    # Skydd mot orimlig parameterkombination (men ingen clamp på g/EPS)
+    if years <= 0:
+        return None
+    if disc <= term_g:  # annars smäller Gordon-formeln
+        return None
+
+    eps1 = _safe_float(row.get("EPS 1Y"))
+    eps2 = _safe_float(row.get("EPS 2Y"))
+    eps_ttm = _safe_float(row.get("EPS TTM"))
+
+    # Bas-EPS
+    base_eps = eps1
+    if base_eps is None:
+        base_eps = eps2
+    if base_eps is None:
+        base_eps = eps_ttm
+
+    if base_eps is None or base_eps <= 0:
+        return None
+
+    # Tillväxt g
+    g = None
+    if eps1 is not None and eps2 is not None and eps1 > 0:
+        try:
+            g = (eps2 / eps1) - 1.0
+        except Exception:
+            g = None
+
+    if g is None:
+        eps_cagr_hist = _safe_float(row.get("EPS CAGR"))
+        if eps_cagr_hist is not None:
+            g = eps_cagr_hist
+
+    if g is None:
+        try:
+            g = float(settings.get("dcf_default_growth", 0.08))
+        except Exception:
+            g = 0.08
+
+    # Själva DCF-beräkningen (per aktie)
+    fv = 0.0
+    for t in range(1, years + 1):
+        cf_t = base_eps * ((1.0 + g) ** (t - 1))
+        fv += cf_t / ((1.0 + disc) ** t)
+
+    # Terminalvärde
+    eps_last = base_eps * ((1.0 + g) ** years)
+    terminal = eps_last * (1.0 + term_g) / (disc - term_g)
+    fv += terminal / ((1.0 + disc) ** years)
+
+    if not math.isfinite(fv):
+        return None
+    return float(fv)
+
+
+# ============================
+# P/E-baserade riktkurser 1–3 år
+# ============================
+
+def _pe_anchor_for_row(row: pd.Series, settings: Dict[str, Any]) -> Optional[float]:
+    """
+    Bygger ett P/E-ankare som används för framtida riktkurser.
+    Här tillåter vi clamp (som tidigare).
+    """
+    pe_ttm = _safe_float(row.get("PE TTM"))
+    pe_fwd = _safe_float(row.get("PE FWD"))
+
+    pe_list = [x for x in (pe_ttm, pe_fwd) if x is not None and x > 0]
+    if pe_list:
+        market_pe = sum(pe_list) / len(pe_list)
+    else:
+        market_pe = None
+
+    # Bas-"kvalitetsmultipel"
+    base_pe = 20.0
+
+    try:
+        w_ttm = float(settings.get("pe_anchor_weight_ttm", 0.5))
+    except Exception:
+        w_ttm = 0.5
+    w_ttm = max(0.0, min(1.0, w_ttm))
+
+    if market_pe is None:
+        anchor = base_pe
+    else:
+        anchor = w_ttm * market_pe + (1.0 - w_ttm) * base_pe
+
+    # Clamp för att undvika helt galna multiplar
+    anchor = max(5.0, min(anchor, 45.0))
+    return anchor
+
+
+def _growth_for_forward_targets(row: pd.Series) -> float:
+    """
+    Beräknar tillväxt g som används för riktkurser 1–3 år.
+    Här CLAMPAR vi (t.ex. -40 % till +60 %) – det var önskemålet tidigare.
+    """
+    eps1 = _safe_float(row.get("EPS 1Y"))
+    eps2 = _safe_float(row.get("EPS 2Y"))
+    g = None
+
+    if eps1 is not None and eps2 is not None and eps1 > 0:
+        try:
+            g = (eps2 / eps1) - 1.0
+        except Exception:
+            g = None
+
+    if g is None:
+        cagr_hist = _safe_float(row.get("EPS CAGR"))
+        if cagr_hist is not None:
+            g = cagr_hist
+
+    if g is None:
+        g = 0.10  # fallback 10 % om inget annat
+
+    # Clamp – här är det OK (du ville ha clamp på framtida riktkurser)
+    g = max(-0.40, min(g, 0.60))
+    return g
+
+
+def _compute_forward_targets_pe(row: pd.Series, settings: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Bygger FV 1, 2 och 3 år med P/E-ankare + tillväxt + multiple-decay.
+    """
+    anchor_pe = _pe_anchor_for_row(row, settings)
+    if anchor_pe is None or anchor_pe <= 0:
+        return {"target_1y": None, "target_2y": None, "target_3y": None}
+
+    g = _growth_for_forward_targets(row)
+
+    try:
+        decay = float(settings.get("multiple_decay", 0.08))
     except Exception:
         decay = 0.08
-    decay = max(0.0, min(0.25, decay))
 
-    m = pe_anchor * (1.0 - decay * year)
-    m = max(5.0, min(35.0, m))
-    return float(m)
+    decay = max(0.0, min(decay, 0.30))
 
+    eps1 = _safe_float(row.get("EPS 1Y"))
+    eps_ttm = _safe_float(row.get("EPS TTM"))
+
+    base_eps = eps1 if eps1 is not None and eps1 > 0 else eps_ttm
+    if base_eps is None or base_eps <= 0:
+        return {"target_1y": None, "target_2y": None, "target_3y": None}
+
+    mult_1 = anchor_pe * (1.0 - decay * 1)
+    mult_2 = anchor_pe * (1.0 - decay * 2)
+    mult_3 = anchor_pe * (1.0 - decay * 3)
+
+    mult_1 = max(3.0, mult_1)
+    mult_2 = max(3.0, mult_2)
+    mult_3 = max(3.0, mult_3)
+
+    eps_y1 = base_eps * ((1.0 + g) ** 1)
+    eps_y2 = base_eps * ((1.0 + g) ** 2)
+    eps_y3 = base_eps * ((1.0 + g) ** 3)
+
+    t1 = eps_y1 * mult_1 if eps_y1 is not None else None
+    t2 = eps_y2 * mult_2 if eps_y2 is not None else None
+    t3 = eps_y3 * mult_3 if eps_y3 is not None else None
+
+    for name, val in (("t1", t1), ("t2", t2), ("t3", t3)):
+        if val is not None and not math.isfinite(val):
+            if name == "t1":
+                t1 = None
+            elif name == "t2":
+                t2 = None
+            else:
+                t3 = None
+
+    return {"target_1y": t1, "target_2y": t2, "target_3y": t3}
+
+
+# ============================
+# Huvudfunktion: compute_methods_for_row
+# ============================
 
 def compute_methods_for_row(
     row: pd.Series,
-    settings: Dict[str, str],
+    settings: Dict[str, Any],
     fx_map: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
     """
-    Huvudfunktion som appen anropar.
+    Central värderingsfunktion.
 
-    Returnerar en dict med minst:
-      - price
-      - currency
-      - method_name
-      - target_today
-      - target_1y
-      - target_2y
-      - target_3y
-
-    Fokus är en robust, konservativ FV **idag**, där framåtblickande
-    riktkurser bygger vidare på EPS-tillväxt + multipel-decay.
+    • FV idag  (`target_today`) = strikt DCF (per aktie) enligt _compute_dcf_fv_today.
+      Ingen clamp på EPS/tillväxt utöver det som behövs för att undvika division by zero.
+    • FV 1–3 år (`target_1y`, `target_2y`, `target_3y`) = P/E-baserade mål med
+      tillväxt + multiple-decay, inklusive clamp på tillväxt (som tidigare).
     """
-    if row is None or not isinstance(row, (pd.Series, dict)):
+    if row is None:
         return {
             "price": None,
-            "currency": "SEK",
-            "method_name": "n/a",
-            "target_today": None,
-            "target_1y": None,
-            "target_2y": None,
-            "target_3y": None,
-        }
-    if isinstance(row, dict):
-        row = pd.Series(row)
-
-    price, currency = _pick_price_and_currency(row)
-    if not _pos(price):
-        # Utan aktuell kurs kan vi inte säga så mycket
-        return {
-            "price": None,
-            "currency": currency,
-            "method_name": "no_price",
+            "currency": None,
             "target_today": None,
             "target_1y": None,
             "target_2y": None,
             "target_3y": None,
         }
 
-    eps_ttm, eps_1y, eps_2y = _eps_inputs_from_row(row)
-    if not _pos(eps_1y):
-        # Vi saknar någon form av EPS-bas → returnera bara pris
-        return {
-            "price": price,
-            "currency": currency,
-            "method_name": "price_only",
-            "target_today": None,
-            "target_1y": None,
-            "target_2y": None,
-            "target_3y": None,
-        }
+    price = _safe_float(row.get("Aktuell kurs"))
+    currency = str(_nz(row.get("Valuta"), "SEK")).upper()
 
-    pe_anchor = _pe_anchor_from_row(row, settings)
-    g = _derive_growth(eps_1y, eps_2y)
+    # 1) FV idag via DCF
+    fv_today = _compute_dcf_fv_today(row, settings)
 
-    # EPS-banor
-    eps_y0 = eps_1y  # "nära kommande år" som används för FV idag
-    eps_y1 = eps_y0 * (1.0 + g)
-    eps_y2 = eps_y1 * (1.0 + g)
-    eps_y3 = eps_y2 * (1.0 + g)
+    # 2) FV 1–3 år via P/E-ankare
+    forwards = _compute_forward_targets_pe(row, settings)
+    t1 = forwards.get("target_1y")
+    t2 = forwards.get("target_2y")
+    t3 = forwards.get("target_3y")
 
-    m0 = _multiple_for_year(pe_anchor, 0, settings)
-    m1 = _multiple_for_year(pe_anchor, 1, settings)
-    m2 = _multiple_for_year(pe_anchor, 2, settings)
-    m3 = _multiple_for_year(pe_anchor, 3, settings)
-
-    target_today = eps_y0 * m0
-    target_1y = eps_y1 * m1
-    target_2y = eps_y2 * m2
-    target_3y = eps_y3 * m3
-
-    # Säkerhetsbälte: om nåt blivit orimligt (t.ex. <0) → None
-    def _safe(v: float | None) -> Optional[float]:
-        if v is None:
-            return None
-        try:
-            v = float(v)
-        except Exception:
-            return None
-        if not math.isfinite(v) or v <= 0:
-            return None
-        return v
-
-    out = {
-        "price": _safe(price),
+    payload: Dict[str, Any] = {
+        "price": price,
         "currency": currency,
-        "method_name": "pe_anchor_eps",
-        "eps_ttm": eps_ttm,
-        "eps_1y": eps_1y,
-        "eps_2y": eps_2y,
-        "growth_eps_1y_2y": g,
-        "pe_anchor": pe_anchor,
-        "target_today": _safe(target_today),
-        "target_1y": _safe(target_1y),
-        "target_2y": _safe(target_2y),
-        "target_3y": _safe(target_3y),
+        "target_today": fv_today,
+        "target_1y": t1,
+        "target_2y": t2,
+        "target_3y": t3,
     }
-    return out
+
+    # Du kan lägga till fler debug-fält här om du vill se dem i Editor/Tabell
+    # t.ex. payload["dcf_growth_used"] = g, etc. (men jag lämnar dem tomma nu)
+
+    return payload
