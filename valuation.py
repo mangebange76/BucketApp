@@ -128,7 +128,34 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     rev_cagr_hist = info.get("revenueGrowth")  # ofta QoQ eller YoY, men bättre än inget
     eps_cagr_hist = info.get("earningsQuarterlyGrowth")
 
-    dps_annual = info.get("dividendRate")
+    # ============================
+    # Utdelning (annualiserad)
+    # ============================
+    dps_annual: Optional[float] = None
+
+    # 1) Försök först med "vanliga" Yahoo-fält
+    for key in ("trailingAnnualDividendRate", "dividendRate"):
+        v = info.get(key)
+        v_f = _safe_float(v)
+        if v_f is not None and v_f > 0:
+            dps_annual = v_f
+            break
+
+    # 2) Om fortfarande None/0 → räkna fram från utdelningshistorik (sista 12 mån)
+    if not dps_annual:
+        try:
+            divs = t.dividends  # pandas Series: index = datum, värde = utdelning per aktie
+            if divs is not None and not divs.empty:
+                now = pd.Timestamp.utcnow()
+                last_12m = divs[divs.index >= (now - pd.Timedelta(days=365))]
+                if last_12m.empty:
+                    last_12m = divs
+                total = float(last_12m.sum())
+                if total > 0:
+                    dps_annual = total
+        except Exception:
+            # vi vill aldrig krascha på utdelningsdelen – hellre None än fel
+            dps_annual = None
 
     out = {
         "name": info.get("longName") or info.get("shortName") or info.get("name"),
