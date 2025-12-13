@@ -20,7 +20,8 @@ import pandas as pd
 import streamlit as st
 
 # Egna moduler
-from core_utils import get_fx_map, _load_data_into_session  # wrappers mot sheets_io
+# CHANGED: importera now_stamp för tydlig “senast omladdad”-text
+from core_utils import get_fx_map, _load_data_into_session, now_stamp  # wrappers mot sheets_io
 from sheets_io import read_data_df, get_settings_map, refresh_fx_live
 from analysis_ui import render_analysis_view, render_ranking_view
 from app_pages import (
@@ -42,22 +43,6 @@ def page_analysis() -> None:
     """Analys-vy: enskild ticker med fair value + metodtabell."""
     st.header("📊 Analys – enskild ticker")
 
-    # CHANGED: Refresh-knapp som läser om DATA från Sheets och rerun:ar
-    with st.sidebar:
-        if st.button("🔄 Läs om Data (från Sheets)", use_container_width=True):
-            try:
-                st.session_state["DATA"] = read_data_df()
-            except Exception as e:
-                st.sidebar.error(f"Kunde inte läsa om Data: {e}")
-            # Rensa ev. gamla beräknings-cache i session (för säkerhets skull)
-            for k in list(st.session_state.keys()):
-                if str(k).upper().startswith("RANK"):
-                    try:
-                        del st.session_state[k]
-                    except Exception:
-                        pass
-            st.rerun()
-
     df = st.session_state.get("DATA")
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         df = read_data_df()
@@ -77,22 +62,6 @@ def page_analysis() -> None:
 def page_ranking() -> None:
     """Ranking-vy: lista över tickers sorterat på uppsida."""
     st.header("🏆 Ranking – uppsida per ticker")
-
-    # CHANGED: Refresh-knapp som läser om DATA från Sheets och rerun:ar
-    with st.sidebar:
-        if st.button("🔄 Läs om Data (från Sheets)", use_container_width=True):
-            try:
-                st.session_state["DATA"] = read_data_df()
-            except Exception as e:
-                st.sidebar.error(f"Kunde inte läsa om Data: {e}")
-            # Rensa ev. rank-relaterat session-state så ranking inte “fastnar”
-            for k in list(st.session_state.keys()):
-                if str(k).upper().startswith("RANK"):
-                    try:
-                        del st.session_state[k]
-                    except Exception:
-                        pass
-            st.rerun()
 
     df = st.session_state.get("DATA")
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
@@ -142,6 +111,37 @@ def main() -> None:
 
     # Sidebar-navigering
     st.sidebar.markdown("## 🧭 Navigering")
+
+    # CHANGED: Refresh-knapp i main (säkert ställe som alltid körs)
+    if st.sidebar.button("🔄 Läs om Data (från Sheets)", key="reload_data_btn", use_container_width=True):
+        try:
+            # Blås ev. cachar som kan göra att ranking “fastnar”
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+
+            # Läs om Data från Sheets
+            st.session_state["DATA"] = read_data_df()
+            st.session_state["DATA_RELOADED_TS"] = now_stamp()
+
+            # Rensa ev. session-nycklar som kan hålla kvar gammal ranking
+            for k in list(st.session_state.keys()):
+                ku = str(k).upper()
+                if ku.startswith("RANK") or ku.startswith("RANKING") or ku.startswith("ANALYSIS"):
+                    try:
+                        del st.session_state[k]
+                    except Exception:
+                        pass
+
+            st.sidebar.success("Data omladdad. Kör om…")
+        except Exception as e:
+            st.sidebar.error(f"Kunde inte läsa om Data: {e}")
+        st.rerun()
+
+    # CHANGED: liten “bevisrad” så du ser att klicket faktiskt gjorde något
+    if st.session_state.get("DATA_RELOADED_TS"):
+        st.sidebar.caption(f"Data omladdad: {st.session_state['DATA_RELOADED_TS']}")
 
     page = st.sidebar.radio(
         "Välj vy",
