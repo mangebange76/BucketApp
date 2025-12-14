@@ -36,7 +36,7 @@ def _safe_dict(obj: Any) -> Dict[str, Any]:
         return dict(obj)
     except Exception:
         return {}
-    
+
 
 def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     """
@@ -144,7 +144,7 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
     # 2) Om fortfarande None/0 → räkna fram från utdelningshistorik (sista 12 mån)
     if not dps_annual:
         try:
-            divs = t.dividends  # pandas Series: index = datum, värde = utdelning per aktie
+            divs = t.dividends
             if divs is not None and not divs.empty:
                 now = pd.Timestamp.utcnow()
                 last_12m = divs[divs.index >= (now - pd.Timedelta(days=365))]
@@ -154,7 +154,6 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
                 if total > 0:
                     dps_annual = total
         except Exception:
-            # vi vill aldrig krascha på utdelningsdelen – hellre None än fel
             dps_annual = None
 
     out = {
@@ -188,6 +187,32 @@ def fetch_from_yahoo(ticker: str) -> Dict[str, Any]:
 
 
 # ============================
+# ✅ CHANGED: Normalisera growth-rate (procent vs decimal)
+# ============================
+def _normalize_growth_rate(g: Optional[float]) -> Optional[float]:
+    """
+    Tar en growth-rate som kan vara i decimal (0.12) eller procent (12.0)
+    och normaliserar till decimalform.
+
+    Ex:
+      0.135 -> 0.135
+      13.5  -> 0.135
+    """
+    if g is None:
+        return None
+    try:
+        gv = float(g)
+        if not math.isfinite(gv):
+            return None
+        # Om någon råkat spara 13.5 (13.5%) i sheet -> gör om till 0.135
+        if abs(gv) > 1.0:
+            gv = gv / 100.0
+        return gv
+    except Exception:
+        return None
+
+
+# ============================
 # EPS-estimat från Yahoo
 # ============================
 
@@ -208,18 +233,15 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
     eps_1y = None
     eps_2y = None
 
-    # Nyare yfinance: get_earnings_trend()
     try:
         trend = t.get_earnings_trend()
         if isinstance(trend, pd.DataFrame) and not trend.empty:
-            # Leta efter rader '0y', '+1y', '+2y' osv
             for _, row in trend.iterrows():
                 per = str(row.get("period") or "").lower()
                 eps = _safe_float(row.get("epsForward") or row.get("epsTrend"))
                 if eps is None:
                     continue
                 if "0y" in per or "current" in per:
-                    # ofta innevarande år
                     eps_1y = eps_1y or eps
                 elif "1y" in per:
                     eps_1y = eps
@@ -228,13 +250,10 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
     except Exception:
         pass
 
-    # Fallback: analysis-tabellen
     if eps_1y is None or eps_2y is None:
         try:
             ana = t.analysis
             if isinstance(ana, pd.DataFrame) and not ana.empty:
-                # Förväntad EPS i nästa år finns ibland i 'EPS' på raden 'Year Ago EPS', etc.
-                # Det här är mest "best effort" – inte kritiskt för logiken.
                 pass
         except Exception:
             pass
@@ -249,22 +268,7 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
 def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[float]:
     """
     Strikt DCF per aktie för FV idag.
-
-    Logik:
-      - Bas-cashflow = EPS 1Y (estimat). Om saknas → försöker EPS 2Y,
-        annars EPS TTM. Om vi fortfarande inte har positiv EPS → None.
-      - Tillväxt g beräknas primärt från EPS 1Y → EPS 2Y:
-            g = (eps2 / eps1) - 1
-        Om eps2 saknas ⇒ försök 'EPS CAGR' på raden, annars settings:
-            dcf_default_growth (t.ex. 0.08 = 8 %).
-      - Diskonteringsränta, antal hög-tillväxtår samt terminaltillväxt
-        läses från Settings:
-            dcf_discount_rate      (default 0.10 = 10 %)
-            dcf_high_growth_years  (default 5)
-            dcf_terminal_growth    (default 0.02 = 2 %)
-      - Ingen clamp på g eller värden – om datan är extrem blir FV extrem.
     """
-    # Parametrar från Settings
     try:
         disc = float(settings.get("dcf_discount_rate", 0.10))
     except Exception:
@@ -280,17 +284,15 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
     except Exception:
         term_g = 0.02
 
-    # Skydd mot orimlig parameterkombination (men ingen clamp på g/EPS)
     if years <= 0:
         return None
-    if disc <= term_g:  # annars smäller Gordon-formeln
+    if disc <= term_g:
         return None
 
     eps1 = _safe_float(row.get("EPS 1Y"))
     eps2 = _safe_float(row.get("EPS 2Y"))
     eps_ttm = _safe_float(row.get("EPS TTM"))
 
-    # Bas-EPS
     base_eps = eps1
     if base_eps is None:
         base_eps = eps2
@@ -300,7 +302,6 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
     if base_eps is None or base_eps <= 0:
         return None
 
-    # Tillväxt g
     g = None
     if eps1 is not None and eps2 is not None and eps1 > 0:
         try:
@@ -309,7 +310,8 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
             g = None
 
     if g is None:
-        eps_cagr_hist = _safe_float(row.get("EPS CAGR"))
+        # ✅ CHANGED: normalisera CAGR om den råkat sparas som procent i sheet
+        eps_cagr_hist = _normalize_growth_rate(_safe_float(row.get("EPS CAGR")))
         if eps_cagr_hist is not None:
             g = eps_cagr_hist
 
@@ -319,13 +321,11 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
         except Exception:
             g = 0.08
 
-    # Själva DCF-beräkningen (per aktie)
     fv = 0.0
     for t in range(1, years + 1):
         cf_t = base_eps * ((1.0 + g) ** (t - 1))
         fv += cf_t / ((1.0 + disc) ** t)
 
-    # Terminalvärde
     eps_last = base_eps * ((1.0 + g) ** years)
     terminal = eps_last * (1.0 + term_g) / (disc - term_g)
     fv += terminal / ((1.0 + disc) ** years)
@@ -340,10 +340,6 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
 # ============================
 
 def _pe_anchor_for_row(row: pd.Series, settings: Dict[str, Any]) -> Optional[float]:
-    """
-    Bygger ett P/E-ankare som används för framtida riktkurser.
-    Här tillåter vi clamp (som tidigare).
-    """
     pe_ttm = _safe_float(row.get("PE TTM"))
     pe_fwd = _safe_float(row.get("PE FWD"))
 
@@ -353,7 +349,6 @@ def _pe_anchor_for_row(row: pd.Series, settings: Dict[str, Any]) -> Optional[flo
     else:
         market_pe = None
 
-    # Bas-"kvalitetsmultipel"
     base_pe = 20.0
 
     try:
@@ -367,16 +362,11 @@ def _pe_anchor_for_row(row: pd.Series, settings: Dict[str, Any]) -> Optional[flo
     else:
         anchor = w_ttm * market_pe + (1.0 - w_ttm) * base_pe
 
-    # Clamp för att undvika helt galna multiplar
     anchor = max(5.0, min(anchor, 45.0))
     return anchor
 
 
 def _growth_for_forward_targets(row: pd.Series) -> float:
-    """
-    Beräknar tillväxt g som används för riktkurser 1–3 år.
-    Här CLAMPAR vi (t.ex. -40 % till +60 %) – det var önskemålet tidigare.
-    """
     eps1 = _safe_float(row.get("EPS 1Y"))
     eps2 = _safe_float(row.get("EPS 2Y"))
     g = None
@@ -388,22 +378,19 @@ def _growth_for_forward_targets(row: pd.Series) -> float:
             g = None
 
     if g is None:
-        cagr_hist = _safe_float(row.get("EPS CAGR"))
+        # ✅ CHANGED: normalisera även här (så 13.5 inte blir 1350%)
+        cagr_hist = _normalize_growth_rate(_safe_float(row.get("EPS CAGR")))
         if cagr_hist is not None:
             g = cagr_hist
 
     if g is None:
-        g = 0.10  # fallback 10 % om inget annat
+        g = 0.10
 
-    # Clamp – här är det OK (du ville ha clamp på framtida riktkurser)
     g = max(-0.40, min(g, 0.60))
     return g
 
 
 def _compute_forward_targets_pe(row: pd.Series, settings: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Bygger FV 1, 2 och 3 år med P/E-ankare + tillväxt + multiple-decay.
-    """
     anchor_pe = _pe_anchor_for_row(row, settings)
     if anchor_pe is None or anchor_pe <= 0:
         return {"target_1y": None, "target_2y": None, "target_3y": None}
@@ -461,14 +448,6 @@ def compute_methods_for_row(
     settings: Dict[str, Any],
     fx_map: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Central värderingsfunktion.
-
-    • FV idag  (`target_today`) = strikt DCF (per aktie) enligt _compute_dcf_fv_today.
-      Ingen clamp på EPS/tillväxt utöver det som behövs för att undvika division by zero.
-    • FV 1–3 år (`target_1y`, `target_2y`, `target_3y`) = P/E-baserade mål med
-      tillväxt + multiple-decay, inklusive clamp på tillväxt (som tidigare).
-    """
     if row is None:
         return {
             "price": None,
@@ -482,10 +461,8 @@ def compute_methods_for_row(
     price = _safe_float(row.get("Aktuell kurs"))
     currency = str(_nz(row.get("Valuta"), "SEK")).upper()
 
-    # 1) FV idag via DCF
     fv_today = _compute_dcf_fv_today(row, settings)
 
-    # 2) FV 1–3 år via P/E-ankare
     forwards = _compute_forward_targets_pe(row, settings)
     t1 = forwards.get("target_1y")
     t2 = forwards.get("target_2y")
@@ -499,8 +476,5 @@ def compute_methods_for_row(
         "target_2y": t2,
         "target_3y": t3,
     }
-
-    # Du kan lägga till fler debug-fält här om du vill se dem i Editor/Tabell
-    # t.ex. payload["dcf_growth_used"] = g, etc. (men jag lämnar dem tomma nu)
 
     return payload
