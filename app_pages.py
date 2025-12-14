@@ -353,7 +353,7 @@ def page_snapshot() -> None:
     if snap is None or snap.empty:
         st.info("Inga snapshots ännu.")
         return
-    _show_df(snap, height=420, use_container_width=True
+    _show_df(snap, height=420, use_container_width=True)
 
 # ============================================================
 # ✏️ Editor (manuellt + Yahoo)
