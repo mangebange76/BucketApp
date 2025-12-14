@@ -444,6 +444,30 @@ def page_editor() -> None:
                         df_cur[k] = np.nan
                     df_cur.at[idx, k] = v
 
+                # CHANGED: räkna om FV för vald rad innan vi skriver till Sheets
+                try:
+                    settings = get_settings_map()
+                    fx_map = get_fx_map()
+                    payload = compute_methods_for_row(df_cur.loc[idx], settings, fx_map)
+
+                    fv_map = {
+                        "FV idag": "target_today",
+                        "FV 1 år": "target_1y",
+                        "FV 2 år": "target_2y",
+                        "FV 3 år": "target_3y",
+                    }
+                    for col, key in fv_map.items():
+                        if col not in df_cur.columns:
+                            df_cur[col] = np.nan
+                        df_cur.at[idx, col] = _f(payload.get(key))
+
+                    if "Bull 1 år" in df_cur.columns:
+                        df_cur.at[idx, "Bull 1 år"] = _f(payload.get("bull_1y"))
+                    if "Bear 1 år" in df_cur.columns:
+                        df_cur.at[idx, "Bear 1 år"] = _f(payload.get("bear_1y"))
+                except Exception:
+                    pass
+
                 write_data_df(df_cur)
 
                 # FIX: synka alltid session efter write_data_df (copy)
@@ -456,7 +480,6 @@ def page_editor() -> None:
     st.markdown("---")
     st.subheader("Förhandsgranskning")
     _show_df(df.loc[[idx]], height=240, use_container_width=True)
-
 
 # ============================================================
 # ➕ Lägg till ticker (med valfri Yahoo-prefill)
