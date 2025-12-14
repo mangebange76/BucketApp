@@ -28,6 +28,57 @@ from sheets_io import (
 from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_methods_for_row
 
 
+# ============================================================
+# CHANGED: Gemensam writer så ALLA vyer får samma "sanning"
+# ============================================================
+def _write_new_fv_values(
+    df: pd.DataFrame,
+    idx: int,
+    payload: Dict[str, Any],
+    set_cell_fn=None,
+) -> None:
+    """
+    Skriver ALLTID de nyberäknade värdena från compute_methods_for_row()
+    till både nya och gamla kolumnnamn, så att appen aldrig råkar visa
+    "gamla" eller olika värden.
+
+    - FV idag/1y/2y/3y
+    - Fair value (back-compat) = FV idag
+    - Riktkurs idag/1y/2y/3y (back-compat) = FV ...
+    - Bull 1 år / Bear 1 år
+    """
+    def _set(col: str, val: Any) -> None:
+        nonlocal df, idx
+        if set_cell_fn is not None:
+            set_cell_fn(idx, col, val)
+            return
+        if col not in df.columns:
+            df[col] = np.nan
+        df.at[idx, col] = val
+
+    t_today = _f(payload.get("target_today"))
+    t_1y    = _f(payload.get("target_1y"))
+    t_2y    = _f(payload.get("target_2y"))
+    t_3y    = _f(payload.get("target_3y"))
+
+    # Nya fält
+    _set("FV idag", t_today)
+    _set("FV 1 år", t_1y)
+    _set("FV 2 år", t_2y)
+    _set("FV 3 år", t_3y)
+
+    # Back-compat, men ALLTID samma nyberäknade sanning
+    _set("Fair value", t_today)
+    _set("Riktkurs idag", t_today)
+    _set("Riktkurs 1 år", t_1y)
+    _set("Riktkurs 2 år", t_2y)
+    _set("Riktkurs 3 år", t_3y)
+
+    # Bull/Bear (om payload har dem)
+    _set("Bull 1 år", _f(payload.get("bull_1y")))
+    _set("Bear 1 år", _f(payload.get("bear_1y")))
+
+
 # -------------------------
 # Autosnapshot vid appstart (max 10 snapshots)
 # -------------------------
@@ -48,19 +99,24 @@ def _auto_snapshot_on_import() -> None:
         if df is None or df.empty:
             return
 
-        # CHANGED: hämta settings + FX till fair value-beräkningen
         settings = get_settings_map()
         fx_map = get_fx_map()
 
-        # Börja med en kopia av Data-bladet
         df_add = df.copy()
 
-        # Säkerställ att snapshoten har kolumner för FV + DCF
+        # CHANGED: Säkerställ även back-compat kolumner (Fair value + Riktkurs ...)
         fv_cols = [
             "FV idag",
             "FV 1 år",
             "FV 2 år",
             "FV 3 år",
+            "Fair value",
+            "Riktkurs idag",
+            "Riktkurs 1 år",
+            "Riktkurs 2 år",
+            "Riktkurs 3 år",
+            "Bull 1 år",
+            "Bear 1 år",
             "FV idag (DCF)",
             "DCF g 1–5",
             "DCF g terminal",
@@ -71,28 +127,21 @@ def _auto_snapshot_on_import() -> None:
             if c not in df_add.columns:
                 df_add[c] = np.nan
 
-        # Räkna fram fair value + DCF-parametrar per rad
         for idx, row in df.iterrows():
             try:
                 payload = compute_methods_for_row(row, settings, fx_map)
             except Exception:
-                # Om något bolag strular ska snapshoten ändå funka
                 continue
 
-            # Huvudsakliga FV-band (kombinerad metod)
-            df_add.at[idx, "FV idag"] = _f(payload.get("target_today"))
-            df_add.at[idx, "FV 1 år"] = _f(payload.get("target_1y"))
-            df_add.at[idx, "FV 2 år"] = _f(payload.get("target_2y"))
-            df_add.at[idx, "FV 3 år"] = _f(payload.get("target_3y"))
+            # CHANGED: skriv FV konsekvent till både nya & gamla namn
+            _write_new_fv_values(df_add, idx, payload, set_cell_fn=None)
 
-            # DCF-specifik fair value (om valuation.py exponerar den)
             fv_dcf = (
                 _f(payload.get("fv_today_dcf"))
                 or _f(payload.get("target_today_dcf"))
             )
             df_add.at[idx, "FV idag (DCF)"] = fv_dcf
 
-            # DCF-parametrar (om de finns i payload)
             dcf_params = payload.get("dcf_params") or payload.get("dcf") or {}
             df_add.at[idx, "DCF g 1–5"] = _f(dcf_params.get("g_1_5"))
             df_add.at[idx, "DCF g terminal"] = _f(dcf_params.get("g_terminal"))
@@ -112,26 +161,21 @@ def _auto_snapshot_on_import() -> None:
         else:
             snap_new = pd.concat([snap_old, df_add], ignore_index=True)
 
-            # Säkerställ kolumnen finns
             if "Snapshot TS" not in snap_new.columns:
-                # Om äldre schema saknade kolumnen – sätt allt till första värdet
                 snap_new.insert(0, "Snapshot TS", ts)
 
-            # Behåll max 10 snapshots baserat på unika "Snapshot TS"
             ts_list = snap_new["Snapshot TS"].astype(str).tolist()
-            # Bevara ordning: första förekommer = äldst
             seen = []
             for v in ts_list:
                 if v not in seen:
                     seen.append(v)
 
             if len(seen) > 10:
-                keep_ts = set(seen[-10:])  # behåll de 10 senaste
+                keep_ts = set(seen[-10:])
                 snap_new = snap_new[snap_new["Snapshot TS"].astype(str).isin(keep_ts)].copy()
 
         _write_df(SNAPSHOT_TITLE, snap_new)
     except Exception:
-        # Snapshot får aldrig krascha appen – svälj ev. fel tyst.
         pass
 
 
@@ -144,8 +188,6 @@ _auto_snapshot_on_import()
 def _safe_str_val(x: Any) -> str:
     """
     Returnerar '' om värdet är None/NaN/'nan', annars strippad sträng.
-    Hindrar att vi får 'nan' som bolagsnamn/sektor och gör det lättare
-    att avgöra om fältet verkligen är tomt.
     """
     if x is None:
         return ""
@@ -160,7 +202,6 @@ def _safe_str_val(x: Any) -> str:
 def _fmt_sek(v: Any) -> str:
     """
     Robust formattering till svenskt talformat '1 234,56'.
-    Om v inte går att tolkas som tal → ''.
     """
     try:
         if v is None:
@@ -270,7 +311,6 @@ def page_settings() -> None:
 
             _write_df(SETTINGS_TITLE, df_to_write)
 
-            # Töm cache så nya värden används direkt
             st.cache_data.clear()
             st.session_state["SETTINGS_MAP"] = get_settings_map()
             st.success("Settings sparade. Laddar om sidan…")
@@ -284,10 +324,11 @@ def page_settings() -> None:
 def page_snapshot() -> None:
     st.header("🕒 Snapshot")
     snap = _read_df(SNAPSHOT_TITLE)
-    if snap.empty:
+    if snap is None or snap.empty:
         st.info("Inga snapshots ännu.")
         return
     _show_df(snap, height=420, use_container_width=True)
+
 
 # ============================================================
 # ✏️ Editor (manuellt + Yahoo)
@@ -311,7 +352,6 @@ def _ensure_editor_stamp_cols(df: pd.DataFrame) -> pd.DataFrame:
 def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, Any]:
     y = fetch_from_yahoo(tkr)
 
-    # Fyll Bolagsnamn & Sektor – men bara om de inte redan har manuell text
     existing_name = _safe_str_val(existing_row.get("Bolagsnamn"))
     if existing_name:
         name = existing_name
@@ -335,6 +375,7 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
         est = _fetch_eps_estimates_yahoo(tkr)
     except Exception:
         est = {"eps_1y": None, "eps_2y": None}
+
     updates = {
         "Timestamp": now_stamp(),
         "Bolagsnamn": name,
@@ -360,6 +401,7 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
         "Senast auto uppdaterad": now_stamp(),
         "Auto källa": "Yahoo",
     }
+
     return {
         k: v
         for k, v in updates.items()
@@ -443,33 +485,18 @@ def page_editor() -> None:
                         df_cur[k] = np.nan
                     df_cur.at[idx, k] = v
 
-                # CHANGED: räkna om FV för vald rad innan vi skriver till Sheets
+                # CHANGED: räkna om FV och skriv ALLTID konsekvent (inkl Fair value/Riktkurs)
                 try:
                     settings = get_settings_map()
                     fx_map = get_fx_map()
                     payload = compute_methods_for_row(df_cur.loc[idx], settings, fx_map)
-
-                    fv_map = {
-                        "FV idag": "target_today",
-                        "FV 1 år": "target_1y",
-                        "FV 2 år": "target_2y",
-                        "FV 3 år": "target_3y",
-                    }
-                    for col, key in fv_map.items():
-                        if col not in df_cur.columns:
-                            df_cur[col] = np.nan
-                        df_cur.at[idx, col] = _f(payload.get(key))
-
-                    if "Bull 1 år" in df_cur.columns:
-                        df_cur.at[idx, "Bull 1 år"] = _f(payload.get("bull_1y"))
-                    if "Bear 1 år" in df_cur.columns:
-                        df_cur.at[idx, "Bear 1 år"] = _f(payload.get("bear_1y"))
+                    _write_new_fv_values(df_cur, idx, payload, set_cell_fn=None)
                 except Exception:
                     pass
 
                 write_data_df(df_cur)
 
-                # FIX: synka alltid session efter write_data_df (copy)
+                # Synka alltid session efter write_data_df (copy)
                 st.session_state["DATA"] = df_cur.copy()
 
                 st.success(f"{tkr}: Rad sparad och uppdaterad från Yahoo.")
@@ -515,9 +542,13 @@ def page_add_ticker() -> None:
             return
         try:
             base_df = read_data_df()
-            if not base_df.empty and (base_df["Ticker"].astype(str).str.upper() == tkr.upper()).any():
-                st.error("Ticker finns redan i DATA.")
-                return
+            if base_df is None:
+                base_df = pd.DataFrame(columns=DATA_COLUMNS)
+
+            if (not base_df.empty) and ("Ticker" in base_df.columns):
+                if (base_df["Ticker"].astype(str).str.upper() == tkr.upper()).any():
+                    st.error("Ticker finns redan i DATA.")
+                    return
 
             new_row: Dict[str, Any] = {c: np.nan for c in DATA_COLUMNS}
             new_row.update({
@@ -547,6 +578,7 @@ def page_add_ticker() -> None:
                 new_row["Rev 1Y"] = rev1_vm
             if rev2_vm is not None:
                 new_row["Rev 2Y"] = rev2_vm
+
             new_row["Senast manuellt uppdaterad"] = now_stamp()
 
             if do_prefill:
@@ -599,14 +631,26 @@ def page_add_ticker() -> None:
                     pass
 
             out_df = pd.concat([base_df, pd.DataFrame([new_row])], ignore_index=True)
+
+            # CHANGED: räkna FV direkt vid add så raden alltid får nyberäknat värde
+            try:
+                settings = get_settings_map()
+                fx_map = get_fx_map()
+                new_idx = int(out_df.index[-1])
+                payload = compute_methods_for_row(out_df.loc[new_idx], settings, fx_map)
+                _write_new_fv_values(out_df, new_idx, payload, set_cell_fn=None)
+            except Exception:
+                pass
+
             write_data_df(out_df)
 
-            # FIX: synka alltid session efter write_data_df (copy)
+            # Synka alltid session efter write_data_df (copy)
             st.session_state["DATA"] = out_df.copy()
 
             st.success(f"{tkr} tillagd.")
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
+
 
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
@@ -625,18 +669,6 @@ def _fx_rate_to_sek(currency: str, fx_map: Dict[str, float]) -> float:
 def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> pd.DataFrame:
     """
     Bygger en positions-tabell för alla innehav (Antal > 0).
-
-    Kolumner:
-      - Ticker
-      - Bolagsnamn
-      - Sektor
-      - Subsektor  (hämtas från 'Subsektor' eller 'Sektor-detalj' i Data-bladet)
-      - Bucket
-      - Valuta
-      - Antal
-      - Aktuell kurs
-      - Värde (valuta)
-      - Värde (SEK)
     """
     cols = [
         "Ticker",
@@ -656,17 +688,14 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
 
     base = df_data.copy()
 
-    # Hitta rätt kvantitetskolumn (backwards-kompatibelt)
     qty_col = None
     for cand in ("Antal aktier", "Antal", "Shares"):
         if cand in base.columns:
             qty_col = cand
             break
-
     if qty_col is None:
         return pd.DataFrame(columns=cols)
 
-    # CHANGED: hitta källa för subsektor (Subsektor eller Sektor-detalj)
     subsector_src_col: Optional[str] = None
     if "Subsektor" in base.columns:
         subsector_src_col = "Subsektor"
@@ -683,7 +712,6 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
         name = str(_nz(r.get("Bolagsnamn"), ""))
         sector = str(_nz(r.get("Sektor"), "") or "")
 
-        # CHANGED: läs subsektor från vald källkolumn om den finns
         if subsector_src_col is not None:
             subsector = str(_nz(r.get(subsector_src_col), "") or "")
         else:
@@ -713,6 +741,7 @@ def _position_value_tables(df_data: pd.DataFrame, fx_map: Dict[str, float]) -> p
 
     out = pd.DataFrame(rows, columns=cols)
     return out
+
 
 def _guess_frequency(freq_raw: Any) -> Optional[int]:
     if freq_raw is None:
@@ -812,6 +841,78 @@ def _next_dps_per_share(row: pd.Series) -> Optional[float]:
         return annual / float(freq) if float(freq) > 0 else None
     except Exception:
         return None
+
+# ============================================================
+# CHANGED: Gemensam writer för att ALLTID skriva nya beräknade värden
+# (så vi inte råkar visa gamla/statiska kolumner som t.ex. "Fair value")
+# ============================================================
+def _write_new_fv_values(
+    df: pd.DataFrame,
+    idx: int,
+    payload: Dict[str, Any],
+    set_cell_fn=None,  # om vi vill räkna changed_total i batch
+) -> None:
+    """
+    Skriver alltid de NYBERÄKNADE värdena till alla relevanta kolumner
+    (FV + Riktkurs + Fair value + Bull/Bear + Metod/Input/Kommentar).
+
+    Viktigt för bl.a. UBER: om UI/Sheets visar "Fair value" så ska den få
+    target_today direkt, inte lämnas NaN.
+    """
+    def _set(col: str, val: Any) -> None:
+        nonlocal df, idx
+        if col not in df.columns:
+            df[col] = np.nan
+        if set_cell_fn is not None:
+            set_cell_fn(idx, col, val)
+        else:
+            df.at[idx, col] = val
+
+    # Targets
+    t_today = _f(payload.get("target_today"))
+    t_1y    = _f(payload.get("target_1y"))
+    t_2y    = _f(payload.get("target_2y"))
+    t_3y    = _f(payload.get("target_3y"))
+
+    # Standardkolumner (FV ...)
+    _set("FV idag", t_today)
+    _set("FV 1 år", t_1y)
+    _set("FV 2 år", t_2y)
+    _set("FV 3 år", t_3y)
+
+    # Alias-kolumner som ibland används i Sheets/UI
+    _set("Riktkurs idag", t_today)
+    _set("Riktkurs 1 år", t_1y)
+    _set("Riktkurs 2 år", t_2y)
+    _set("Riktkurs 3 år", t_3y)
+
+    # CHANGED: "Fair value" ska alltid spegla nya target_today (löst UBER-problemet)
+    for c in ("Fair value", "Fair Value", "fair_value", "fair value"):
+        if c in df.columns or c == "Fair value":
+            _set(c, t_today)
+
+    # Bull/Bear
+    b1 = _f(payload.get("bull_1y"))
+    be1 = _f(payload.get("bear_1y"))
+    if "Bull 1 år" in df.columns or b1 is not None:
+        _set("Bull 1 år", b1)
+    if "Bear 1 år" in df.columns or be1 is not None:
+        _set("Bear 1 år", be1)
+
+    # Metod / inputs (om payload har dem)
+    method = payload.get("method") or payload.get("method_name") or payload.get("primary_method")
+    if method is not None:
+        _set("Metod", str(method))
+        if "Primär metod" in df.columns:
+            _set("Primär metod", str(method))
+
+    inp = payload.get("input_summary") or payload.get("inputs") or payload.get("input") or payload.get("summary")
+    if inp is not None:
+        _set("Input-sammanfattning", str(inp))
+
+    note = payload.get("comment") or payload.get("note") or payload.get("notes")
+    if note is not None:
+        _set("Kommentar", str(note))
 
 
 def build_next_dividends_table(
@@ -941,9 +1042,6 @@ def render_portfolio_dividends_section(
 # 📆 Rullande 12 mån utdelningskalender (estimat + bekräftade)
 # ============================================================
 def _annual_dps(row: pd.Series) -> Optional[float]:
-    """
-    Försöker läsa årlig utdelning (per aktie) från vanliga kolumnnamn.
-    """
     for c in ("Årlig utdelning", "Dividend (Annual)", "DPS Annual", "Årsutdelning"):
         if c in row and _f(row.get(c)) is not None:
             v = _f(row.get(c))
@@ -957,10 +1055,6 @@ def build_dividend_rolling_12m(
     fx_map: Dict[str, float],
     settings: Dict[str, Any],
 ) -> pd.DataFrame:
-    """
-    Bygger en lista av utdelningshändelser (bekräftade + estimerade)
-    för de kommande ~12 månaderna.
-    """
     events: List[Dict[str, Any]] = []
     if data_df is None or data_df.empty:
         return pd.DataFrame(
@@ -982,7 +1076,6 @@ def build_dividend_rolling_12m(
     today = dt.date.today()
     horizon = today + dt.timedelta(days=365)
 
-    # Första passet: samla bekräftade kommande utdelningar
     confirmed_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
 
     for _, r in data_df.iterrows():
@@ -1035,7 +1128,6 @@ def build_dividend_rolling_12m(
         events.append(ev)
         confirmed_by_ticker.setdefault(ticker, []).append(ev)
 
-    # Andra passet: estimera resterande utdelningar utifrån årlig utdelning + frekvens
     for _, r in data_df.iterrows():
         ticker = str(r.get("Ticker") or "").strip()
         if not ticker:
@@ -1050,10 +1142,8 @@ def build_dividend_rolling_12m(
 
         annual_dps = _annual_dps(r)
         if annual_dps is None or annual_dps <= 0:
-            # Ingen årlig utdelning – behåll ev. bekräftade events men estimera inget extra
             continue
 
-        # Frekvens
         freq = None
         for c in ("Utdelningsfrekvens", "Frekvens", "Frequency", "Dividend Frequency"):
             if c in r and r[c] is not None:
@@ -1061,7 +1151,6 @@ def build_dividend_rolling_12m(
                 if freq:
                     break
         if not freq:
-            # Simple default: anta kvartalsvis om inget annat anges
             freq = 4
 
         if freq <= 0:
@@ -1077,28 +1166,18 @@ def build_dividend_rolling_12m(
         fx = _fx_rate_to_sek(currency, fx_map)
 
         annual_brutto = float(annual_dps * (shares or 0.0))
-        annual_netto = float(annual_brutto * (1.0 - wht))
-        annual_netto_sek = float(annual_netto * fx)
 
-        # Summera redan bekräftade brutto inom perioden
         confirmed_list = confirmed_by_ticker.get(ticker, [])
         confirmed_brutto = sum(ev["Brutto"] for ev in confirmed_list)
-
         remaining_brutto = max(annual_brutto - confirmed_brutto, 0.0)
-
-        # Om allt redan "förbrukat" via bekräftade events → ingen extra estimerad
         if remaining_brutto <= 0.0:
             continue
 
-        # Antal kvarvarande "slots" detta år
         remaining_slots = max(freq - len(confirmed_list), 0)
         if remaining_slots == 0:
-            # Inga "platser" kvar – vi låter bekräftade event representera hela årets utdelning
             continue
 
-        # Generera ungefärliga datum jämnt fördelade under året
         if confirmed_list:
-            # Starta runt tidigaste bekräftade datum om det finns
             base_date = min(ev["Datum"] for ev in confirmed_list)
             if base_date < today:
                 base_date = today
@@ -1109,16 +1188,14 @@ def build_dividend_rolling_12m(
         interval_days = int(round(365.0 / float(freq)))
         est_dates: List[dt.date] = []
 
-        # Bygg datum framåt inom horisonten, undvik krock nära bekräftade datum
         d0 = base_date
         while d0 < today:
             d0 = d0 + dt.timedelta(days=interval_days)
 
-        for k in range(freq * 2):  # lite slack
+        for k in range(freq * 2):
             d = d0 + dt.timedelta(days=interval_days * k)
             if d > horizon:
                 break
-            # hoppa om vi ligger väldigt nära en bekräftad utdelning
             if any(abs((d - ed).days) <= 10 for ed in existing_dates):
                 continue
             est_dates.append(d)
@@ -1167,7 +1244,6 @@ def build_dividend_rolling_12m(
         )
 
     df = pd.DataFrame(events)
-    # Filtrera bara kommande 12 månader (säkerhetsbälte)
     df = df[df["Datum"].between(today, horizon)]
     df = df.sort_values(["Datum", "Ticker"]).reset_index(drop=True)
     return df
@@ -1235,13 +1311,11 @@ def render_dividend_rolling_12m_section(
                 use_container_width=True,
             )
 
+
 # ============================================================
 # 🧩 Sektor- & subsektor-sammanställning (totalt + del av sektor)
 # ============================================================
 def _build_sector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summerar värde per Sektor baserat på positions-tabellen.
-    """
     if pos_df is None or pos_df.empty or "Sektor" not in pos_df.columns:
         return pd.DataFrame(columns=["Sektor", "Totalt värde (SEK)", "Antal innehav", "Tickers"])
 
@@ -1268,16 +1342,7 @@ def _build_sector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_subsector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summerar värde per Subsektor baserat på positions-tabellen.
-    Använder kolumnen 'Subsektor' i positions-tabellen, som i sin tur kommer
-    från 'Subsektor' ELLER 'Sektor-detalj' i Data-bladet.
-    """
-    if (
-        pos_df is None
-        or pos_df.empty
-        or "Subsektor" not in pos_df.columns
-    ):
+    if pos_df is None or pos_df.empty or "Subsektor" not in pos_df.columns:
         return pd.DataFrame(columns=["Subsektor", "Totalt värde (SEK)", "Antal innehav", "Tickers"])
 
     df = pos_df.copy()
@@ -1300,6 +1365,7 @@ def _build_subsector_overview(pos_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return agg
+
 
 def render_bucket_expandables(pos_df: pd.DataFrame, settings: Dict[str, str]) -> None:
     if pos_df is None or pos_df.empty:
@@ -1333,7 +1399,6 @@ def page_portfolio() -> None:
         st.warning("Ingen data laddad.")
         return
 
-    # Använd live-FX från session om satt, annars läs från Valutakurser-bladet
     fx_map = st.session_state.get("FX", {}) or get_fx_map()
     settings = get_settings_map()
 
@@ -1349,9 +1414,6 @@ def page_portfolio() -> None:
         st.caption(f"{len(fx_map)} valutakurser i FX-kartan i denna session.")
         _show_df(pos.sort_values(["Bucket", "Värde (SEK)"]), height=320, use_container_width=True)
 
-        # -------------------------
-        # Sektor-sammanställning
-        # -------------------------
         st.markdown("#### Sektor-sammanställning (värde per sektor)")
         sector_df = _build_sector_overview(pos)
         if sector_df.empty:
@@ -1410,9 +1472,6 @@ def page_portfolio() -> None:
                         show_sub["Värde (SEK)"] = show_sub["Värde (SEK)"].map(_fmt_sek)
                         _show_df(show_sub, height=260, use_container_width=True)
 
-        # -------------------------
-        # Sub-sektorsammanställning
-        # -------------------------
         st.markdown("#### Sub-sektorsammanställning (värde per subsektor)")
         subsector_df = _build_subsector_overview(pos)
         if subsector_df.empty:
@@ -1491,7 +1550,6 @@ def page_batch() -> None:
         st.info("Inga rader matchar urvalet.")
         return
 
-    # Nuvarande universum av tickers inom urvalet
     tickers_universe = (
         subset["Ticker"]
         .dropna()
@@ -1521,7 +1579,6 @@ def page_batch() -> None:
     if not go:
         return
 
-    # CHANGED: hämta settings + FX så vi kan beräkna & skriva FV/Ranking under massuppdatering
     settings = get_settings_map()
     fx_map = get_fx_map()
 
@@ -1530,7 +1587,6 @@ def page_batch() -> None:
     status = st.empty()
     changed_total = 0
 
-    # CHANGED: liten intern helper för att räkna "changed_total" konsekvent
     def _set_cell(idx: int, col: str, val: Any) -> None:
         nonlocal changed_total, df_cur
         if col not in df_cur.columns:
@@ -1556,23 +1612,10 @@ def page_batch() -> None:
                 for k, v in updates.items():
                     _set_cell(idx, k, v)
 
-                # CHANGED: räkna om FV + ev Ranking för raden direkt efter Yahoo-uppdatering
+                # CHANGED: skriv ALLTID nya beräknade värden (FV + Riktkurs + Fair value + mm)
                 try:
                     payload = compute_methods_for_row(df_cur.loc[idx], settings, fx_map)
-
-                    fv_map = {
-                        "FV idag": "target_today",
-                        "FV 1 år": "target_1y",
-                        "FV 2 år": "target_2y",
-                        "FV 3 år": "target_3y",
-                    }
-                    for col, key in fv_map.items():
-                        _set_cell(idx, col, _f(payload.get(key)))
-
-                    if "Bull 1 år" in df_cur.columns:
-                        _set_cell(idx, "Bull 1 år", _f(payload.get("bull_1y")))
-                    if "Bear 1 år" in df_cur.columns:
-                        _set_cell(idx, "Bear 1 år", _f(payload.get("bear_1y")))
+                    _write_new_fv_values(df_cur, idx, payload, set_cell_fn=_set_cell)
 
                     # Ranking (om kolumnen finns) – skriv bara om vi hittar ett värde i payload
                     if "Ranking" in df_cur.columns:
@@ -1596,20 +1639,7 @@ def page_batch() -> None:
                 try:
                     new_idx = int(df_cur.index[-1])
                     payload = compute_methods_for_row(df_cur.loc[new_idx], settings, fx_map)
-
-                    fv_map = {
-                        "FV idag": "target_today",
-                        "FV 1 år": "target_1y",
-                        "FV 2 år": "target_2y",
-                        "FV 3 år": "target_3y",
-                    }
-                    for col, key in fv_map.items():
-                        _set_cell(new_idx, col, _f(payload.get(key)))
-
-                    if "Bull 1 år" in df_cur.columns:
-                        _set_cell(new_idx, "Bull 1 år", _f(payload.get("bull_1y")))
-                    if "Bear 1 år" in df_cur.columns:
-                        _set_cell(new_idx, "Bear 1 år", _f(payload.get("bear_1y")))
+                    _write_new_fv_values(df_cur, new_idx, payload, set_cell_fn=_set_cell)
 
                     if "Ranking" in df_cur.columns:
                         rank_val = (
@@ -1639,6 +1669,7 @@ def page_batch() -> None:
         f"{changed_total} fält ändrades."
     )
 
+
 # ============================================================
 # 🛒 Köpförslag + Säljförslag
 # ============================================================
@@ -1656,16 +1687,11 @@ def _normalize_key(s: str) -> str:
 
 
 def _cap_for_bucket(bucket_label: str, settings: Dict[str, str]) -> Optional[float]:
-    """
-    Försöker hitta cap per Bucket med flera olika namnvarianter.
-    Om ingen nyckel hittas → behandlas som oändlig cap (ingen begränsning).
-    """
     if not bucket_label:
         return float("inf")
 
     s = (bucket_label or "").lower()
 
-    # Lista ut bokstav + typ (tillväxt/utdelning)
     letter = None
     if "bucket a" in s:
         letter = "a"
@@ -1707,10 +1733,6 @@ def _cap_for_bucket(bucket_label: str, settings: Dict[str, str]) -> Optional[flo
 # 🧮 Helpers: Bucket-sida (Tillväxt/Utdelning) + B/C-mål
 # ============================================================
 def _side_for_bucket(bucket_label: str) -> Optional[str]:
-    """
-    Returnerar 'Tillväxt' eller 'Utdelning' baserat på Bucket-namnet.
-    Används för att gruppera hinkar per sida.
-    """
     if not bucket_label:
         return None
     s = str(bucket_label).lower()
@@ -1722,10 +1744,6 @@ def _side_for_bucket(bucket_label: str) -> Optional[str]:
 
 
 def _bucket_letter(bucket_label: str) -> Optional[str]:
-    """
-    Returnerar 'A', 'B' eller 'C' baserat på Bucket-namnet.
-    Förväntar sig t.ex. 'Bucket A tillväxt', 'Bucket B utdelning', etc.
-    """
     if not bucket_label:
         return None
     s = str(bucket_label).lower()
@@ -1739,10 +1757,6 @@ def _bucket_letter(bucket_label: str) -> Optional[str]:
 
 
 def _lookup_pct_setting(settings: Dict[str, str], canonical_key: str, fallback: float) -> float:
-    """
-    Hämtar en procentsats (t.ex. 40.0) från Settings med ett "kanoniskt" namn,
-    men matchar mot olika stavningar/format via _normalize_key.
-    """
     target_norm = _normalize_key(canonical_key)
     for k, v in settings.items():
         if _normalize_key(k) == target_norm:
@@ -1753,20 +1767,6 @@ def _lookup_pct_setting(settings: Dict[str, str], canonical_key: str, fallback: 
 
 
 def _bucket_ratio_targets_for_side(side: str, settings: Dict[str, str]) -> tuple[float, float]:
-    """
-    Läser önskade B/C-nivåer (i % av Bucket A) från Settings.
-
-    Nycklar som stöds:
-      Tillväxt:
-        - bucket_b_tillvaxt_pct_of_a
-        - bucket_c_tillvaxt_pct_of_a
-
-      Utdelning:
-        - bucket_b_utdelning_pct_of_a
-        - bucket_c_utdelning_pct_of_a
-
-    Om nycklar saknas → default 40 % (B) och 20 % (C).
-    """
     if side == "Tillväxt":
         b_key = "bucket_b_tillvaxt_pct_of_a"
         c_key = "bucket_c_tillvaxt_pct_of_a"
@@ -1784,10 +1784,6 @@ def _compute_bucket_side_summary(
     settings: Dict[str, str],
     side: str,
 ) -> Dict[str, Any]:
-    """
-    Summerar A/B/C-värden inom vald sida (Tillväxt/Utdelning) och
-    beräknar nuvarande B/A- och C/A-nivåer i procent.
-    """
     summary: Dict[str, Any] = {
         "side": side,
         "total_side_value": 0.0,
@@ -1834,7 +1830,7 @@ def _compute_bucket_side_summary(
     summary["A_value"] = letter_totals["A"]
     summary["B_value"] = letter_totals["B"]
     summary["C_value"] = letter_totals["C"]
-    summary["A_count"] = letter_counts["A"]  # oförändrad logik i övrigt
+    summary["A_count"] = letter_counts["A"]
     summary["B_count"] = letter_counts["B"]
     summary["C_count"] = letter_counts["C"]
     summary["total_side_value"] = sum(letter_totals.values())
@@ -1845,7 +1841,101 @@ def _compute_bucket_side_summary(
 
     return summary
 
+# ============================================================
+# CHANGED: Skriv ALLTID "nya beräknade värden" till alla relevanta kolumner
+#  - FV idag/FV 1–3 år
+#  - Riktkurs idag/Riktkurs 1–3 år (legacy)
+#  - Fair value (legacy)
+#  - Metod + Input-sammanfattning + Kommentar (om finns)
+#  - Bull/Bear 1 år (om finns)
+# ============================================================
+def _write_new_fv_values(
+    df: pd.DataFrame,
+    idx: int,
+    payload: Dict[str, Any],
+    set_cell_fn=None,
+) -> None:
+    """
+    Skriver konsekvent ut de NYA beräknade värdena från compute_methods_for_row
+    till både nya och legacy-kolumner, så att UI/Sheets aldrig visar "gamla" värden.
 
+    set_cell_fn: valfri setter (t.ex. _set_cell i batch) för att räkna changed_total.
+                Om None -> direkt df.at-sättning.
+    """
+    def _set(col: str, val: Any) -> None:
+        if set_cell_fn is not None:
+            set_cell_fn(idx, col, val)
+        else:
+            if col not in df.columns:
+                df[col] = np.nan
+            df.at[idx, col] = val
+
+    # FV / targets
+    t_today = _f(payload.get("target_today"))
+    t_1y    = _f(payload.get("target_1y"))
+    t_2y    = _f(payload.get("target_2y"))
+    t_3y    = _f(payload.get("target_3y"))
+
+    # Skriv "FV ..." (nya kolumner)
+    _set("FV idag", t_today)
+    _set("FV 1 år", t_1y)
+    _set("FV 2 år", t_2y)
+    _set("FV 3 år", t_3y)
+
+    # Skriv "Riktkurs ..." (legacy kolumner)
+    _set("Riktkurs idag", t_today)
+    _set("Riktkurs 1 år", t_1y)
+    _set("Riktkurs 2 år", t_2y)
+    _set("Riktkurs 3 år", t_3y)
+
+    # Skriv "Fair value" (legacy) = idag
+    _set("Fair value", t_today)
+
+    # Bull/Bear om de finns
+    bull_1y = _f(payload.get("bull_1y"))
+    bear_1y = _f(payload.get("bear_1y"))
+    if bull_1y is not None:
+        _set("Bull 1 år", bull_1y)
+    if bear_1y is not None:
+        _set("Bear 1 år", bear_1y)
+
+    # Metod / Inputs / Kommentar (om payload levererar)
+    method = (
+        payload.get("method")
+        or payload.get("metod")
+        or payload.get("primary_method")
+        or payload.get("primar_metod")
+    )
+    if method is not None:
+        _set("Metod", str(method))
+
+    input_sum = (
+        payload.get("input_summary")
+        or payload.get("inputs_summary")
+        or payload.get("input")
+        or payload.get("inputs")
+        or payload.get("input_text")
+    )
+    if input_sum is not None:
+        _set("Input-sammanfattning", str(input_sum))
+
+    comment = (
+        payload.get("comment")
+        or payload.get("note")
+        or payload.get("kommentar")
+    )
+    if comment is not None:
+        _set("Kommentar", str(comment))
+
+    # Primär metod (om kolumnen finns / vi har värde)
+    prim = payload.get("primary_method") or payload.get("primar_metod")
+    if prim is not None:
+        _set("Primär metod", str(prim))
+
+
+# ============================================================
+# 🧮 Helpers: Bucket-sida (Tillväxt/Utdelning) + B/C-mål
+# ============================================================
 def _compute_recommended_buy_for_side(
     df_data: pd.DataFrame,
     settings: Dict[str, str],
@@ -1853,10 +1943,6 @@ def _compute_recommended_buy_for_side(
     side: str,
     new_capital_sek: float,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Bucket-köpalgoritm:
-    (oförändrad, bara anropar build_buy_suggestions utan progressbar)
-    """
     if df_data is None or df_data.empty:
         return None
     if new_capital_sek is None or new_capital_sek <= 0:
@@ -1890,20 +1976,17 @@ def _compute_recommended_buy_for_side(
 
     # Steg 1–3: välj vilken bucket (A/B/C) kapitalet ska till
     if A_val <= 0:
-        # Inget A ännu → börja bygga A
         target_letter = "A"
     else:
         best_letter: Optional[str] = None
         best_gap = 0.0
 
-        # Jämför B
         if B_target_pct is not None:
             gap_b = B_target_pct - B_now_pct
             if gap_b > best_gap:
                 best_gap = gap_b
                 best_letter = "B"
 
-        # Jämför C
         if C_target_pct is not None:
             gap_c = C_target_pct - C_now_pct
             if gap_c > best_gap:
@@ -1911,7 +1994,6 @@ def _compute_recommended_buy_for_side(
                 best_letter = "C"
 
         if best_letter is None or not letter_to_buckets.get(best_letter):
-            # Inget underläge i B/C eller inga buckets för dem → fyll A
             target_letter = "A"
         else:
             target_letter = best_letter
@@ -1920,10 +2002,8 @@ def _compute_recommended_buy_for_side(
     if not buckets_for_letter:
         return None
 
-    # Ta första bucket-namnet för denna bokstav/sida (normalt bara ett)
     target_bucket_label = sorted(buckets_for_letter)[0]
 
-    # Begränsa till innehav i vald bucket (bara aktier vi faktiskt äger)
     pos_bucket = pos_df[
         (pos_df["Bucket"] == target_bucket_label) & (pos_df["Antal"] > 0)
     ].copy()
@@ -1937,7 +2017,6 @@ def _compute_recommended_buy_for_side(
 
     target_each = bucket_total / float(n_holdings)
 
-    # Använd buy-suggestions för att säkerställa att vi bara plockar från "köpbara" case
     sug_all = build_buy_suggestions(
         df_data,
         settings,
@@ -1952,11 +2031,8 @@ def _compute_recommended_buy_for_side(
 
     sug_bucket = sug_all[sug_all["Bucket"] == target_bucket_label].copy()
     if sug_bucket.empty:
-        # Inga bolag i den bucketen är under FV / har slack till cap
         return None
 
-    # Slå ihop pos_bucket (värde i SEK) med buy-suggestions (pris, slack, m.m.)
-    # Nyckel: Ticker
     cand_rows: List[Dict[str, Any]] = []
     for _, r_pos in pos_bucket.iterrows():
         tkr = str(r_pos.get("Ticker") or "").upper().strip()
@@ -1965,14 +2041,12 @@ def _compute_recommended_buy_for_side(
 
         s_match = sug_bucket[sug_bucket["Ticker"].astype(str).str.upper() == tkr]
         if s_match.empty:
-            # Den här aktien är antingen över FV eller vid cap → hoppa
             continue
 
         s = s_match.iloc[0]
         current_value_sek = _f(r_pos.get("Värde (SEK)")) or 0.0
         need_to_equal = max(target_each - current_value_sek, 0.0)
         if need_to_equal <= 0:
-            # Redan minst på snittnivå – vi gillar hellre de som släpar efter
             continue
 
         cand_rows.append({
@@ -1988,7 +2062,6 @@ def _compute_recommended_buy_for_side(
     if not cand_rows:
         return None
 
-    # Välj den aktie som ligger mest under "lika stort"-nivån
     cand_df = pd.DataFrame(cand_rows)
     cand_df = cand_df.sort_values("need_to_equal_sek", ascending=False).reset_index(drop=True)
     best = cand_df.iloc[0]
@@ -2007,10 +2080,6 @@ def _compute_recommended_buy_for_side(
     if slack_cap_sek is None or (isinstance(slack_cap_sek, float) and math.isnan(slack_cap_sek)):
         slack_cap_sek = float("inf")
 
-    # Hur många aktier kan vi köpa utan att:
-    #  - gå över cap
-    #  - gå över "lika stort"-nivån
-    #  - överskrida tillgängligt kapital
     max_by_cash = math.floor(new_capital_sek / price_sek) if new_capital_sek > 0 else 0
     max_by_equal = math.floor(best["need_to_equal_sek"] / price_sek) if best["need_to_equal_sek"] > 0 else 0
     max_by_cap = math.floor(slack_cap_sek / price_sek) if slack_cap_sek > 0 and math.isfinite(slack_cap_sek) else max_by_cash
@@ -2053,7 +2122,6 @@ def _quick_pos_lookup(df: pd.DataFrame, fx_map: Dict[str, float]) -> Dict[str, D
     return out
 
 
-# CHANGED: lagt till progress_obj och progress_status
 def build_buy_suggestions(
     df_data: pd.DataFrame,
     settings: Dict[str, str],
@@ -2095,7 +2163,6 @@ def build_buy_suggestions(
     if total_rows <= 0:
         return pd.DataFrame(columns=cols_out)
 
-    # Init progress
     if progress_obj is not None:
         try:
             progress_obj.progress(0.0)
@@ -2111,7 +2178,6 @@ def build_buy_suggestions(
     rows: List[Dict[str, Any]] = []
 
     for i, (_, r) in enumerate(base.iterrows(), start=1):
-        # Uppdatera progressbar
         if progress_obj is not None:
             try:
                 frac = i / total_rows
@@ -2130,7 +2196,6 @@ def build_buy_suggestions(
             if not bucket:
                 continue
 
-            # Bucket-filter (om vi inte kör ren zon-filtrering)
             if bucket_filter and bucket_filter != "Alla" and bucket != bucket_filter:
                 continue
 
@@ -2152,17 +2217,11 @@ def build_buy_suggestions(
             fv_2y    = _f(payload.get("target_2y"))
             fv_3y    = _f(payload.get("target_3y"))
 
-            fv_map = {
-                "Idag": fv_today,
-                "1 år": fv_1y,
-                "2 år": fv_2y,
-                "3 år": fv_3y,
-            }
+            fv_map = {"Idag": fv_today, "1 år": fv_1y, "2 år": fv_2y, "3 år": fv_3y}
             fv_active = fv_map.get(fv_horizon, fv_today)
 
             if not _pos(fv_active):
                 continue
-
             if not (price < fv_active):
                 continue
 
@@ -2193,7 +2252,6 @@ def build_buy_suggestions(
             if _pos(price) and _pos(fv_active):
                 up_pct = (fv_active - price) / price * 100.0
 
-            # Bra köp / fyndläge-nivåer + zon
             bra_level: Optional[float] = None
             fynd_level: Optional[float] = None
             zone: str = ""
@@ -2212,7 +2270,6 @@ def build_buy_suggestions(
                     else:
                         zone = "Under FV"
 
-            # Zon-filter (Fyndläge / Bra köp) om valt
             if zone_filter == "Fyndläge" and zone != "Fyndläge":
                 continue
             if zone_filter == "Bra köp" and zone != "Bra köp":
@@ -2304,10 +2361,8 @@ def build_sell_suggestions(
                 continue
 
             value_sek = _f(r.get("Värde (SEK)")) or 0.0
-
             if not math.isfinite(cap):
                 continue
-
             if value_sek <= cap:
                 continue
 
@@ -2333,6 +2388,7 @@ def build_sell_suggestions(
     out = out.sort_values("Över cap (SEK)", ascending=False).reset_index(drop=True)
     return out
 
+
 def page_buy_suggestions() -> None:
     st.header("🛒 Köp-/säljförslag (läser Data-bladet)")
     df = st.session_state.get("DATA")
@@ -2345,7 +2401,6 @@ def page_buy_suggestions() -> None:
     settings = get_settings_map()
     fx_map = get_fx_map()
 
-    # Visuell "bevis"-rad för FX-uppdatering om vi har någon timestamp lagrad
     fx_ts = (
         settings.get("FX_LAST_UPDATE_TS")
         or settings.get("FX last update")
@@ -2362,13 +2417,13 @@ def page_buy_suggestions() -> None:
             if str(b).strip()
         }
     )
+
     bucket_opts = (
         ["Alla"]
         + [b for b in DEFAULT_BUCKETS if b in all_buckets]
         + [b for b in all_buckets if b not in DEFAULT_BUCKETS]
     )
 
-    # Rullista: Alla / Fyndläge / Bra köp + buckets
     bucket_zone_opts = ["Alla", "Fyndläge", "Bra köp"] + [b for b in bucket_opts if b != "Alla"]
 
     col_top1, col_top2, col_top3 = st.columns([2, 2, 2])
@@ -2392,7 +2447,6 @@ def page_buy_suggestions() -> None:
             index=0,
         )
 
-    # Tolka valet: antingen ren zon (Fyndläge/Bra köp) eller bucket-filter
     if bucket_or_zone in ("Fyndläge", "Bra köp"):
         zone_filter = bucket_or_zone
         bucket_filter_buy = "Alla"
@@ -2409,7 +2463,6 @@ def page_buy_suggestions() -> None:
         f"- Välj **Fyndläge** eller **Bra köp** för att filtrera på Köpzon över alla buckets"
     )
 
-    # CHANGED: progressbar + % under bygger köpförslag
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
 
@@ -2426,7 +2479,6 @@ def page_buy_suggestions() -> None:
             progress_status=status_placeholder,
         )
 
-    # Städa bort progressbar + status efteråt
     progress_placeholder.empty()
     status_placeholder.empty()
 
@@ -2491,9 +2543,7 @@ def page_buy_suggestions() -> None:
     if sell_df.empty:
         st.info("Inga innehav ligger över maxvärdet (cap) för vald Bucket just nu.")
     else:
-        st.caption(
-            f"{len(sell_df)} säljförslag — innehav där värdet överstiger Bucket-cap."
-        )
+        st.caption(f"{len(sell_df)} säljförslag — innehav där värdet överstiger Bucket-cap.")
         show_s = sell_df.copy()
         for c in ("Aktuell kurs", "Värde (SEK)", "Cap per innehav (SEK)", "Över cap (SEK)"):
             if c in show_s.columns:
@@ -2502,9 +2552,6 @@ def page_buy_suggestions() -> None:
                 )
         _show_df(show_s, height=360, use_container_width=True)
 
-    # ========================================================
-    # 🤖 Bucket-köpalgoritm – nästa rekommenderade köp
-    # ========================================================
     st.markdown("---")
     st.subheader("🤖 Bucket-köpalgoritm – nästa rekommenderade köp")
 
@@ -2524,93 +2571,83 @@ def page_buy_suggestions() -> None:
             "Inga innehav hittades för vald sida. "
             "Kontrollera att Bucket-namnen innehåller t.ex. 'tillväxt' eller 'utdelning'."
         )
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("Totalt värde (sida)", _fmt_sek(side_summary["total_side_value"]))
-        with c2:
-            st.metric("Bucket A värde", _fmt_sek(side_summary["A_value"]))
+        return
 
-        # Bucket B / A
-        with c3:
-            b_now = side_summary["B_now_pct"]
-            b_tgt = side_summary["B_target_pct"]
-            if b_now is not None and b_tgt is not None and side_summary["A_value"] > 0:
-                delta_b = b_now - b_tgt
-                st.metric(
-                    "Bucket B / A",
-                    f"{b_now:.1f} %",
-                    f"{delta_b:+.1f} %-enheter (mål {b_tgt:.1f} %)",
-                )
-            else:
-                st.metric("Bucket B / A", "—", "")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Totalt värde (sida)", _fmt_sek(side_summary["total_side_value"]))
+    with c2:
+        st.metric("Bucket A värde", _fmt_sek(side_summary["A_value"]))
 
-        # Bucket C / A
-        with c4:
-            c_now = side_summary["C_now_pct"]
-            c_tgt = side_summary["C_target_pct"]
-            if c_now is not None and c_tgt is not None and side_summary["A_value"] > 0:
-                delta_c = c_now - c_tgt
-                st.metric(
-                    "Bucket C / A",
-                    f"{c_now:.1f} %",
-                    f"{delta_c:+.1f} %-enheter (mål {c_tgt:.1f} %)",
-                )
-            else:
-                st.metric("Bucket C / A", "—", "")
-
-        st.caption(
-            "Målen för Bucket B/C läses från Settings om nycklarna finns:\n"
-            "- bucket_b_tillvaxt_pct_of_a / bucket_c_tillvaxt_pct_of_a\n"
-            "- bucket_b_utdelning_pct_of_a / bucket_c_utdelning_pct_of_a\n"
-            "Annars används defaultvärden (40 % för B, 20 % för C)."
-        )
-
-        new_cap = st.number_input(
-            "Tillgängligt kapital (SEK) att placera i denna sida",
-            min_value=0.0,
-            step=100.0,
-            value=0.0,
-            key="bucket_algo_cap_sek",
-        )
-
-        if new_cap > 0 and st.button(
-            "💡 Beräkna nästa köp utifrån bucket-reglerna",
-            key="btn_bucket_algo",
-        ):
-            suggestion = _compute_recommended_buy_for_side(
-                df,
-                settings,
-                fx_map,
-                side_opt,
-                new_cap,
+    with c3:
+        b_now = side_summary["B_now_pct"]
+        b_tgt = side_summary["B_target_pct"]
+        if b_now is not None and b_tgt is not None and side_summary["A_value"] > 0:
+            delta_b = b_now - b_tgt
+            st.metric(
+                "Bucket B / A",
+                f"{b_now:.1f} %",
+                f"{delta_b:+.1f} %-enheter (mål {b_tgt:.1f} %)",
             )
-            if suggestion is None:
-                st.info(
-                    "Kunde inte ta fram ett konkret förslag. "
-                    "Orsaker kan vara: alla kandidater över FV, fulla mot cap eller "
-                    "att kapitalet inte räcker till en aktie."
-                )
-            else:
-                tkr = suggestion["ticker"]
-                buk = suggestion["bucket"]
-                qty = int(suggestion["shares_to_buy"])
-                invest_sek = suggestion["invest_sek"]
-                cur_sek = suggestion["current_value_sek"]
-                tgt_each = suggestion["target_value_each_sek"]
-                price = suggestion["price"]
-                ccy = suggestion["ccy"]
-                fx = suggestion["fx"]
+        else:
+            st.metric("Bucket B / A", "—", "")
 
-                st.markdown(
-                    f"**Förslag:** köp **{qty} st {tkr}** i *{buk}*.\n\n"
-                    f"- Nuvarande position: ≈ {_fmt_sek(cur_sek)} SEK\n"
-                    f"- Målnivå (lika stort som övriga i bucket): ≈ {_fmt_sek(tgt_each)} SEK\n"
-                    f"- Denna affär investerar ≈ {_fmt_sek(invest_sek)} SEK i {tkr}\n"
-                    f"- Ny uppskattad positionsstorlek: ≈ {_fmt_sek(cur_sek + invest_sek)} SEK"
-                )
-                st.caption(
-                    f"Beräkningen använder pris ≈ {price:.2f} {ccy} "
-                    f"(FX ≈ {fx:.2f} SEK/{ccy}). "
-                    f"Övrigt kapital kan du fördela manuellt eller via nästa körning av algoritmen."
+    with c4:
+        c_now = side_summary["C_now_pct"]
+        c_tgt = side_summary["C_target_pct"]
+        if c_now is not None and c_tgt is not None and side_summary["A_value"] > 0:
+            delta_c = c_now - c_tgt
+            st.metric(
+                "Bucket C / A",
+                f"{c_now:.1f} %",
+                f"{delta_c:+.1f} %-enheter (mål {c_tgt:.1f} %)",
+            )
+        else:
+            st.metric("Bucket C / A", "—", "")
+
+    st.caption(
+        "Målen för Bucket B/C läses från Settings om nycklarna finns:\n"
+        "- bucket_b_tillvaxt_pct_of_a / bucket_c_tillvaxt_pct_of_a\n"
+        "- bucket_b_utdelning_pct_of_a / bucket_c_utdelning_pct_of_a\n"
+        "Annars används defaultvärden (40 % för B, 20 % för C)."
     )
+
+    new_cap = st.number_input(
+        "Tillgängligt kapital (SEK) att placera i denna sida",
+        min_value=0.0,
+        step=100.0,
+        value=0.0,
+        key="bucket_algo_cap_sek",
+    )
+
+    if new_cap > 0 and st.button("💡 Beräkna nästa köp utifrån bucket-reglerna", key="btn_bucket_algo"):
+        suggestion = _compute_recommended_buy_for_side(df, settings, fx_map, side_opt, new_cap)
+        if suggestion is None:
+            st.info(
+                "Kunde inte ta fram ett konkret förslag. "
+                "Orsaker kan vara: alla kandidater över FV, fulla mot cap eller "
+                "att kapitalet inte räcker till en aktie."
+            )
+        else:
+            tkr = suggestion["ticker"]
+            buk = suggestion["bucket"]
+            qty = int(suggestion["shares_to_buy"])
+            invest_sek = suggestion["invest_sek"]
+            cur_sek = suggestion["current_value_sek"]
+            tgt_each = suggestion["target_value_each_sek"]
+            price = suggestion["price"]
+            ccy = suggestion["ccy"]
+            fx = suggestion["fx"]
+
+            st.markdown(
+                f"**Förslag:** köp **{qty} st {tkr}** i *{buk}*.\n\n"
+                f"- Nuvarande position: ≈ {_fmt_sek(cur_sek)} SEK\n"
+                f"- Målnivå (lika stort som övriga i bucket): ≈ {_fmt_sek(tgt_each)} SEK\n"
+                f"- Denna affär investerar ≈ {_fmt_sek(invest_sek)} SEK i {tkr}\n"
+                f"- Ny uppskattad positionsstorlek: ≈ {_fmt_sek(cur_sek + invest_sek)} SEK"
+            )
+            st.caption(
+                f"Beräkningen använder pris ≈ {price:.2f} {ccy} "
+                f"(FX ≈ {fx:.2f} SEK/{ccy}). "
+                f"Övrigt kapital kan du fördela manuellt eller via nästa körning av algoritmen."
+        )
