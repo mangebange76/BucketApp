@@ -289,7 +289,6 @@ def page_snapshot() -> None:
         return
     _show_df(snap, height=420, use_container_width=True)
 
-
 # ============================================================
 # ✏️ Editor (manuellt + Yahoo)
 # ============================================================
@@ -608,7 +607,6 @@ def page_add_ticker() -> None:
             st.success(f"{tkr} tillagd.")
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
-
 
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
@@ -1523,10 +1521,28 @@ def page_batch() -> None:
     if not go:
         return
 
+    # CHANGED: hämta settings + FX så vi kan beräkna & skriva FV/Ranking under massuppdatering
+    settings = get_settings_map()
+    fx_map = get_fx_map()
+
     df_cur = df.copy()
     progress = st.progress(0.0)
     status = st.empty()
     changed_total = 0
+
+    # CHANGED: liten intern helper för att räkna "changed_total" konsekvent
+    def _set_cell(idx: int, col: str, val: Any) -> None:
+        nonlocal changed_total, df_cur
+        if col not in df_cur.columns:
+            df_cur[col] = np.nan
+        old = df_cur.at[idx, col]
+        same = (pd.isna(old) and pd.isna(val)) or (
+            not pd.isna(old) and not pd.isna(val) and str(old) == str(val)
+        )
+        if same:
+            return
+        df_cur.at[idx, col] = val
+        changed_total += 1
 
     for i, tkr in enumerate(target, start=1):
         try:
@@ -1538,21 +1554,75 @@ def page_batch() -> None:
             if mask.any():
                 idx = df_cur.index[mask][0]
                 for k, v in updates.items():
-                    if k not in df_cur.columns:
-                        df_cur[k] = np.nan
-                    old = df_cur.at[idx, k]
-                    same = (pd.isna(old) and pd.isna(v)) or (
-                        not pd.isna(old) and not pd.isna(v) and str(old) == str(v)
-                    )
-                    if same:
-                        continue
-                    df_cur.at[idx, k] = v
-                    changed_total += 1
+                    _set_cell(idx, k, v)
+
+                # CHANGED: räkna om FV + ev Ranking för raden direkt efter Yahoo-uppdatering
+                try:
+                    payload = compute_methods_for_row(df_cur.loc[idx], settings, fx_map)
+
+                    fv_map = {
+                        "FV idag": "target_today",
+                        "FV 1 år": "target_1y",
+                        "FV 2 år": "target_2y",
+                        "FV 3 år": "target_3y",
+                    }
+                    for col, key in fv_map.items():
+                        _set_cell(idx, col, _f(payload.get(key)))
+
+                    if "Bull 1 år" in df_cur.columns:
+                        _set_cell(idx, "Bull 1 år", _f(payload.get("bull_1y")))
+                    if "Bear 1 år" in df_cur.columns:
+                        _set_cell(idx, "Bear 1 år", _f(payload.get("bear_1y")))
+
+                    # Ranking (om kolumnen finns) – skriv bara om vi hittar ett värde i payload
+                    if "Ranking" in df_cur.columns:
+                        rank_val = (
+                            _f(payload.get("ranking"))
+                            or _f(payload.get("rank"))
+                            or _f(payload.get("score_total"))
+                            or _f(payload.get("score"))
+                        )
+                        if rank_val is not None:
+                            _set_cell(idx, "Ranking", rank_val)
+                except Exception:
+                    pass
             else:
                 base_row = {c: np.nan for c in DATA_COLUMNS}
                 base_row.update({"Timestamp": now_stamp(), "Ticker": tkr})
                 base_row.update(updates)
                 df_cur = pd.concat([df_cur, pd.DataFrame([base_row])], ignore_index=True)
+
+                # CHANGED: även nya rader ska få FV/Ranking direkt om möjligt
+                try:
+                    new_idx = int(df_cur.index[-1])
+                    payload = compute_methods_for_row(df_cur.loc[new_idx], settings, fx_map)
+
+                    fv_map = {
+                        "FV idag": "target_today",
+                        "FV 1 år": "target_1y",
+                        "FV 2 år": "target_2y",
+                        "FV 3 år": "target_3y",
+                    }
+                    for col, key in fv_map.items():
+                        _set_cell(new_idx, col, _f(payload.get(key)))
+
+                    if "Bull 1 år" in df_cur.columns:
+                        _set_cell(new_idx, "Bull 1 år", _f(payload.get("bull_1y")))
+                    if "Bear 1 år" in df_cur.columns:
+                        _set_cell(new_idx, "Bear 1 år", _f(payload.get("bear_1y")))
+
+                    if "Ranking" in df_cur.columns:
+                        rank_val = (
+                            _f(payload.get("ranking"))
+                            or _f(payload.get("rank"))
+                            or _f(payload.get("score_total"))
+                            or _f(payload.get("score"))
+                        )
+                        if rank_val is not None:
+                            _set_cell(new_idx, "Ranking", rank_val)
+                except Exception:
+                    pass
+
                 changed_total += len(updates)
         except Exception as e:
             st.error(f"{tkr}: {e}")
@@ -2263,7 +2333,6 @@ def build_sell_suggestions(
     out = out.sort_values("Över cap (SEK)", ascending=False).reset_index(drop=True)
     return out
 
-
 def page_buy_suggestions() -> None:
     st.header("🛒 Köp-/säljförslag (läser Data-bladet)")
     df = st.session_state.get("DATA")
@@ -2544,4 +2613,4 @@ def page_buy_suggestions() -> None:
                     f"Beräkningen använder pris ≈ {price:.2f} {ccy} "
                     f"(FX ≈ {fx:.2f} SEK/{ccy}). "
                     f"Övrigt kapital kan du fördela manuellt eller via nästa körning av algoritmen."
-                )
+            )
