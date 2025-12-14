@@ -29,7 +29,10 @@ from valuation import fetch_from_yahoo, _fetch_eps_estimates_yahoo, compute_meth
 
 
 # ============================================================
-# CHANGED: Gemensam writer så ALLA vyer får samma "sanning"
+# ✅ CHANGED: EN (1) gemensam writer så ALLA vyer får samma "sanning"
+#   - Speglar ALLTID target_today till både Fair value och fair_value
+#   - Speglar ALLTID till legacy Riktkurs-kolumner
+#   - Används av Editor / Add / Batch / Snapshot
 # ============================================================
 def _write_new_fv_values(
     df: pd.DataFrame,
@@ -39,14 +42,16 @@ def _write_new_fv_values(
 ) -> None:
     """
     Skriver ALLTID de nyberäknade värdena från compute_methods_for_row()
-    till både nya och gamla kolumnnamn, så att appen aldrig råkar visa
+    till både nya och legacy/alias-kolumner, så att appen aldrig visar
     "gamla" eller olika värden.
 
-    - FV idag/1y/2y/3y
-    - Fair value (back-compat) = FV idag
-    - Riktkurs idag/1y/2y/3y (back-compat) = FV ...
-    - Bull 1 år / Bear 1 år
+    - FV idag/1 år/2 år/3 år
+    - Riktkurs idag/1 år/2 år/3 år (legacy)
+    - Fair value + fair_value + Fair Value (alias) = FV idag
+    - Bull 1 år / Bear 1 år (om finns)
+    - Metod / Primär metod / Input-sammanfattning / Kommentar (om finns)
     """
+
     def _set(col: str, val: Any) -> None:
         nonlocal df, idx
         if set_cell_fn is not None:
@@ -56,10 +61,11 @@ def _write_new_fv_values(
             df[col] = np.nan
         df.at[idx, col] = val
 
+    # Targets
     t_today = _f(payload.get("target_today"))
-    t_1y    = _f(payload.get("target_1y"))
-    t_2y    = _f(payload.get("target_2y"))
-    t_3y    = _f(payload.get("target_3y"))
+    t_1y = _f(payload.get("target_1y"))
+    t_2y = _f(payload.get("target_2y"))
+    t_3y = _f(payload.get("target_3y"))
 
     # Nya fält
     _set("FV idag", t_today)
@@ -67,16 +73,46 @@ def _write_new_fv_values(
     _set("FV 2 år", t_2y)
     _set("FV 3 år", t_3y)
 
-    # Back-compat, men ALLTID samma nyberäknade sanning
-    _set("Fair value", t_today)
+    # Legacy-fält som ofta visas i Sheets/UI
     _set("Riktkurs idag", t_today)
     _set("Riktkurs 1 år", t_1y)
     _set("Riktkurs 2 år", t_2y)
     _set("Riktkurs 3 år", t_3y)
 
-    # Bull/Bear (om payload har dem)
+    # ✅ CHANGED: Skriv ALLTID alla vanliga varianter (det är här UBER-problemet uppstår annars)
+    for alias in ("Fair value", "fair_value", "Fair Value", "fair value"):
+        # Skriv även om kolumnen inte fanns (vi vill undvika "tittar på fel kolumn"-bugg)
+        _set(alias, t_today)
+
+    # Bull/Bear (skriv alltid; om val saknas blir det NaN)
     _set("Bull 1 år", _f(payload.get("bull_1y")))
     _set("Bear 1 år", _f(payload.get("bear_1y")))
+
+    # Metod / inputs / kommentar (om payload har dem)
+    method = (
+        payload.get("method")
+        or payload.get("metod")
+        or payload.get("primary_method")
+        or payload.get("primar_metod")
+        or payload.get("method_name")
+    )
+    if method is not None:
+        _set("Metod", str(method))
+        _set("Primär metod", str(method))
+
+    input_sum = (
+        payload.get("input_summary")
+        or payload.get("inputs_summary")
+        or payload.get("inputs")
+        or payload.get("input")
+        or payload.get("summary")
+    )
+    if input_sum is not None:
+        _set("Input-sammanfattning", str(input_sum))
+
+    comment = payload.get("comment") or payload.get("note") or payload.get("kommentar")
+    if comment is not None:
+        _set("Kommentar", str(comment))
 
 
 # -------------------------
@@ -104,13 +140,14 @@ def _auto_snapshot_on_import() -> None:
 
         df_add = df.copy()
 
-        # CHANGED: Säkerställ även back-compat kolumner (Fair value + Riktkurs ...)
         fv_cols = [
             "FV idag",
             "FV 1 år",
             "FV 2 år",
             "FV 3 år",
             "Fair value",
+            "fair_value",
+            "Fair Value",
             "Riktkurs idag",
             "Riktkurs 1 år",
             "Riktkurs 2 år",
@@ -133,13 +170,10 @@ def _auto_snapshot_on_import() -> None:
             except Exception:
                 continue
 
-            # CHANGED: skriv FV konsekvent till både nya & gamla namn
+            # CHANGED: skriv FV konsekvent till både nya & legacy/alias
             _write_new_fv_values(df_add, idx, payload, set_cell_fn=None)
 
-            fv_dcf = (
-                _f(payload.get("fv_today_dcf"))
-                or _f(payload.get("target_today_dcf"))
-            )
+            fv_dcf = _f(payload.get("fv_today_dcf")) or _f(payload.get("target_today_dcf"))
             df_add.at[idx, "FV idag (DCF)"] = fv_dcf
 
             dcf_params = payload.get("dcf_params") or payload.get("dcf") or {}
@@ -356,20 +390,13 @@ def _build_updates_from_yahoo(tkr: str, existing_row: pd.Series) -> Dict[str, An
     if existing_name:
         name = existing_name
     else:
-        name = (
-            y.get("name")
-            or y.get("longName")
-            or y.get("shortName")
-        )
+        name = (y.get("name") or y.get("longName") or y.get("shortName"))
 
     existing_sector = _safe_str_val(existing_row.get("Sektor"))
     if existing_sector:
         sector = existing_sector
     else:
-        sector = (
-            y.get("sector")
-            or y.get("industry")
-        )
+        sector = (y.get("sector") or y.get("industry"))
 
     try:
         est = _fetch_eps_estimates_yahoo(tkr)
@@ -434,8 +461,8 @@ def page_editor() -> None:
     c1, c2 = st.columns(2)
     with c1:
         new_ticker = st.text_input("Ticker", value=str(row.get("Ticker") or "").upper())
-        antal_in   = st.text_input("Antal aktier", value=str(_f(row.get("Antal aktier")) or ""))
-        gav_in     = st.text_input("GAV (SEK)", value=str(_f(row.get("GAV (SEK)")) or ""))
+        antal_in = st.text_input("Antal aktier", value=str(_f(row.get("Antal aktier")) or ""))
+        gav_in = st.text_input("GAV (SEK)", value=str(_f(row.get("GAV (SEK)")) or ""))
         bucket_opts = [""] + DEFAULT_BUCKETS
         current_bucket = str(row.get("Bucket") or "")
         try:
@@ -485,7 +512,7 @@ def page_editor() -> None:
                         df_cur[k] = np.nan
                     df_cur.at[idx, k] = v
 
-                # CHANGED: räkna om FV och skriv ALLTID konsekvent (inkl Fair value/Riktkurs)
+                # ✅ CHANGED: räkna om FV och skriv ALLTID konsekvent (inkl Fair value + fair_value + Riktkurs)
                 try:
                     settings = get_settings_map()
                     fx_map = get_fx_map()
@@ -507,6 +534,7 @@ def page_editor() -> None:
     st.subheader("Förhandsgranskning")
     _show_df(df.loc[[idx]], height=240, use_container_width=True)
 
+
 # ============================================================
 # ➕ Lägg till ticker (med valfri Yahoo-prefill)
 # ============================================================
@@ -517,13 +545,13 @@ def page_add_ticker() -> None:
     c1, c2, c3 = st.columns(3)
     with c1:
         bolagsnamn = st.text_input("Bolagsnamn")
-        sektor     = st.text_input("Sektor")
+        sektor = st.text_input("Sektor")
     with c2:
         bucket_sel = st.selectbox("Bucket", [""] + DEFAULT_BUCKETS, index=0)
-        valuta     = st.text_input("Valuta (t.ex. USD)", value="USD").upper()
+        valuta = st.text_input("Valuta (t.ex. USD)", value="USD").upper()
     with c3:
         antal = st.text_input("Antal aktier", value="")
-        gav   = st.text_input("GAV (SEK)", value="")
+        gav = st.text_input("GAV (SEK)", value="")
 
     st.markdown("**Prognosfält (frivilliga)**")
     c4, c5 = st.columns(2)
@@ -566,8 +594,8 @@ def page_add_ticker() -> None:
             if gav_v is not None:
                 new_row["GAV (SEK)"] = gav_v
 
-            eps1_v  = _f(eps1_in)
-            eps2_v  = _f(eps2_in)
+            eps1_v = _f(eps1_in)
+            eps2_v = _f(eps2_in)
             rev1_vm = (_f(rev1_in) or 0.0) * 1_000_000.0 if rev1_in not in (None, "") else None
             rev2_vm = (_f(rev2_in) or 0.0) * 1_000_000.0 if rev2_in not in (None, "") else None
             if eps1_v is not None:
@@ -589,20 +617,13 @@ def page_add_ticker() -> None:
                     if existing_name:
                         name = existing_name
                     else:
-                        name = (
-                            y.get("name")
-                            or y.get("longName")
-                            or y.get("shortName")
-                        )
+                        name = (y.get("name") or y.get("longName") or y.get("shortName"))
 
                     existing_sector = _safe_str_val(new_row.get("Sektor"))
                     if existing_sector:
                         sektor_y = existing_sector
                     else:
-                        sektor_y = (
-                            y.get("sector")
-                            or y.get("industry")
-                        )
+                        sektor_y = (y.get("sector") or y.get("industry"))
 
                     pre = {
                         "Bolagsnamn": name,
@@ -632,7 +653,7 @@ def page_add_ticker() -> None:
 
             out_df = pd.concat([base_df, pd.DataFrame([new_row])], ignore_index=True)
 
-            # CHANGED: räkna FV direkt vid add så raden alltid får nyberäknat värde
+            # ✅ CHANGED: räkna FV direkt vid add så raden alltid får nyberäknat värde + alias
             try:
                 settings = get_settings_map()
                 fx_map = get_fx_map()
@@ -650,7 +671,6 @@ def page_add_ticker() -> None:
             st.success(f"{tkr} tillagd.")
         except Exception as e:
             st.error(f"Kunde inte lägga till: {e}")
-
 
 # ============================================================
 # 📦 Portfölj (innehav + kommande utdelningar)
@@ -842,78 +862,6 @@ def _next_dps_per_share(row: pd.Series) -> Optional[float]:
     except Exception:
         return None
 
-# ============================================================
-# CHANGED: Gemensam writer för att ALLTID skriva nya beräknade värden
-# (så vi inte råkar visa gamla/statiska kolumner som t.ex. "Fair value")
-# ============================================================
-def _write_new_fv_values(
-    df: pd.DataFrame,
-    idx: int,
-    payload: Dict[str, Any],
-    set_cell_fn=None,  # om vi vill räkna changed_total i batch
-) -> None:
-    """
-    Skriver alltid de NYBERÄKNADE värdena till alla relevanta kolumner
-    (FV + Riktkurs + Fair value + Bull/Bear + Metod/Input/Kommentar).
-
-    Viktigt för bl.a. UBER: om UI/Sheets visar "Fair value" så ska den få
-    target_today direkt, inte lämnas NaN.
-    """
-    def _set(col: str, val: Any) -> None:
-        nonlocal df, idx
-        if col not in df.columns:
-            df[col] = np.nan
-        if set_cell_fn is not None:
-            set_cell_fn(idx, col, val)
-        else:
-            df.at[idx, col] = val
-
-    # Targets
-    t_today = _f(payload.get("target_today"))
-    t_1y    = _f(payload.get("target_1y"))
-    t_2y    = _f(payload.get("target_2y"))
-    t_3y    = _f(payload.get("target_3y"))
-
-    # Standardkolumner (FV ...)
-    _set("FV idag", t_today)
-    _set("FV 1 år", t_1y)
-    _set("FV 2 år", t_2y)
-    _set("FV 3 år", t_3y)
-
-    # Alias-kolumner som ibland används i Sheets/UI
-    _set("Riktkurs idag", t_today)
-    _set("Riktkurs 1 år", t_1y)
-    _set("Riktkurs 2 år", t_2y)
-    _set("Riktkurs 3 år", t_3y)
-
-    # CHANGED: "Fair value" ska alltid spegla nya target_today (löst UBER-problemet)
-    for c in ("Fair value", "Fair Value", "fair_value", "fair value"):
-        if c in df.columns or c == "Fair value":
-            _set(c, t_today)
-
-    # Bull/Bear
-    b1 = _f(payload.get("bull_1y"))
-    be1 = _f(payload.get("bear_1y"))
-    if "Bull 1 år" in df.columns or b1 is not None:
-        _set("Bull 1 år", b1)
-    if "Bear 1 år" in df.columns or be1 is not None:
-        _set("Bear 1 år", be1)
-
-    # Metod / inputs (om payload har dem)
-    method = payload.get("method") or payload.get("method_name") or payload.get("primary_method")
-    if method is not None:
-        _set("Metod", str(method))
-        if "Primär metod" in df.columns:
-            _set("Primär metod", str(method))
-
-    inp = payload.get("input_summary") or payload.get("inputs") or payload.get("input") or payload.get("summary")
-    if inp is not None:
-        _set("Input-sammanfattning", str(inp))
-
-    note = payload.get("comment") or payload.get("note") or payload.get("notes")
-    if note is not None:
-        _set("Kommentar", str(note))
-
 
 def build_next_dividends_table(
     data_df: pd.DataFrame,
@@ -1078,6 +1026,7 @@ def build_dividend_rolling_12m(
 
     confirmed_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
 
+    # Bekräftad: nästa utbetalningsdatum
     for _, r in data_df.iterrows():
         ticker = str(r.get("Ticker") or "").strip()
         if not ticker:
@@ -1128,6 +1077,7 @@ def build_dividend_rolling_12m(
         events.append(ev)
         confirmed_by_ticker.setdefault(ticker, []).append(ev)
 
+    # Estimerad: fyll återstående utifrån Årlig utdelning och frekvens
     for _, r in data_df.iterrows():
         ticker = str(r.get("Ticker") or "").strip()
         if not ticker:
@@ -1612,12 +1562,12 @@ def page_batch() -> None:
                 for k, v in updates.items():
                     _set_cell(idx, k, v)
 
-                # CHANGED: skriv ALLTID nya beräknade värden (FV + Riktkurs + Fair value + mm)
+                # Viktigt: skriv ALLTID nya beräknade värden (FV + legacy) efter uppdatering
                 try:
                     payload = compute_methods_for_row(df_cur.loc[idx], settings, fx_map)
                     _write_new_fv_values(df_cur, idx, payload, set_cell_fn=_set_cell)
 
-                    # Ranking (om kolumnen finns) – skriv bara om vi hittar ett värde i payload
+                    # Ranking (om kolumnen finns)
                     if "Ranking" in df_cur.columns:
                         rank_val = (
                             _f(payload.get("ranking"))
@@ -1629,13 +1579,13 @@ def page_batch() -> None:
                             _set_cell(idx, "Ranking", rank_val)
                 except Exception:
                     pass
+
             else:
                 base_row = {c: np.nan for c in DATA_COLUMNS}
                 base_row.update({"Timestamp": now_stamp(), "Ticker": tkr})
                 base_row.update(updates)
                 df_cur = pd.concat([df_cur, pd.DataFrame([base_row])], ignore_index=True)
 
-                # CHANGED: även nya rader ska få FV/Ranking direkt om möjligt
                 try:
                     new_idx = int(df_cur.index[-1])
                     payload = compute_methods_for_row(df_cur.loc[new_idx], settings, fx_map)
@@ -1654,8 +1604,10 @@ def page_batch() -> None:
                     pass
 
                 changed_total += len(updates)
+
         except Exception as e:
             st.error(f"{tkr}: {e}")
+
         progress.progress(i / len(target))
         time.sleep(float(delay))
 
@@ -1840,98 +1792,6 @@ def _compute_bucket_side_summary(
         summary["C_now_pct"] = letter_totals["C"] / letter_totals["A"] * 100.0
 
     return summary
-
-# ============================================================
-# CHANGED: Skriv ALLTID "nya beräknade värden" till alla relevanta kolumner
-#  - FV idag/FV 1–3 år
-#  - Riktkurs idag/Riktkurs 1–3 år (legacy)
-#  - Fair value (legacy)
-#  - Metod + Input-sammanfattning + Kommentar (om finns)
-#  - Bull/Bear 1 år (om finns)
-# ============================================================
-def _write_new_fv_values(
-    df: pd.DataFrame,
-    idx: int,
-    payload: Dict[str, Any],
-    set_cell_fn=None,
-) -> None:
-    """
-    Skriver konsekvent ut de NYA beräknade värdena från compute_methods_for_row
-    till både nya och legacy-kolumner, så att UI/Sheets aldrig visar "gamla" värden.
-
-    set_cell_fn: valfri setter (t.ex. _set_cell i batch) för att räkna changed_total.
-                Om None -> direkt df.at-sättning.
-    """
-    def _set(col: str, val: Any) -> None:
-        if set_cell_fn is not None:
-            set_cell_fn(idx, col, val)
-        else:
-            if col not in df.columns:
-                df[col] = np.nan
-            df.at[idx, col] = val
-
-    # FV / targets
-    t_today = _f(payload.get("target_today"))
-    t_1y    = _f(payload.get("target_1y"))
-    t_2y    = _f(payload.get("target_2y"))
-    t_3y    = _f(payload.get("target_3y"))
-
-    # Skriv "FV ..." (nya kolumner)
-    _set("FV idag", t_today)
-    _set("FV 1 år", t_1y)
-    _set("FV 2 år", t_2y)
-    _set("FV 3 år", t_3y)
-
-    # Skriv "Riktkurs ..." (legacy kolumner)
-    _set("Riktkurs idag", t_today)
-    _set("Riktkurs 1 år", t_1y)
-    _set("Riktkurs 2 år", t_2y)
-    _set("Riktkurs 3 år", t_3y)
-
-    # Skriv "Fair value" (legacy) = idag
-    _set("Fair value", t_today)
-
-    # Bull/Bear om de finns
-    bull_1y = _f(payload.get("bull_1y"))
-    bear_1y = _f(payload.get("bear_1y"))
-    if bull_1y is not None:
-        _set("Bull 1 år", bull_1y)
-    if bear_1y is not None:
-        _set("Bear 1 år", bear_1y)
-
-    # Metod / Inputs / Kommentar (om payload levererar)
-    method = (
-        payload.get("method")
-        or payload.get("metod")
-        or payload.get("primary_method")
-        or payload.get("primar_metod")
-    )
-    if method is not None:
-        _set("Metod", str(method))
-
-    input_sum = (
-        payload.get("input_summary")
-        or payload.get("inputs_summary")
-        or payload.get("input")
-        or payload.get("inputs")
-        or payload.get("input_text")
-    )
-    if input_sum is not None:
-        _set("Input-sammanfattning", str(input_sum))
-
-    comment = (
-        payload.get("comment")
-        or payload.get("note")
-        or payload.get("kommentar")
-    )
-    if comment is not None:
-        _set("Kommentar", str(comment))
-
-    # Primär metod (om kolumnen finns / vi har värde)
-    prim = payload.get("primary_method") or payload.get("primar_metod")
-    if prim is not None:
-        _set("Primär metod", str(prim))
-
 
 # ============================================================
 # 🧮 Helpers: Bucket-sida (Tillväxt/Utdelning) + B/C-mål
@@ -2388,7 +2248,84 @@ def build_sell_suggestions(
     out = out.sort_values("Över cap (SEK)", ascending=False).reset_index(drop=True)
     return out
 
+# ============================================================
+# CHANGED (VIKTIGT): SISTA & ENDA "SANNINGEN" för FV-skrivning
+#  - Fixar UBER-problemet: om Sheets/UI råkar läsa "fair_value" eller "Fair value"
+#    så får den ALLTID nya target_today (inte NaN / gammalt värde).
+#  - Lägger även FV/Riktkurs + Bull/Bear + Metod/Input/Kommentar konsekvent.
+# ============================================================
+def _write_new_fv_values(
+    df: pd.DataFrame,
+    idx: int,
+    payload: Dict[str, Any],
+    set_cell_fn=None,
+) -> None:
+    def _set(col: str, val: Any) -> None:
+        if set_cell_fn is not None:
+            set_cell_fn(idx, col, val)
+            return
+        if col not in df.columns:
+            df[col] = np.nan
+        df.at[idx, col] = val
 
+    # Targets
+    t_today = _f(payload.get("target_today"))
+    t_1y    = _f(payload.get("target_1y"))
+    t_2y    = _f(payload.get("target_2y"))
+    t_3y    = _f(payload.get("target_3y"))
+
+    # Nya kolumner
+    _set("FV idag", t_today)
+    _set("FV 1 år", t_1y)
+    _set("FV 2 år", t_2y)
+    _set("FV 3 år", t_3y)
+
+    # Legacy/alias som kan användas av UI/Sheets
+    _set("Riktkurs idag", t_today)
+    _set("Riktkurs 1 år", t_1y)
+    _set("Riktkurs 2 år", t_2y)
+    _set("Riktkurs 3 år", t_3y)
+
+    # CHANGED: skriv ALLA varianter som förekommer i din Sheet/app
+    for c in ("Fair value", "Fair Value", "fair_value", "fair value"):
+        _set(c, t_today)
+
+    # Bull/Bear (om payload har)
+    _set("Bull 1 år", _f(payload.get("bull_1y")))
+    _set("Bear 1 år", _f(payload.get("bear_1y")))
+
+    # Metod/inputs/kommentar (om payload levererar)
+    method = (
+        payload.get("method")
+        or payload.get("metod")
+        or payload.get("primary_method")
+        or payload.get("primar_metod")
+        or payload.get("method_name")
+    )
+    if method is not None:
+        _set("Metod", str(method))
+        if "Primär metod" in df.columns:
+            _set("Primär metod", str(method))
+
+    inp = (
+        payload.get("input_summary")
+        or payload.get("inputs_summary")
+        or payload.get("input")
+        or payload.get("inputs")
+        or payload.get("summary")
+        or payload.get("input_text")
+    )
+    if inp is not None:
+        _set("Input-sammanfattning", str(inp))
+
+    note = payload.get("comment") or payload.get("note") or payload.get("kommentar") or payload.get("notes")
+    if note is not None:
+        _set("Kommentar", str(note))
+
+
+# ============================================================
+# 🛒 Köpförslag + Säljförslag (UI)
+# ============================================================
 def page_buy_suggestions() -> None:
     st.header("🛒 Köp-/säljförslag (läser Data-bladet)")
     df = st.session_state.get("DATA")
@@ -2650,4 +2587,4 @@ def page_buy_suggestions() -> None:
                 f"Beräkningen använder pris ≈ {price:.2f} {ccy} "
                 f"(FX ≈ {fx:.2f} SEK/{ccy}). "
                 f"Övrigt kapital kan du fördela manuellt eller via nästa körning av algoritmen."
-        )
+            )
