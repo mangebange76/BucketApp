@@ -262,12 +262,29 @@ def _fetch_eps_estimates_yahoo(ticker: str) -> Dict[str, Optional[float]]:
 
 
 # ============================
+# ✅ CHANGED: intern clamp-helper
+# ============================
+def _clamp(x: float, lo: float, hi: float) -> float:
+    try:
+        xv = float(x)
+        if not math.isfinite(xv):
+            return lo
+        return max(lo, min(hi, xv))
+    except Exception:
+        return lo
+
+
+# ============================
 # DCF-metod för FV idag
 # ============================
 
 def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[float]:
     """
     Strikt DCF per aktie för FV idag.
+
+    ✅ CHANGED (viktigt): FV idag ska INTE påverkas av EPS-estimat (EPS 1Y / EPS 2Y).
+    - Bas: använder EPS TTM (eller trailing-alias) som proxy för "owner earnings" per aktie.
+    - Tillväxt g: EPS CAGR (normaliserad) eller settings dcf_default_growth.
     """
     try:
         disc = float(settings.get("dcf_discount_rate", 0.10))
@@ -289,37 +306,35 @@ def _compute_dcf_fv_today(row: pd.Series, settings: Dict[str, Any]) -> Optional[
     if disc <= term_g:
         return None
 
-    eps1 = _safe_float(row.get("EPS 1Y"))
-    eps2 = _safe_float(row.get("EPS 2Y"))
+    # ✅ CHANGED: använd INTE EPS 1Y/EPS 2Y som bas för FV idag
     eps_ttm = _safe_float(row.get("EPS TTM"))
 
-    base_eps = eps1
-    if base_eps is None:
-        base_eps = eps2
-    if base_eps is None:
-        base_eps = eps_ttm
+    # trailing-alias (ifall sheet råkar heta annat)
+    if eps_ttm is None:
+        for c in ("EPS trailing", "Trailing EPS", "EPS (TTM)", "EPS_TTM"):
+            if eps_ttm is None:
+                eps_ttm = _safe_float(row.get(c))
+
+    base_eps = eps_ttm
 
     if base_eps is None or base_eps <= 0:
         return None
 
+    # ✅ CHANGED: g från historik eller default — INTE från eps2/eps1
     g = None
-    if eps1 is not None and eps2 is not None and eps1 > 0:
-        try:
-            g = (eps2 / eps1) - 1.0
-        except Exception:
-            g = None
-
-    if g is None:
-        # ✅ CHANGED: normalisera CAGR om den råkat sparas som procent i sheet
-        eps_cagr_hist = _normalize_growth_rate(_safe_float(row.get("EPS CAGR")))
-        if eps_cagr_hist is not None:
-            g = eps_cagr_hist
+    eps_cagr_hist = _normalize_growth_rate(_safe_float(row.get("EPS CAGR")))
+    if eps_cagr_hist is not None:
+        g = eps_cagr_hist
 
     if g is None:
         try:
             g = float(settings.get("dcf_default_growth", 0.08))
         except Exception:
             g = 0.08
+
+    # ✅ CHANGED: clamp g för att undvika extrema/trasiga inputs som ger absurda FV
+    # (du kan senare styra detta via settings om du vill, men default är stabilt)
+    g = _clamp(g, -0.20, 0.25)
 
     fv = 0.0
     for t in range(1, years + 1):
@@ -371,6 +386,7 @@ def _growth_for_forward_targets(row: pd.Series) -> float:
     eps2 = _safe_float(row.get("EPS 2Y"))
     g = None
 
+    # (Här är det OK att EPS-estimat styr 1–3 år)
     if eps1 is not None and eps2 is not None and eps1 > 0:
         try:
             g = (eps2 / eps1) - 1.0
@@ -378,7 +394,7 @@ def _growth_for_forward_targets(row: pd.Series) -> float:
             g = None
 
     if g is None:
-        # ✅ CHANGED: normalisera även här (så 13.5 inte blir 1350%)
+        # normalisera även här (så 13.5 inte blir 1350%)
         cagr_hist = _normalize_growth_rate(_safe_float(row.get("EPS CAGR")))
         if cagr_hist is not None:
             g = cagr_hist
