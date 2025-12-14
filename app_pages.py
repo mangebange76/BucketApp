@@ -2613,4 +2613,4 @@ def page_buy_suggestions() -> None:
                     f"Beräkningen använder pris ≈ {price:.2f} {ccy} "
                     f"(FX ≈ {fx:.2f} SEK/{ccy}). "
                     f"Övrigt kapital kan du fördela manuellt eller via nästa körning av algoritmen."
-            )
+    )
